@@ -136,6 +136,10 @@ export const ExcelImportPage: React.FC<ExcelImportPageProps> = ({
     }
 
     const summary = executeExcelImport(validRows, settings.sellerName);
+    if (!summary.success) {
+      showToast(summary.error || t.toasts.error, 'error');
+      return;
+    }
     setImportSummary(summary);
     showToast(t.toasts.excelImported, 'success');
   };

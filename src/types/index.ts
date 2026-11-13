@@ -116,6 +116,14 @@ export interface OrderFinancialAdjustment {
   notes?: string;
 }
 
+export interface StorageWriteResult {
+  success: boolean;
+  error?: string;
+  quotaExceeded?: boolean;
+  rolledBack?: boolean;
+  rollbackError?: string;
+}
+
 export interface OrderFinancialBreakdown {
   orderId: string;
   sellingPriceTotal: number;
@@ -131,9 +139,12 @@ export interface OrderFinancialBreakdown {
   productCostOfGoods: number | null; // null if missing
   cogsSource?: 'snapshot' | 'catalog' | 'mixed' | 'missing';
   refundAmount: number;
-  confirmedNet: number | null; // null if cost missing or not delivered
+  recordedCostMargin: number | null; // Margin from recorded costs only (excludes missing marketplace fees); null if COGS missing or not delivered
+  confirmedNet: number | null; // Strictly non-null ONLY when delivered, non-cancelled, all COGS exist, AND marketplaceCommission is recorded
+  estimatedNet: number | null; // Informational estimate using documented 12% estimated commission when unrecorded; null if COGS missing or not delivered
   isProfitCalculable: boolean;
   uncalculatedReason?: string;
+  missingCostReasons?: string[];
 }
 
 export interface Order {
@@ -270,7 +281,7 @@ export interface FinancialTransaction {
   type: FinancialTransactionType;
   amount: number; // positive for income, positive for expense (discriminated by type)
   currency: string;
-  status: 'confirmed' | 'pending' | 'settled';
+  status: 'confirmed' | 'pending' | 'settled' | 'cancelled';
   date: string;
   source: 'automatic' | 'manual' | 'imported';
   notes?: string;

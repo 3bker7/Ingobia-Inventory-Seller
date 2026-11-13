@@ -209,22 +209,30 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({
 
     if (editingProduct) {
       if (editingProduct.marketplaceListings.noon?.price !== Number(formNoonPrice)) {
-        storageService.updateProductPrice(
+        const priceRes = storageService.updateProductPriceWithResult(
           editingProduct.id,
           'noon',
           Number(formNoonPrice),
           'تعديل سعر نون في نموذج المنتج',
           settings.sellerName
         );
+        if (!priceRes.success) {
+          showToast(priceRes.error || t.toasts.error, 'error');
+          return;
+        }
       }
       if (editingProduct.marketplaceListings.amazon?.price !== Number(formAmzPrice)) {
-        storageService.updateProductPrice(
+        const priceRes = storageService.updateProductPriceWithResult(
           editingProduct.id,
           'amazon',
           Number(formAmzPrice),
           'تعديل سعر أمازون في نموذج المنتج',
           settings.sellerName
         );
+        if (!priceRes.success) {
+          showToast(priceRes.error || t.toasts.error, 'error');
+          return;
+        }
       }
 
       const physicalDiff = targetPhysical - editingProduct.physicalStock;
@@ -241,10 +249,14 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({
         marketplaceListings: listings,
       };
 
-      storageService.saveProduct(updated);
+      const saveRes = storageService.saveProduct(updated);
+      if (!saveRes.success) {
+        showToast(saveRes.error || t.toasts.error, 'error');
+        return;
+      }
 
       if (physicalDiff !== 0) {
-        storageService.recordStockMovements([
+        const movRes = storageService.recordStockMovements([
           {
             id: `mov-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
             productId: updated.id,
@@ -261,6 +273,10 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({
             timestamp: nowIso,
           },
         ]);
+        if (!movRes.success) {
+          showToast(movRes.error || t.toasts.error, 'error');
+          return;
+        }
       }
 
       showToast(t.toasts.productUpdated, 'success');
@@ -288,7 +304,11 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({
         updatedAt: new Date().toISOString(),
       };
 
-      storageService.saveProduct(newProd);
+      const saveRes = storageService.saveProduct(newProd);
+      if (!saveRes.success) {
+        showToast(saveRes.error || t.toasts.error, 'error');
+        return;
+      }
       showToast(t.toasts.productAdded, 'success');
       setIsAddModalOpen(false);
       if (onCloseInitialAddModal) onCloseInitialAddModal();
@@ -299,7 +319,11 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({
 
   const handleDeleteConfirm = () => {
     if (!productToDelete) return;
-    storageService.deleteProduct(productToDelete.id);
+    const delRes = storageService.deleteProduct(productToDelete.id);
+    if (!delRes.success) {
+      showToast(delRes.error || t.toasts.error, 'error');
+      return;
+    }
     showToast(t.toasts.productDeleted, 'success');
     setProductToDelete(null);
     refreshProducts();

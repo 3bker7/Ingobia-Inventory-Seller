@@ -14,7 +14,6 @@ import {
   ChevronRight,
   Globe,
   Sparkles,
-  FlaskConical,
   Terminal,
 } from 'lucide-react';
 import { translations, Locale } from '../../locales/translations';
@@ -43,7 +42,6 @@ interface SidebarProps {
   onToggleCollapse: () => void;
   activeOrdersCount: number;
   pendingReturnsCount: number;
-  onOpenTestSuite?: () => void;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({
@@ -55,7 +53,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onToggleCollapse,
   activeOrdersCount,
   pendingReturnsCount,
-  onOpenTestSuite,
 }) => {
   const t = translations[locale];
   const settings = storageService.getSettings();
@@ -258,23 +255,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
             </div>
           )}
         </button>
-
-        {onOpenTestSuite && (
-          <button
-            onClick={onOpenTestSuite}
-            className={`w-full flex items-center gap-2.5 px-3 py-2 text-xs font-semibold text-purple-700 hover:text-purple-900 bg-purple-50/60 hover:bg-purple-100/60 rounded-lg transition-colors border border-purple-200 cursor-pointer ${
-              isCollapsed ? 'justify-center px-0' : ''
-            }`}
-            title={locale === 'ar' ? 'فحص واختبار منطق العمليات' : 'Run Operations Test Suite'}
-          >
-            <FlaskConical className="w-4 h-4 text-purple-600 shrink-0" />
-            {!isCollapsed && (
-              <span className="truncate">
-                {locale === 'ar' ? 'اختبار قواعد العمليات' : 'Logic Test Suite'}
-              </span>
-            )}
-          </button>
-        )}
 
         {!isCollapsed && (
           <div className="px-2 py-1.5 flex items-center gap-2 text-[11px] text-[#64748B]">

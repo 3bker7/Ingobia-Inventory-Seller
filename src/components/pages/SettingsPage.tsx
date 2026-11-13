@@ -7,7 +7,6 @@ import {
   User,
   Database,
   Download,
-  RotateCcw,
   CheckCircle2,
   Trash2,
   GraduationCap,
@@ -18,7 +17,6 @@ import { storageService } from '../../services/storage';
 import { translations, Locale } from '../../locales/translations';
 import { MarketplaceConfig } from '../../types';
 import { Modal } from '../common/Modal';
-import { ConfirmDialog } from '../common/ConfirmDialog';
 import { useToast } from '../common/Toast';
 
 interface SettingsPageProps {
@@ -39,9 +37,6 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ locale, onDataReset,
   const [newMktNameAr, setNewMktNameAr] = useState('');
   const [newMktColor, setNewMktColor] = useState('#2563EB');
 
-  // Reset confirmation
-  const [isResetConfirmOpen, setIsResetConfirmOpen] = useState(false);
-
   // Form state
   const [sellerName, setSellerName] = useState(profile.merchantName || settings.sellerName);
   const [storeName, setStoreName] = useState(profile.storeName || settings.storeName);
@@ -55,13 +50,21 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ locale, onDataReset,
       storeName: storeName.trim(),
       currency,
     };
-    storageService.saveSettings(updated);
-    storageService.saveMerchantProfile({
+    const settingsRes = storageService.saveSettings(updated);
+    if (!settingsRes.success) {
+      showToast(settingsRes.error || t.toasts.error, 'error');
+      return;
+    }
+    const profileRes = storageService.saveMerchantProfile({
       ...profile,
       merchantName: sellerName.trim(),
       storeName: storeName.trim(),
     });
-    setSettings(updated);
+    if (!profileRes.success) {
+      showToast(profileRes.error || t.toasts.error, 'error');
+      return;
+    }
+    setSettings(storageService.getSettings());
     setProfile(storageService.getMerchantProfile());
     showToast(t.toasts.settingsSaved, 'success');
   };
@@ -74,8 +77,13 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ locale, onDataReset,
       );
       return;
     }
-    storageService.removeMarketplace(id);
+    const res = storageService.removeMarketplace(id);
+    if (!res.success) {
+      showToast(res.error || t.toasts.error, 'error');
+      return;
+    }
     setSettings(storageService.getSettings());
+    onDataReset();
     showToast(
       locale === 'ar' ? 'تمت إزالة المنصة بنجاح.' : 'Marketplace removed successfully.',
       'success'
@@ -115,7 +123,11 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ locale, onDataReset,
       isActive: true,
     };
 
-    storageService.addMarketplace(newMkt);
+    const res = storageService.addMarketplace(newMkt);
+    if (!res.success) {
+      showToast(res.error || t.toasts.error, 'error');
+      return;
+    }
     setSettings(storageService.getSettings());
     setIsAddMktModalOpen(false);
     setNewMktNameEn('');
@@ -135,6 +147,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ locale, onDataReset,
       movements: storageService.getMovements(),
       returns: storageService.getReturns(),
       priceHistory: storageService.getPriceHistory(),
+      financialTransactions: storageService.getFinancialTransactions(),
       settings: storageService.getSettings(),
       exportedAt: new Date().toISOString(),
     };
@@ -149,16 +162,6 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ locale, onDataReset,
     a.click();
     URL.revokeObjectURL(url);
     showToast(locale === 'ar' ? 'تم تصدير النسخة الاحتياطية بنجاح.' : 'Backup exported successfully.', 'success');
-  };
-
-  const handleConfirmReset = () => {
-    storageService.resetToSample();
-    setSettings(storageService.getSettings());
-    setSellerName(storageService.getSettings().sellerName);
-    setStoreName(storageService.getSettings().storeName);
-    setCurrency(storageService.getSettings().currency);
-    showToast(t.toasts.dataReset, 'success');
-    onDataReset();
   };
 
   return (
@@ -314,10 +317,10 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ locale, onDataReset,
           <Database className="w-5 h-5 text-[#2563EB]" />
           <div>
             <h3 className="text-sm font-bold text-[#172033]">
-              {t.settings.dataManagement}
+              {locale === 'ar' ? 'النسخ الاحتياطي للبيانات' : 'Store Data Backup'}
             </h3>
             <p className="text-xs text-[#64748B]">
-              {locale === 'ar' ? 'تصدير نسخة احتياطية أو استعادة البيانات الأولية' : 'Data export and sample database restore'}
+              {locale === 'ar' ? 'تصدير نسخة احتياطية كاملة بصيغة JSON' : 'Export full store database backup'}
             </p>
           </div>
         </div>
@@ -340,27 +343,6 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ locale, onDataReset,
           >
             <Download className="w-3.5 h-3.5 text-[#2563EB]" />
             <span>{t.actions.export} (JSON)</span>
-          </button>
-        </div>
-
-        <div className="flex flex-wrap items-center justify-between gap-3 pt-3 border-t border-[#E8ECF2] text-xs">
-          <div>
-            <span className="font-semibold text-[#DC5555] block">
-              {t.settings.resetSampleData}
-            </span>
-            <span className="text-[#64748B] text-[11px]">
-              {locale === 'ar'
-                ? 'إعادة ضبط النظام إلى المنتجات والطلبات النموذجية للتجربة والاختبار'
-                : 'Reset database to realistic default state for sandbox testing'}
-            </span>
-          </div>
-
-          <button
-            onClick={() => setIsResetConfirmOpen(true)}
-            className="flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold text-[#DC5555] bg-rose-50 hover:bg-rose-100 border border-rose-200 rounded-lg transition-colors cursor-pointer"
-          >
-            <RotateCcw className="w-3.5 h-3.5" />
-            <span>{t.settings.resetSampleData}</span>
           </button>
         </div>
       </div>
@@ -525,18 +507,6 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ locale, onDataReset,
           </div>
         </form>
       </Modal>
-
-      {/* Reset Confirmation */}
-      <ConfirmDialog
-        isOpen={isResetConfirmOpen}
-        onClose={() => setIsResetConfirmOpen(false)}
-        onConfirm={handleConfirmReset}
-        title={t.settings.resetSampleData}
-        description={t.settings.resetConfirm}
-        confirmText={t.actions.confirm}
-        cancelText={t.actions.cancel}
-        isDestructive
-      />
     </div>
   );
 };

@@ -319,6 +319,7 @@ export function executeExcelImport(
   operator: string = 'مدير العمليات'
 ): {
   success: boolean;
+  error?: string;
   importedNew: number;
   updatedExisting: number;
   totalProcessed: number;
@@ -328,13 +329,22 @@ export function executeExcelImport(
   let updatedExisting = 0;
   let skippedInvalid = 0;
   const marketplaces = storageService.getMarketplaces();
+  const workingProducts = storageService.getProducts().map((p) => ({
+    ...p,
+    marketplaceListings: { ...p.marketplaceListings },
+  }));
   const movementsToRecord: StockMovement[] = [];
 
   for (let rowIdx = 0; rowIdx < validRows.length; rowIdx++) {
     const row = validRows[rowIdx];
-    const existing =
-      (row.sku && storageService.getProductBySku(row.sku)) ||
-      storageService.getProductByName(row.productName);
+    const trimmedSku = row.sku ? row.sku.trim().toLowerCase() : '';
+    const trimmedName = row.productName.trim().toLowerCase();
+    const existing = workingProducts.find(
+      (p) =>
+        (trimmedSku && p.sku && p.sku.toLowerCase() === trimmedSku) ||
+        p.name.toLowerCase() === trimmedName ||
+        (p.nameAr && p.nameAr.toLowerCase() === trimmedName)
+    );
 
     if (existing) {
       const prevPhysical = existing.physicalStock;
@@ -366,8 +376,6 @@ export function executeExcelImport(
 
       if (row.imageUrl) existing.imageUrl = row.imageUrl;
       existing.updatedAt = new Date().toISOString();
-
-      storageService.saveProduct(existing);
 
       if (stockDiff !== 0) {
         movementsToRecord.push({
@@ -431,7 +439,7 @@ export function executeExcelImport(
         }
       }
 
-      storageService.saveProduct(newProduct);
+      workingProducts.unshift(newProduct);
 
       movementsToRecord.push({
         id: `mov-${Date.now()}-${rowIdx}-${Math.random().toString(36).substring(2, 6)}`,
@@ -453,8 +461,16 @@ export function executeExcelImport(
     }
   }
 
-  if (movementsToRecord.length > 0) {
-    storageService.recordStockMovements(movementsToRecord);
+  const writeRes = storageService.saveProductsBatch(workingProducts, movementsToRecord);
+  if (!writeRes.success) {
+    return {
+      success: false,
+      error: writeRes.error,
+      importedNew: 0,
+      updatedExisting: 0,
+      totalProcessed: 0,
+      skippedInvalid,
+    };
   }
 
   return {

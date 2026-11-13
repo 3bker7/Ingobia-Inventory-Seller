@@ -2,6 +2,14 @@
  * Central storage and business rules facade for Seller Operations.
  * Persists state to localStorage while delegating all business invariants,
  * state machines, financial calculations, and custody checks to pure domain engines.
+ *
+ * RELIABILITY & LIMITATIONS NOTE:
+ * Browser localStorage does NOT provide true ACID transactions, isolation locks across tabs,
+ * or two-phase commit. To prevent partial multi-key corruption on QuotaExceededError or
+ * mid-operation write failures, multi-key mutations use `commitMultiKeyWrites`, which
+ * pre-serializes payloads, snapshots prior raw key values, and executes synchronous best-effort
+ * reverse rollback if any write throws. Corrupted JSON keys are preserved intact rather than
+ * overwritten or silently reset to sample data.
  */
 
 import {
@@ -23,6 +31,7 @@ import {
   MerchantRecommendation,
   RecommendationStatus,
   ShipmentRecord,
+  StorageWriteResult,
 } from '../types';
 import {
   STORAGE_KEYS,
@@ -54,6 +63,7 @@ import {
 import {
   computeFinancialSummary,
   computeOrderFinancialBreakdown,
+  FinancialSummaryResult,
   resolveOrderItemUnitCost,
 } from '../domain/financialLedger';
 import { saveSmartImportOrdersPure } from '../domain/smartImportCustody';
@@ -71,70 +81,351 @@ export {
   DEFAULT_FINANCIAL_TRANSACTIONS,
 };
 
+const LIFECYCLE_DEDUP_MOVEMENT_TYPES = new Set([
+  'order_created',
+  'handover_to_courier',
+  'order_delivered',
+  'order_cancelled',
+  'return_initiated',
+  'return_received_warehouse',
+  'return_restocked',
+  'return_damaged',
+  'return_missing',
+]);
+
+function isQuotaExceededError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const anyErr = err as { name?: string; code?: number; message?: string };
+  if (
+    anyErr.name === 'QuotaExceededError' ||
+    anyErr.name === 'NS_ERROR_DOM_QUOTA_REACHED' ||
+    anyErr.code === 22 ||
+    anyErr.code === 1014
+  ) {
+    return true;
+  }
+  return typeof anyErr.message === 'string' && /quota/i.test(anyErr.message);
+}
+
+function formatWriteError(err: unknown): string {
+  if (isQuotaExceededError(err)) {
+    return 'مساحة التخزين المحلية (localStorage) ممتلئة؛ لم يتم حفظ التغييرات وتم استرجاع الحالة السابقة.';
+  }
+  if (err instanceof Error && err.message) {
+    return `فشل الحفظ في التخزين المحلي: ${err.message}`;
+  }
+  return 'تعذر حفظ البيانات في التخزين المحلي.';
+}
+
 class StorageService {
+  private corruptedKeys = new Set<string>();
+
   private hasStorage(): boolean {
     return typeof globalThis !== 'undefined' && typeof globalThis.localStorage !== 'undefined';
+  }
+
+  public getCorruptedKeys(): string[] {
+    return Array.from(this.corruptedKeys);
+  }
+
+  public hasCorruptedData(): boolean {
+    return this.corruptedKeys.size > 0;
+  }
+
+  public clearCorruptedKeyWarning(key?: string): void {
+    if (key) {
+      this.corruptedKeys.delete(key);
+    } else {
+      this.corruptedKeys.clear();
+    }
   }
 
   private get<T>(key: string, defaultVal: T): T {
     if (!this.hasStorage()) return defaultVal;
     try {
       const data = globalThis.localStorage.getItem(key);
-      if (!data) return defaultVal;
-      return JSON.parse(data) as T;
+      if (data === null || data === '') {
+        this.corruptedKeys.delete(key);
+        return defaultVal;
+      }
+      const parsed = JSON.parse(data) as T;
+      this.corruptedKeys.delete(key);
+      return parsed;
     } catch (e) {
-      console.error(`Failed to read ${key} from storage:`, e);
+      // Preserve corrupted raw data intact instead of overwriting or silently resetting.
+      this.corruptedKeys.add(key);
+      console.error(`Failed to read ${key} from storage (raw data preserved):`, e);
       return defaultVal;
     }
   }
 
-  private set<T>(key: string, value: T): void {
-    if (!this.hasStorage()) return;
+  private set<T>(key: string, value: T): StorageWriteResult {
+    return this.commitMultiKeyWrites([{ key, value }]);
+  }
+
+  /**
+   * Executes multi-key writes with pre-write serialization and synchronous best-effort
+   * rollback upon any failure (e.g., QuotaExceededError).
+   *
+   * Limitation: localStorage does not support native ACID transactions, multi-tab locking,
+   * or isolated snapshots across browser contexts; if rollback itself hits a storage lock,
+   * `rollbackError` is returned alongside `rolledBack: false`.
+   */
+  public commitMultiKeyWrites(
+    entries: Array<{ key: string; value: unknown }>,
+    options: { allowOverwriteCorrupted?: boolean } = {}
+  ): StorageWriteResult {
+    if (!this.hasStorage()) return { success: true };
+    if (entries.length === 0) return { success: true };
+
+    // Deduplicate target keys keeping the last payload if caller included duplicates
+    const dedupMap = new Map<string, unknown>();
+    for (const entry of entries) {
+      dedupMap.set(entry.key, entry.value);
+    }
+    const targetKeys = Array.from(dedupMap.keys());
+
+    if (!options.allowOverwriteCorrupted) {
+      const blocked = targetKeys.filter((k) => this.corruptedKeys.has(k));
+      if (blocked.length > 0) {
+        return {
+          success: false,
+          error: `تم إيقاف الكتابة لحماية بيانات تالفة في التخزين (${blocked.join(', ')}) من الكتابة فوقها.`,
+        };
+      }
+    }
+
+    // 1. Pre-serialize every payload before mutating localStorage
+    const serializedEntries: Array<{ key: string; raw: string }> = [];
     try {
-      globalThis.localStorage.setItem(key, JSON.stringify(value));
+      for (const [key, value] of dedupMap.entries()) {
+        serializedEntries.push({ key, raw: JSON.stringify(value) });
+      }
     } catch (e) {
-      console.error(`Failed to write ${key} to storage:`, e);
+      console.error('Failed to serialize storage payload:', e);
+      return {
+        success: false,
+        error: formatWriteError(e),
+        quotaExceeded: isQuotaExceededError(e),
+        rolledBack: true,
+      };
     }
+
+    // 2. Capture raw pre-write snapshots of every target key
+    const snapshots: Array<{ key: string; existed: boolean; rawValue: string | null }> = [];
+    try {
+      for (const { key } of serializedEntries) {
+        const rawValue = globalThis.localStorage.getItem(key);
+        snapshots.push({
+          key,
+          existed: rawValue !== null,
+          rawValue,
+        });
+      }
+    } catch (e) {
+      console.error('Failed to snapshot prior localStorage keys:', e);
+      return {
+        success: false,
+        error: formatWriteError(e),
+        quotaExceeded: isQuotaExceededError(e),
+        rolledBack: false,
+      };
+    }
+
+    // 3. Apply writes sequentially; roll back previously touched keys on first error
+    let failedIndex = -1;
+    let writeErr: unknown = null;
+
+    for (let i = 0; i < serializedEntries.length; i++) {
+      const { key, raw } = serializedEntries[i];
+      try {
+        globalThis.localStorage.setItem(key, raw);
+      } catch (e) {
+        failedIndex = i;
+        writeErr = e;
+        console.error(`Failed to write ${key} to storage:`, e);
+        break;
+      }
+    }
+
+    if (failedIndex === -1) {
+      if (options.allowOverwriteCorrupted) {
+        for (const k of targetKeys) {
+          this.corruptedKeys.delete(k);
+        }
+      }
+      return { success: true };
+    }
+
+    // 4. Synchronous best-effort reverse rollback of already-written keys (failedIndex itself never wrote)
+    let rollbackError: string | undefined;
+    for (let j = failedIndex - 1; j >= 0; j--) {
+      const snap = snapshots[j];
+      try {
+        if (snap.existed && snap.rawValue !== null) {
+          globalThis.localStorage.setItem(snap.key, snap.rawValue);
+        } else {
+          globalThis.localStorage.removeItem(snap.key);
+        }
+      } catch (rbErr) {
+        console.error(`Rollback failed for ${snap.key}:`, rbErr);
+        rollbackError = rbErr instanceof Error ? rbErr.message : String(rbErr);
+      }
+    }
+
+    return {
+      success: false,
+      error: formatWriteError(writeErr),
+      quotaExceeded: isQuotaExceededError(writeErr),
+      rolledBack: rollbackError === undefined,
+      rollbackError,
+    };
   }
 
-  public init(): void {
-    if (!this.hasStorage()) return;
-    if (!globalThis.localStorage.getItem(STORAGE_KEYS.PRODUCTS)) {
-      this.set(STORAGE_KEYS.PRODUCTS, DEFAULT_PRODUCTS);
-    }
-    if (!globalThis.localStorage.getItem(STORAGE_KEYS.ORDERS)) {
-      this.set(STORAGE_KEYS.ORDERS, DEFAULT_ORDERS);
-    }
-    if (!globalThis.localStorage.getItem(STORAGE_KEYS.MOVEMENTS)) {
-      this.set(STORAGE_KEYS.MOVEMENTS, DEFAULT_MOVEMENTS);
-    }
-    if (!globalThis.localStorage.getItem(STORAGE_KEYS.RETURNS)) {
-      this.set(STORAGE_KEYS.RETURNS, DEFAULT_RETURNS);
-    }
-    if (!globalThis.localStorage.getItem(STORAGE_KEYS.PRICE_HISTORY)) {
-      this.set(STORAGE_KEYS.PRICE_HISTORY, DEFAULT_PRICE_HISTORY);
-    }
-    if (!globalThis.localStorage.getItem(STORAGE_KEYS.SETTINGS)) {
-      this.set(STORAGE_KEYS.SETTINGS, DEFAULT_SETTINGS);
-    }
-    if (!globalThis.localStorage.getItem(STORAGE_KEYS.FINANCIAL_TRANSACTIONS)) {
-      this.set(STORAGE_KEYS.FINANCIAL_TRANSACTIONS, DEFAULT_FINANCIAL_TRANSACTIONS);
-    }
+  /**
+   * Initializes missing keys to an EMPTY production store ([]).
+   * Preserves existing stored records and NEVER auto-seeds demo/fake products on general startup.
+   */
+  public init(): StorageWriteResult {
+    if (!this.hasStorage()) return { success: true };
+    const entries: Array<{ key: string; value: unknown }> = [];
+    const queueIfMissing = (key: string, emptyValue: unknown) => {
+      if (globalThis.localStorage.getItem(key) === null) {
+        entries.push({ key, value: emptyValue });
+      }
+    };
+    queueIfMissing(STORAGE_KEYS.PRODUCTS, []);
+    queueIfMissing(STORAGE_KEYS.ORDERS, []);
+    queueIfMissing(STORAGE_KEYS.MOVEMENTS, []);
+    queueIfMissing(STORAGE_KEYS.RETURNS, []);
+    queueIfMissing(STORAGE_KEYS.PRICE_HISTORY, []);
+    queueIfMissing(STORAGE_KEYS.SETTINGS, DEFAULT_SETTINGS);
+    queueIfMissing(STORAGE_KEYS.FINANCIAL_TRANSACTIONS, []);
+
+    if (entries.length === 0) return { success: true };
+    return this.commitMultiKeyWrites(entries);
   }
 
-  public resetToSample(): void {
-    this.set(STORAGE_KEYS.PRODUCTS, DEFAULT_PRODUCTS);
-    this.set(STORAGE_KEYS.ORDERS, DEFAULT_ORDERS);
-    this.set(STORAGE_KEYS.MOVEMENTS, DEFAULT_MOVEMENTS);
-    this.set(STORAGE_KEYS.RETURNS, DEFAULT_RETURNS);
-    this.set(STORAGE_KEYS.PRICE_HISTORY, DEFAULT_PRICE_HISTORY);
-    this.set(STORAGE_KEYS.SETTINGS, DEFAULT_SETTINGS);
-    this.set(STORAGE_KEYS.FINANCIAL_TRANSACTIONS, DEFAULT_FINANCIAL_TRANSACTIONS);
+  /**
+   * Developer-only action: populates the realistic demo catalog, orders, returns, and ledger
+   * exclusively for pre-launch testing from Developer Center.
+   */
+  public loadDemoSampleData(): StorageWriteResult {
+    return this.commitMultiKeyWrites(
+      [
+        { key: STORAGE_KEYS.PRODUCTS, value: DEFAULT_PRODUCTS },
+        { key: STORAGE_KEYS.ORDERS, value: DEFAULT_ORDERS },
+        { key: STORAGE_KEYS.MOVEMENTS, value: DEFAULT_MOVEMENTS },
+        { key: STORAGE_KEYS.RETURNS, value: DEFAULT_RETURNS },
+        { key: STORAGE_KEYS.PRICE_HISTORY, value: DEFAULT_PRICE_HISTORY },
+        { key: STORAGE_KEYS.SETTINGS, value: DEFAULT_SETTINGS },
+        { key: STORAGE_KEYS.FINANCIAL_TRANSACTIONS, value: DEFAULT_FINANCIAL_TRANSACTIONS },
+      ],
+      { allowOverwriteCorrupted: true }
+    );
+  }
+
+  /**
+   * Alias retained for Developer Center and automated tests.
+   * NEVER invoked automatically during runtime or error recovery.
+   */
+  public resetToSample(): StorageWriteResult {
+    return this.loadDemoSampleData();
+  }
+
+  /**
+   * Developer-only action: wipes all demo/operational entities back to clean empty arrays ([])
+   * while keeping storefront settings intact.
+   */
+  public clearAllStoreData(): StorageWriteResult {
+    return this.commitMultiKeyWrites(
+      [
+        { key: STORAGE_KEYS.PRODUCTS, value: [] },
+        { key: STORAGE_KEYS.ORDERS, value: [] },
+        { key: STORAGE_KEYS.MOVEMENTS, value: [] },
+        { key: STORAGE_KEYS.RETURNS, value: [] },
+        { key: STORAGE_KEYS.PRICE_HISTORY, value: [] },
+        { key: STORAGE_KEYS.FINANCIAL_TRANSACTIONS, value: [] },
+        { key: STORAGE_KEYS.SMART_IMPORT_HISTORY, value: [] },
+        { key: STORAGE_KEYS.RECOMMENDATIONS, value: [] },
+      ],
+      { allowOverwriteCorrupted: true }
+    );
+  }
+
+  // --- Internal Deduplication Helpers ---
+  private prepareMovementsAppend(
+    existing: StockMovement[],
+    incoming: StockMovement[]
+  ): StockMovement[] {
+    if (!incoming || incoming.length === 0) return existing;
+    const existingIds = new Set(existing.map((m) => m.id));
+    const existingLifecycleKeys = new Set(
+      existing
+        .filter((m) => LIFECYCLE_DEDUP_MOVEMENT_TYPES.has(m.type))
+        .map((m) => `${m.type}|${m.productId}|${m.referenceOrderId || ''}|${m.referenceReturnId || ''}`)
+    );
+
+    const uniqueToAdd: StockMovement[] = [];
+    for (const m of incoming) {
+      if (m.id && existingIds.has(m.id)) continue;
+      if (LIFECYCLE_DEDUP_MOVEMENT_TYPES.has(m.type)) {
+        const sig = `${m.type}|${m.productId}|${m.referenceOrderId || ''}|${m.referenceReturnId || ''}`;
+        if (existingLifecycleKeys.has(sig)) continue;
+      }
+      if (m.id) existingIds.add(m.id);
+      uniqueToAdd.push(m);
+    }
+
+    if (uniqueToAdd.length === 0) return existing;
+    return [...uniqueToAdd, ...existing];
+  }
+
+  private prepareTransactionsAppend(
+    existing: FinancialTransaction[],
+    incoming: Array<Omit<FinancialTransaction, 'id' | 'date'> & { id?: string; date?: string }>
+  ): { list: FinancialTransaction[]; added: FinancialTransaction[] } {
+    if (!incoming || incoming.length === 0) return { list: existing, added: [] };
+    const existingIds = new Set(existing.map((t) => t.id));
+    const existingAutoSignatures = new Set(
+      existing
+        .filter((t) => t.status !== 'cancelled' && t.source === 'automatic' && t.type !== 'adjustment')
+        .map((t) =>
+          t.type === 'damage_writeoff'
+            ? `auto|${t.orderId}|${t.returnId || ''}|${t.type}|${t.status}|${t.amount}|${t.notes || ''}`
+            : `auto|${t.orderId}|${t.returnId || ''}|${t.type}|${t.status}`
+        )
+    );
+
+    const added: FinancialTransaction[] = [];
+    for (let i = 0; i < incoming.length; i++) {
+      const tx = incoming[i];
+      if (tx.id && existingIds.has(tx.id)) continue;
+      if (tx.status !== 'cancelled' && tx.source === 'automatic' && tx.type !== 'adjustment') {
+        const sig =
+          tx.type === 'damage_writeoff'
+            ? `auto|${tx.orderId}|${tx.returnId || ''}|${tx.type}|${tx.status}|${tx.amount}|${tx.notes || ''}`
+            : `auto|${tx.orderId}|${tx.returnId || ''}|${tx.type}|${tx.status}`;
+        if (existingAutoSignatures.has(sig)) continue;
+        existingAutoSignatures.add(sig);
+      }
+
+      const fullTx: FinancialTransaction = {
+        id: tx.id || `tx-${Date.now()}-${i}-${Math.random().toString(36).substring(2, 6)}`,
+        date: tx.date || new Date().toISOString(),
+        ...tx,
+      };
+      existingIds.add(fullTx.id);
+      added.push(fullTx);
+    }
+
+    if (added.length === 0) return { list: existing, added: [] };
+    return { list: [...added, ...existing], added };
   }
 
   // --- Products ---
   public getProducts(): Product[] {
-    const raw = this.get<Product[]>(STORAGE_KEYS.PRODUCTS, DEFAULT_PRODUCTS);
+    const raw = this.get<Product[]>(STORAGE_KEYS.PRODUCTS, []);
     return raw.map(normalizeProductCustody);
   }
 
@@ -157,8 +448,15 @@ class StorageService {
     return this.getProducts().find((p) => p.id === id);
   }
 
-  public saveProduct(product: Product): void {
+  public saveProduct(product: Product): StorageWriteResult {
     const products = this.getProducts();
+    if (this.corruptedKeys.has(STORAGE_KEYS.PRODUCTS)) {
+      return {
+        success: false,
+        error: 'بيانات المنتجات المخزنة تالفة ولا يمكن الكتابة فوقها تلقائياً.',
+      };
+    }
+
     const normalized = normalizeProductCustody(product);
     const index = products.findIndex((p) => p.id === normalized.id);
     const nowIso = new Date().toISOString();
@@ -172,32 +470,60 @@ class StorageService {
         updatedAt: nowIso,
       });
     }
-    this.set(STORAGE_KEYS.PRODUCTS, products);
+    return this.set(STORAGE_KEYS.PRODUCTS, products);
   }
 
-  public deleteProduct(id: string): boolean {
-    const products = this.getProducts().filter((p) => p.id !== id);
-    this.set(STORAGE_KEYS.PRODUCTS, products);
-    return true;
+  public saveProductsBatch(
+    nextProducts: Product[],
+    newMovements: StockMovement[] = []
+  ): StorageWriteResult {
+    const existingMovements = this.getMovements();
+    const writes: Array<{ key: string; value: unknown }> = [
+      { key: STORAGE_KEYS.PRODUCTS, value: nextProducts.map(normalizeProductCustody) },
+    ];
+    if (newMovements.length > 0) {
+      writes.push({
+        key: STORAGE_KEYS.MOVEMENTS,
+        value: this.prepareMovementsAppend(existingMovements, newMovements),
+      });
+    }
+    return this.commitMultiKeyWrites(writes);
   }
 
-  public updateProductPrice(
+  public deleteProduct(id: string): StorageWriteResult {
+    const current = this.getProducts();
+    if (this.corruptedKeys.has(STORAGE_KEYS.PRODUCTS)) {
+      return {
+        success: false,
+        error: 'بيانات المنتجات المخزنة تالفة ولا يمكن تعديلها تلقائياً.',
+      };
+    }
+    const products = current.filter((p) => p.id !== id);
+    return this.set(STORAGE_KEYS.PRODUCTS, products);
+  }
+
+  public updateProductPriceWithResult(
     productId: string,
     marketplaceId: MarketplaceId,
     newPrice: number,
     reason?: string,
     changedBy: string = 'مدير العمليات'
-  ): PriceHistoryRecord | null {
+  ): StorageWriteResult & { record?: PriceHistoryRecord | null } {
     const products = this.getProducts();
+    const history = this.getPriceHistory();
     const product = products.find((p) => p.id === productId);
-    if (!product) return null;
+    if (!product) {
+      return { success: false, error: 'المنتج غير موجود.' };
+    }
 
     const existingListingPrice = product.marketplaceListings[marketplaceId]?.price;
     const previousPrice =
       typeof existingListingPrice === 'number' ? existingListingPrice : product.currentPrice;
 
     const metrics = computePriceChangeMetrics(previousPrice, newPrice);
-    if (!metrics.valid || previousPrice === newPrice) return null;
+    if (!metrics.valid || previousPrice === newPrice) {
+      return { success: true, record: null };
+    }
 
     const nowIso = new Date().toISOString();
     if (!product.marketplaceListings[marketplaceId]) {
@@ -215,7 +541,6 @@ class StorageService {
 
     product.currentPrice = newPrice;
     product.updatedAt = nowIso;
-    this.set(STORAGE_KEYS.PRODUCTS, products);
 
     const historyRecord: PriceHistoryRecord = {
       id: `ph-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
@@ -232,16 +557,39 @@ class StorageService {
       timestamp: nowIso,
     };
 
-    const history = this.getPriceHistory();
-    history.unshift(historyRecord);
-    this.set(STORAGE_KEYS.PRICE_HISTORY, history);
+    const nextHistory = [historyRecord, ...history];
+    const writeRes = this.commitMultiKeyWrites([
+      { key: STORAGE_KEYS.PRODUCTS, value: products },
+      { key: STORAGE_KEYS.PRICE_HISTORY, value: nextHistory },
+    ]);
 
-    return historyRecord;
+    if (!writeRes.success) {
+      return { ...writeRes, record: null };
+    }
+
+    return { success: true, record: historyRecord };
+  }
+
+  public updateProductPrice(
+    productId: string,
+    marketplaceId: MarketplaceId,
+    newPrice: number,
+    reason?: string,
+    changedBy: string = 'مدير العمليات'
+  ): PriceHistoryRecord | null {
+    const res = this.updateProductPriceWithResult(
+      productId,
+      marketplaceId,
+      newPrice,
+      reason,
+      changedBy
+    );
+    return res.success ? res.record || null : null;
   }
 
   // --- Orders & Strict Inventory Logic ---
   public getOrders(): Order[] {
-    return this.get<Order[]>(STORAGE_KEYS.ORDERS, DEFAULT_ORDERS);
+    return this.get<Order[]>(STORAGE_KEYS.ORDERS, []);
   }
 
   public getActiveOrders(): Order[] {
@@ -256,11 +604,21 @@ class StorageService {
     orderData: Omit<Order, 'id' | 'createdAt' | 'updatedAt' | 'stockDeducted' | 'isClosed'>,
     customId?: string,
     operator: string = 'مدير العمليات'
-  ): { success: boolean; order?: Order; error?: string } {
+  ): {
+    success: boolean;
+    order?: Order;
+    error?: string;
+    quotaExceeded?: boolean;
+    rolledBack?: boolean;
+  } {
+    const existingProducts = this.getProducts();
+    const existingOrders = this.getOrders();
+    const existingMovements = this.getMovements();
+
     const res = createOrderPure({
       orderData,
-      products: this.getProducts(),
-      existingOrders: this.getOrders(),
+      products: existingProducts,
+      existingOrders,
       customId,
       operator,
     });
@@ -269,10 +627,25 @@ class StorageService {
       return { success: false, error: res.error };
     }
 
-    this.set(STORAGE_KEYS.PRODUCTS, res.products);
-    this.set(STORAGE_KEYS.ORDERS, res.orders);
+    const writes: Array<{ key: string; value: unknown }> = [
+      { key: STORAGE_KEYS.PRODUCTS, value: res.products },
+      { key: STORAGE_KEYS.ORDERS, value: res.orders },
+    ];
     if (res.movements.length > 0) {
-      this.recordStockMovements(res.movements);
+      writes.push({
+        key: STORAGE_KEYS.MOVEMENTS,
+        value: this.prepareMovementsAppend(existingMovements, res.movements),
+      });
+    }
+
+    const writeRes = this.commitMultiKeyWrites(writes);
+    if (!writeRes.success) {
+      return {
+        success: false,
+        error: writeRes.error,
+        quotaExceeded: writeRes.quotaExceeded,
+        rolledBack: writeRes.rolledBack,
+      };
     }
 
     return { success: true, order: res.order };
@@ -283,14 +656,20 @@ class StorageService {
     newStatus: OrderStatus,
     operator: string = 'مدير العمليات',
     shipmentDetails?: Partial<ShipmentRecord>
-  ): { success: boolean; error?: string } {
+  ): StorageWriteResult {
     const settings = this.getSettings();
+    const existingOrders = this.getOrders();
+    const existingProducts = this.getProducts();
+    const existingReturns = this.getReturns();
+    const existingMovements = this.getMovements();
+    const existingTransactions = this.getFinancialTransactions();
+
     const res = updateOrderStatusPure({
       orderId,
       newStatus,
-      orders: this.getOrders(),
-      products: this.getProducts(),
-      returns: this.getReturns(),
+      orders: existingOrders,
+      products: existingProducts,
+      returns: existingReturns,
       currency: settings.currency || 'SAR',
       operator,
       shipmentDetails,
@@ -300,23 +679,35 @@ class StorageService {
       return { success: false, error: res.error };
     }
 
-    this.set(STORAGE_KEYS.ORDERS, res.orders);
-    this.set(STORAGE_KEYS.PRODUCTS, res.products);
-    this.set(STORAGE_KEYS.RETURNS, res.returns);
+    const writes: Array<{ key: string; value: unknown }> = [
+      { key: STORAGE_KEYS.ORDERS, value: res.orders },
+      { key: STORAGE_KEYS.PRODUCTS, value: res.products },
+      { key: STORAGE_KEYS.RETURNS, value: res.returns },
+    ];
 
     if (res.newMovements.length > 0) {
-      this.recordStockMovements(res.newMovements);
-    }
-    for (const tx of res.newTransactions) {
-      this.recordFinancialTransaction(tx);
+      writes.push({
+        key: STORAGE_KEYS.MOVEMENTS,
+        value: this.prepareMovementsAppend(existingMovements, res.newMovements),
+      });
     }
 
-    return { success: true };
+    if (res.newTransactions.length > 0) {
+      const txPrep = this.prepareTransactionsAppend(existingTransactions, res.newTransactions);
+      if (txPrep.added.length > 0) {
+        writes.push({
+          key: STORAGE_KEYS.FINANCIAL_TRANSACTIONS,
+          value: txPrep.list,
+        });
+      }
+    }
+
+    return this.commitMultiKeyWrites(writes);
   }
 
   // --- Returns Management ---
   public getReturns(): ReturnRecord[] {
-    const raw = this.get<ReturnRecord[]>(STORAGE_KEYS.RETURNS, DEFAULT_RETURNS);
+    const raw = this.get<ReturnRecord[]>(STORAGE_KEYS.RETURNS, []);
     return raw.map((r) => {
       let status: ReturnStatus = r.returnStatus;
       let isCompleted = r.isCompleted;
@@ -355,13 +746,18 @@ class StorageService {
     operator: string = 'مدير العمليات',
     notes?: string,
     shipment?: Partial<ShipmentRecord>
-  ): { success: boolean; error?: string } {
+  ): StorageWriteResult {
+    const existingReturns = this.getReturns();
+    const existingProducts = this.getProducts();
+    const existingOrders = this.getOrders();
+    const existingMovements = this.getMovements();
+
     const res = advanceReturnStatusPure({
       returnId,
       targetStatus,
-      returns: this.getReturns(),
-      products: this.getProducts(),
-      orders: this.getOrders(),
+      returns: existingReturns,
+      products: existingProducts,
+      orders: existingOrders,
       operator,
       notes,
       shipment,
@@ -371,14 +767,18 @@ class StorageService {
       return { success: false, error: res.error };
     }
 
-    this.set(STORAGE_KEYS.RETURNS, res.returns);
-    this.set(STORAGE_KEYS.PRODUCTS, res.products);
-
+    const writes: Array<{ key: string; value: unknown }> = [
+      { key: STORAGE_KEYS.RETURNS, value: res.returns },
+      { key: STORAGE_KEYS.PRODUCTS, value: res.products },
+    ];
     if (res.newMovements.length > 0) {
-      this.recordStockMovements(res.newMovements);
+      writes.push({
+        key: STORAGE_KEYS.MOVEMENTS,
+        value: this.prepareMovementsAppend(existingMovements, res.newMovements),
+      });
     }
 
-    return { success: true };
+    return this.commitMultiKeyWrites(writes);
   }
 
   public processReturnInspection(
@@ -387,16 +787,27 @@ class StorageService {
     condition: 'like_new' | 'opened_good' | 'damaged' | 'lost',
     notes: string,
     operator: string = 'مدير العمليات'
-  ): { success: boolean; message: string } {
+  ): {
+    success: boolean;
+    message: string;
+    quotaExceeded?: boolean;
+    rolledBack?: boolean;
+  } {
     const settings = this.getSettings();
+    const existingReturns = this.getReturns();
+    const existingProducts = this.getProducts();
+    const existingOrders = this.getOrders();
+    const existingMovements = this.getMovements();
+    const existingTransactions = this.getFinancialTransactions();
+
     const res = processReturnInspectionPure({
       returnId,
       outcome,
       condition,
       notes,
-      returns: this.getReturns(),
-      products: this.getProducts(),
-      orders: this.getOrders(),
+      returns: existingReturns,
+      products: existingProducts,
+      orders: existingOrders,
       currency: settings.currency || 'SAR',
       operator,
     });
@@ -405,15 +816,37 @@ class StorageService {
       return { success: false, message: res.message };
     }
 
-    this.set(STORAGE_KEYS.RETURNS, res.returns);
-    this.set(STORAGE_KEYS.PRODUCTS, res.products);
-    this.set(STORAGE_KEYS.ORDERS, res.orders);
+    const writes: Array<{ key: string; value: unknown }> = [
+      { key: STORAGE_KEYS.RETURNS, value: res.returns },
+      { key: STORAGE_KEYS.PRODUCTS, value: res.products },
+      { key: STORAGE_KEYS.ORDERS, value: res.orders },
+    ];
 
     if (res.newMovements.length > 0) {
-      this.recordStockMovements(res.newMovements);
+      writes.push({
+        key: STORAGE_KEYS.MOVEMENTS,
+        value: this.prepareMovementsAppend(existingMovements, res.newMovements),
+      });
     }
-    for (const tx of res.newTransactions) {
-      this.recordFinancialTransaction(tx);
+
+    if (res.newTransactions.length > 0) {
+      const txPrep = this.prepareTransactionsAppend(existingTransactions, res.newTransactions);
+      if (txPrep.added.length > 0) {
+        writes.push({
+          key: STORAGE_KEYS.FINANCIAL_TRANSACTIONS,
+          value: txPrep.list,
+        });
+      }
+    }
+
+    const writeRes = this.commitMultiKeyWrites(writes);
+    if (!writeRes.success) {
+      return {
+        success: false,
+        message: writeRes.error || 'تعذر حفظ نتيجة فحص المرتجع.',
+        quotaExceeded: writeRes.quotaExceeded,
+        rolledBack: writeRes.rolledBack,
+      };
     }
 
     return { success: true, message: res.message };
@@ -423,15 +856,27 @@ class StorageService {
     orderId: string,
     reason: string,
     notes?: string
-  ): { success: boolean; returnRecord?: ReturnRecord; error?: string } {
+  ): {
+    success: boolean;
+    returnRecord?: ReturnRecord;
+    error?: string;
+    quotaExceeded?: boolean;
+    rolledBack?: boolean;
+  } {
     const settings = this.getSettings();
+    const existingOrders = this.getOrders();
+    const existingReturns = this.getReturns();
+    const existingProducts = this.getProducts();
+    const existingMovements = this.getMovements();
+    const existingTransactions = this.getFinancialTransactions();
+
     const res = registerPostDeliveryReturnPure({
       orderId,
       reason,
       notes,
-      orders: this.getOrders(),
-      returns: this.getReturns(),
-      products: this.getProducts(),
+      orders: existingOrders,
+      returns: existingReturns,
+      products: existingProducts,
       currency: settings.currency || 'SAR',
       operator: settings.sellerName || 'مدير العمليات',
     });
@@ -440,15 +885,37 @@ class StorageService {
       return { success: false, error: res.error };
     }
 
-    this.set(STORAGE_KEYS.PRODUCTS, res.products);
-    this.set(STORAGE_KEYS.RETURNS, res.returns);
-    this.set(STORAGE_KEYS.ORDERS, res.orders);
+    const writes: Array<{ key: string; value: unknown }> = [
+      { key: STORAGE_KEYS.PRODUCTS, value: res.products },
+      { key: STORAGE_KEYS.RETURNS, value: res.returns },
+      { key: STORAGE_KEYS.ORDERS, value: res.orders },
+    ];
 
     if (res.newMovements.length > 0) {
-      this.recordStockMovements(res.newMovements);
+      writes.push({
+        key: STORAGE_KEYS.MOVEMENTS,
+        value: this.prepareMovementsAppend(existingMovements, res.newMovements),
+      });
     }
-    for (const tx of res.newTransactions) {
-      this.recordFinancialTransaction(tx);
+
+    if (res.newTransactions.length > 0) {
+      const txPrep = this.prepareTransactionsAppend(existingTransactions, res.newTransactions);
+      if (txPrep.added.length > 0) {
+        writes.push({
+          key: STORAGE_KEYS.FINANCIAL_TRANSACTIONS,
+          value: txPrep.list,
+        });
+      }
+    }
+
+    const writeRes = this.commitMultiKeyWrites(writes);
+    if (!writeRes.success) {
+      return {
+        success: false,
+        error: writeRes.error,
+        quotaExceeded: writeRes.quotaExceeded,
+        rolledBack: writeRes.rolledBack,
+      };
     }
 
     return { success: true, returnRecord: res.returnRecord };
@@ -458,7 +925,7 @@ class StorageService {
     returnId: string,
     note: string,
     operator: string = 'مدير العمليات'
-  ): { success: boolean; returnRecord?: ReturnRecord; error?: string } {
+  ): { success: boolean; returnRecord?: ReturnRecord; error?: string; quotaExceeded?: boolean } {
     const res = addReturnNotePure({
       returnId,
       note,
@@ -470,30 +937,58 @@ class StorageService {
       return { success: false, error: res.error };
     }
 
-    this.set(STORAGE_KEYS.RETURNS, res.returns);
+    const writeRes = this.set(STORAGE_KEYS.RETURNS, res.returns);
+    if (!writeRes.success) {
+      return {
+        success: false,
+        error: writeRes.error,
+        quotaExceeded: writeRes.quotaExceeded,
+      };
+    }
     return { success: true, returnRecord: res.returnRecord };
   }
 
   // --- Financial Transaction Ledger & Auditable Accounting ---
   public getFinancialTransactions(): FinancialTransaction[] {
-    return this.get<FinancialTransaction[]>(
-      STORAGE_KEYS.FINANCIAL_TRANSACTIONS,
-      DEFAULT_FINANCIAL_TRANSACTIONS
-    );
+    return this.get<FinancialTransaction[]>(STORAGE_KEYS.FINANCIAL_TRANSACTIONS, []);
+  }
+
+  public recordFinancialTransactionWithResult(
+    tx: Omit<FinancialTransaction, 'id' | 'date'> & { id?: string; date?: string }
+  ): StorageWriteResult & { transaction?: FinancialTransaction; deduplicated?: boolean } {
+    const list = this.getFinancialTransactions();
+    const prep = this.prepareTransactionsAppend(list, [tx]);
+    if (prep.added.length === 0) {
+      const existingMatch = list.find(
+        (existing) =>
+          (tx.id && existing.id === tx.id) ||
+          (existing.source === 'automatic' &&
+            tx.source === 'automatic' &&
+            existing.orderId === tx.orderId &&
+            (existing.returnId || '') === (tx.returnId || '') &&
+            existing.type === tx.type &&
+            existing.status === tx.status)
+      );
+      return { success: true, transaction: existingMatch, deduplicated: true };
+    }
+
+    const writeRes = this.set(STORAGE_KEYS.FINANCIAL_TRANSACTIONS, prep.list);
+    if (!writeRes.success) {
+      return writeRes;
+    }
+    return { success: true, transaction: prep.added[0], deduplicated: false };
   }
 
   public recordFinancialTransaction(
     tx: Omit<FinancialTransaction, 'id' | 'date'> & { id?: string; date?: string }
   ): FinancialTransaction {
-    const list = this.getFinancialTransactions();
-    const newTx: FinancialTransaction = {
-      id: tx.id || `tx-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+    const res = this.recordFinancialTransactionWithResult(tx);
+    if (res.transaction) return res.transaction;
+    return {
+      id: tx.id || `tx-unsaved-${Date.now()}`,
       date: tx.date || new Date().toISOString(),
       ...tx,
     };
-    list.unshift(newTx);
-    this.set(STORAGE_KEYS.FINANCIAL_TRANSACTIONS, list);
-    return newTx;
   }
 
   public getOrderFinancialBreakdown(orderId: string): OrderFinancialBreakdown | null {
@@ -505,7 +1000,7 @@ class StorageService {
   public getFinancialSummary(
     dateRange?: { start: Date; end: Date },
     marketplace?: MarketplaceId
-  ) {
+  ): FinancialSummaryResult {
     const orders = this.getFilteredOrders(dateRange, marketplace);
     return computeFinancialSummary(
       orders,
@@ -696,8 +1191,7 @@ class StorageService {
         updatedAt: new Date().toISOString(),
       } as MerchantRecommendation);
     }
-    this.set(STORAGE_KEYS.RECOMMENDATIONS, list);
-    return true;
+    return this.set(STORAGE_KEYS.RECOMMENDATIONS, list).success;
   }
 
   // --- Storefront Product Quality Audit ---
@@ -761,14 +1255,15 @@ class StorageService {
 
   // --- Movements Log ---
   public getMovements(): StockMovement[] {
-    return this.get<StockMovement[]>(STORAGE_KEYS.MOVEMENTS, DEFAULT_MOVEMENTS);
+    return this.get<StockMovement[]>(STORAGE_KEYS.MOVEMENTS, []);
   }
 
-  public recordStockMovements(newMovements: StockMovement[]): void {
-    if (!newMovements || newMovements.length === 0) return;
-    const movements = this.getMovements();
-    movements.unshift(...newMovements);
-    this.set(STORAGE_KEYS.MOVEMENTS, movements);
+  public recordStockMovements(newMovements: StockMovement[]): StorageWriteResult {
+    if (!newMovements || newMovements.length === 0) return { success: true };
+    const existing = this.getMovements();
+    const merged = this.prepareMovementsAppend(existing, newMovements);
+    if (merged === existing) return { success: true };
+    return this.set(STORAGE_KEYS.MOVEMENTS, merged);
   }
 
   public manualStockAdjustmentWithResult(
@@ -776,7 +1271,7 @@ class StorageService {
     newPhysicalStock: number,
     reason: string,
     operator: string = 'مدير العمليات'
-  ): { success: boolean; error?: string } {
+  ): StorageWriteResult {
     const res = applyManualStockAdjustmentPure(
       this.getProducts(),
       productId,
@@ -789,11 +1284,17 @@ class StorageService {
       return { success: false, error: res.error };
     }
 
-    this.set(STORAGE_KEYS.PRODUCTS, res.products);
+    const writes: Array<{ key: string; value: unknown }> = [
+      { key: STORAGE_KEYS.PRODUCTS, value: res.products },
+    ];
     if (res.movement) {
-      this.recordStockMovements([res.movement]);
+      writes.push({
+        key: STORAGE_KEYS.MOVEMENTS,
+        value: this.prepareMovementsAppend(this.getMovements(), [res.movement]),
+      });
     }
-    return { success: true };
+
+    return this.commitMultiKeyWrites(writes);
   }
 
   public manualStockAdjustment(
@@ -807,7 +1308,7 @@ class StorageService {
 
   // --- Price History ---
   public getPriceHistory(): PriceHistoryRecord[] {
-    return this.get<PriceHistoryRecord[]>(STORAGE_KEYS.PRICE_HISTORY, DEFAULT_PRICE_HISTORY);
+    return this.get<PriceHistoryRecord[]>(STORAGE_KEYS.PRICE_HISTORY, []);
   }
 
   // --- Settings ---
@@ -815,16 +1316,17 @@ class StorageService {
     return this.get<AppSettings>(STORAGE_KEYS.SETTINGS, DEFAULT_SETTINGS);
   }
 
-  public saveSettings(settings: AppSettings): void {
-    this.set(STORAGE_KEYS.SETTINGS, settings);
+  public saveSettings(settings: AppSettings): StorageWriteResult {
+    return this.set(STORAGE_KEYS.SETTINGS, settings);
   }
 
-  public addMarketplace(marketplace: MarketplaceConfig): void {
+  public addMarketplace(marketplace: MarketplaceConfig): StorageWriteResult {
     const settings = this.getSettings();
     if (!settings.marketplaces.some((m) => m.id === marketplace.id)) {
       settings.marketplaces.push(marketplace);
-      this.saveSettings(settings);
+      return this.saveSettings(settings);
     }
+    return { success: true };
   }
 
   // --- Filtered Analytics Helpers ---
@@ -871,10 +1373,10 @@ class StorageService {
     return this.get<SmartImportHistory[]>(STORAGE_KEYS.SMART_IMPORT_HISTORY, []);
   }
 
-  public saveSmartImportHistory(record: SmartImportHistory): void {
+  public saveSmartImportHistory(record: SmartImportHistory): StorageWriteResult {
     const history = this.getSmartImportHistory();
     history.unshift(record);
-    this.set(STORAGE_KEYS.SMART_IMPORT_HISTORY, history);
+    return this.set(STORAGE_KEYS.SMART_IMPORT_HISTORY, history);
   }
 
   public saveSmartImportOrders(
@@ -883,27 +1385,30 @@ class StorageService {
     fileName: string,
     operator: string = 'مدير العمليات'
   ): {
+    success: boolean;
+    error?: string;
+    quotaExceeded?: boolean;
+    rolledBack?: boolean;
     importedCount: number;
     historicalCount: number;
     duplicateCount: number;
   } {
+    const existingOrders = this.getOrders();
+    const existingProducts = this.getProducts();
+    const existingReturns = this.getReturns();
+    const existingMovements = this.getMovements();
+    const existingHistory = this.getSmartImportHistory();
+
     const res = saveSmartImportOrdersPure({
       ordersToImport,
       isHistoricalDeducted,
-      existingOrders: this.getOrders(),
-      products: this.getProducts(),
-      returns: this.getReturns(),
+      existingOrders,
+      products: existingProducts,
+      returns: existingReturns,
       operator,
     });
 
-    this.set(STORAGE_KEYS.ORDERS, res.orders);
-    this.set(STORAGE_KEYS.PRODUCTS, res.products);
-    this.set(STORAGE_KEYS.RETURNS, res.returns);
-    if (res.newMovements.length > 0) {
-      this.recordStockMovements(res.newMovements);
-    }
-
-    this.saveSmartImportHistory({
+    const historyRecord: SmartImportHistory = {
       id: `smi-${Date.now()}`,
       marketplaceId: ordersToImport[0]?.marketplaceId || 'noon',
       fileName,
@@ -911,9 +1416,37 @@ class StorageService {
       totalImported: res.importedCount + res.historicalCount,
       historicalCount: res.historicalCount,
       operator,
-    });
+    };
+
+    const writes: Array<{ key: string; value: unknown }> = [
+      { key: STORAGE_KEYS.ORDERS, value: res.orders },
+      { key: STORAGE_KEYS.PRODUCTS, value: res.products },
+      { key: STORAGE_KEYS.RETURNS, value: res.returns },
+      { key: STORAGE_KEYS.SMART_IMPORT_HISTORY, value: [historyRecord, ...existingHistory] },
+    ];
+
+    if (res.newMovements.length > 0) {
+      writes.push({
+        key: STORAGE_KEYS.MOVEMENTS,
+        value: this.prepareMovementsAppend(existingMovements, res.newMovements),
+      });
+    }
+
+    const writeRes = this.commitMultiKeyWrites(writes);
+    if (!writeRes.success) {
+      return {
+        success: false,
+        error: writeRes.error,
+        quotaExceeded: writeRes.quotaExceeded,
+        rolledBack: writeRes.rolledBack,
+        importedCount: 0,
+        historicalCount: 0,
+        duplicateCount: res.duplicateCount,
+      };
+    }
 
     return {
+      success: true,
       importedCount: res.importedCount,
       historicalCount: res.historicalCount,
       duplicateCount: res.duplicateCount,
@@ -929,22 +1462,26 @@ class StorageService {
     return profile;
   }
 
-  public saveMerchantProfile(profile: MerchantProfile): void {
-    if (profile.merchantName && !profile.name) {
-      profile.name = profile.merchantName;
+  public saveMerchantProfile(profile: MerchantProfile): StorageWriteResult {
+    const nextProfile = { ...profile };
+    if (nextProfile.merchantName && !nextProfile.name) {
+      nextProfile.name = nextProfile.merchantName;
     }
-    this.set(STORAGE_KEYS.MERCHANT_PROFILE, profile);
     const settings = this.getSettings();
-    settings.storeName = profile.storeName;
-    settings.sellerName = profile.merchantName || profile.name;
-    this.saveSettings(settings);
+    settings.storeName = nextProfile.storeName;
+    settings.sellerName = nextProfile.merchantName || nextProfile.name;
+
+    return this.commitMultiKeyWrites([
+      { key: STORAGE_KEYS.MERCHANT_PROFILE, value: nextProfile },
+      { key: STORAGE_KEYS.SETTINGS, value: settings },
+    ]);
   }
 
   public completeOnboarding(
     param1: MarketplaceConfig[] | string,
     param2: string,
     param3?: string | string[] | MarketplaceConfig[]
-  ): void {
+  ): StorageWriteResult {
     let merchantName = 'أحمد بكر';
     let storeName = 'متجر الأناقة الحديثة';
     let marketplaces: MarketplaceConfig[] = this.getMarketplaces();
@@ -965,7 +1502,6 @@ class StorageService {
     settings.marketplaces = marketplaces;
     settings.storeName = storeName;
     settings.sellerName = merchantName;
-    this.saveSettings(settings);
 
     const profile = this.getMerchantProfile();
     profile.name = merchantName;
@@ -974,7 +1510,11 @@ class StorageService {
     profile.isOnboarded = true;
     profile.selectedMarketplaceIds = marketplaces.map((m) => m.id);
     profile.onboardedAt = new Date().toISOString();
-    this.saveMerchantProfile(profile);
+
+    return this.commitMultiKeyWrites([
+      { key: STORAGE_KEYS.SETTINGS, value: settings },
+      { key: STORAGE_KEYS.MERCHANT_PROFILE, value: profile },
+    ]);
   }
 
   // --- Tutorial & Interactive Learning Progress ---
@@ -1029,24 +1569,23 @@ class StorageService {
       ...settings.marketplaces[idx],
       ...updates,
     };
-    this.saveSettings(settings);
-    return true;
+    return this.saveSettings(settings).success;
   }
 
-  public removeMarketplace(id: string): { success: boolean; error?: string } {
+  public removeMarketplace(id: string): StorageWriteResult {
     const settings = this.getSettings();
     if (settings.marketplaces.length <= 1) {
       return { success: false, error: 'يجب الإبقاء على منصة بيع واحدة على الأقل.' };
     }
 
     settings.marketplaces = settings.marketplaces.filter((m) => m.id !== id);
-    this.saveSettings(settings);
-
     const profile = this.getMerchantProfile();
     profile.selectedMarketplaceIds = profile.selectedMarketplaceIds.filter((mId) => mId !== id);
-    this.saveMerchantProfile(profile);
 
-    return { success: true };
+    return this.commitMultiKeyWrites([
+      { key: STORAGE_KEYS.SETTINGS, value: settings },
+      { key: STORAGE_KEYS.MERCHANT_PROFILE, value: profile },
+    ]);
   }
 }
 

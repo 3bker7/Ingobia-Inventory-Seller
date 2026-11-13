@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { Product, Order, ReturnRecord } from '../types';
+import { Product, Order, FinancialTransaction, StockMovement } from '../types';
 import {
   applyManualStockAdjustmentPure,
   computeEditedAvailableStock,
@@ -25,7 +25,7 @@ import {
   registerPostDeliveryReturnPure,
 } from '../domain/returnLifecycle';
 import { saveSmartImportOrdersPure } from '../domain/smartImportCustody';
-import { DEFAULT_PRODUCTS, DEFAULT_ORDERS, DEFAULT_RETURNS } from '../services/seedData';
+import { DEFAULT_PRODUCTS, DEFAULT_ORDERS, DEFAULT_RETURNS, STORAGE_KEYS } from '../services/seedData';
 import { storageService } from '../services/storage';
 
 const makeProduct = (overrides: Partial<Product> = {}): Product => ({
@@ -498,18 +498,35 @@ test('financial breakdown preserves historical snapshot COGS and avoids fake pro
   assert.equal(resolved.source, 'snapshot');
 
   const breakdown = computeOrderFinancialBreakdown(deliveredOrder, [prod]);
-  assert.equal(breakdown.isProfitCalculable, true);
+  // Missing commission MUST block confirmedNet even when COGS is present, exposing recordedCostMargin & estimatedNet separately
+  assert.equal(breakdown.isProfitCalculable, false);
+  assert.equal(breakdown.confirmedNet, null);
+  assert.equal(breakdown.recordedCostMargin, 270); // 500 - 30 - 200
+  assert.equal(breakdown.estimatedNet, 210); // 270 - 60 (12% heuristic)
   assert.equal(breakdown.productCostOfGoods, 200);
   assert.equal(breakdown.cogsSource, 'snapshot');
   assert.equal(breakdown.commissionStatus, 'missing');
   assert.equal(breakdown.marketplaceCommission, 0);
   assert.equal(breakdown.estimatedMarketplaceCommission, 60);
-  assert.equal(breakdown.confirmedNet, 270); // 500 - 0 - 30 - 200
 
-  // Missing COGS blocks speculative profit
+  // Complete order with both COGS snapshot and recorded commission IS profit-calculable
+  const completeOrder = makeOrder({
+    ...deliveredOrder,
+    id: 'ORD-COMPLETE-1',
+    marketplaceCommission: 50,
+  });
+  const completeBreakdown = computeOrderFinancialBreakdown(completeOrder, [prod]);
+  assert.equal(completeBreakdown.isProfitCalculable, true);
+  assert.equal(completeBreakdown.confirmedNet, 220); // 500 - 50 - 30 - 200
+  assert.equal(completeBreakdown.recordedCostMargin, 220);
+  assert.equal(completeBreakdown.estimatedNet, 220);
+  assert.equal(completeBreakdown.commissionStatus, 'recorded');
+
+  // Missing COGS blocks all profit/margin outputs even if commission is recorded
   const noCostProd = makeProduct({ id: 'p-missing', sku: 'MISS-1', baseCost: undefined });
   const orderMissingCost = makeOrder({
     status: 'delivered',
+    marketplaceCommission: 36,
     items: [
       {
         productId: noCostProd.id,
@@ -524,6 +541,8 @@ test('financial breakdown preserves historical snapshot COGS and avoids fake pro
   const missingBreakdown = computeOrderFinancialBreakdown(orderMissingCost, [noCostProd]);
   assert.equal(missingBreakdown.isProfitCalculable, false);
   assert.equal(missingBreakdown.confirmedNet, null);
+  assert.equal(missingBreakdown.recordedCostMargin, null);
+  assert.equal(missingBreakdown.estimatedNet, null);
   assert.equal(missingBreakdown.cogsSource, 'missing');
 
   const summary = computeFinancialSummary(
@@ -545,7 +564,9 @@ test('financial breakdown preserves historical snapshot COGS and avoids fake pro
     [prod, noCostProd]
   );
   assert.equal(summary.ordersMissingCostCount, 1);
+  assert.equal(summary.ordersMissingCommissionCount, 1);
   assert.equal(summary.courierShippingExpenses, 30);
+  assert.equal(summary.estimatedUnrecordedCommissions, 60);
 });
 
 // ---------------------------------------------------------------------------
@@ -714,4 +735,490 @@ test('storageService executes end-to-end order -> return -> inspection -> price 
   const ph = storageService.updateProductPrice(targetProd.id, 'noon', targetProd.currentPrice + 10, 'تعديل سعر');
   assert.ok(ph);
   assert.equal(storageService.getPriceHistory()[0].newPrice, targetProd.currentPrice + 10);
+});
+
+// ---------------------------------------------------------------------------
+// 9. Clean Startup (No Auto-Seeded Fake Products) & Developer-Only Seeding
+// ---------------------------------------------------------------------------
+test('storageService.init starts completely empty without fake demo products unless explicitly seeded in Developer Center', () => {
+  const backing = new Map<string, string>();
+  const mockStorage: Storage = {
+    get length() {
+      return backing.size;
+    },
+    clear() {
+      backing.clear();
+    },
+    getItem(key: string) {
+      return backing.get(key) ?? null;
+    },
+    key(index: number) {
+      return Array.from(backing.keys())[index] ?? null;
+    },
+    removeItem(key: string) {
+      backing.delete(key);
+    },
+    setItem(key: string, value: string) {
+      backing.set(key, value);
+    },
+  };
+
+  Object.defineProperty(globalThis, 'localStorage', {
+    value: mockStorage,
+    configurable: true,
+    writable: true,
+  });
+
+  const initRes = storageService.init();
+  assert.equal(initRes.success, true);
+  assert.equal(storageService.getProducts().length, 0);
+  assert.equal(storageService.getOrders().length, 0);
+  assert.equal(storageService.getReturns().length, 0);
+  assert.equal(storageService.getMovements().length, 0);
+  assert.equal(storageService.getFinancialTransactions().length, 0);
+
+  // Explicit Developer Center demo seeding
+  const seedRes = storageService.loadDemoSampleData();
+  assert.equal(seedRes.success, true);
+  assert.equal(storageService.getProducts().length, DEFAULT_PRODUCTS.length);
+  assert.equal(storageService.getOrders().length, DEFAULT_ORDERS.length);
+
+  // Calling init() again preserves existing store data
+  storageService.init();
+  assert.equal(storageService.getProducts().length, DEFAULT_PRODUCTS.length);
+
+  // Explicit Developer Center clear resets to clean empty store
+  const clearRes = storageService.clearAllStoreData();
+  assert.equal(clearRes.success, true);
+  assert.equal(storageService.getProducts().length, 0);
+  assert.equal(storageService.getOrders().length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// 10. LocalStorage Reliability: QuotaExceededError, Multi-Key Rollback, Corruption Preservation, Idempotency
+// ---------------------------------------------------------------------------
+test('storageService rolls back multi-key writes on QuotaExceededError, preserves corrupted JSON, and prevents duplicate ledger/movement rows', () => {
+  const backing = new Map<string, string>();
+  let failOnKey: string | null = null;
+  let throwQuota = true;
+
+  const installMockStorage = () => {
+    const mockStorage: Storage = {
+      get length() {
+        return backing.size;
+      },
+      clear() {
+        backing.clear();
+      },
+      getItem(key: string) {
+        return backing.get(key) ?? null;
+      },
+      key(index: number) {
+        return Array.from(backing.keys())[index] ?? null;
+      },
+      removeItem(key: string) {
+        backing.delete(key);
+      },
+      setItem(key: string, value: string) {
+        if (failOnKey && key === failOnKey) {
+          if (throwQuota) {
+            const err = new Error('The quota has been exceeded.');
+            err.name = 'QuotaExceededError';
+            throw err;
+          }
+          throw new Error('Disk failure');
+        }
+        backing.set(key, value);
+      },
+    };
+    Object.defineProperty(globalThis, 'localStorage', {
+      value: mockStorage,
+      configurable: true,
+      writable: true,
+    });
+  };
+
+  installMockStorage();
+  storageService.clearAllStoreData();
+
+  const prod = makeProduct({ id: 'prod-rb-1', sku: 'RB-SKU-1', physicalStock: 10, availableStock: 10 });
+  assert.equal(storageService.saveProduct(prod).success, true);
+
+  // Snapshot before multi-key failure in createOrder:
+  // Order writes PRODUCTS -> ORDERS -> MOVEMENTS. Fail on ORDERS (2nd key)!
+  const preProductsJson = backing.get(STORAGE_KEYS.PRODUCTS);
+  const preOrdersJson = backing.get(STORAGE_KEYS.ORDERS);
+  const preMovementsJson = backing.get(STORAGE_KEYS.MOVEMENTS);
+
+  failOnKey = STORAGE_KEYS.ORDERS;
+  throwQuota = true;
+  const failedOrder = storageService.createOrder({
+    marketplaceId: 'noon',
+    customerName: 'عميل فشل مساحة',
+    shippingAddress: 'الرياض',
+    items: [
+      {
+        productId: prod.id,
+        productSku: prod.sku,
+        productName: prod.name,
+        imageUrl: prod.imageUrl,
+        quantity: 2,
+        unitPrice: 200,
+      },
+    ],
+    totalAmount: 400,
+    shippingCost: 20,
+    status: 'preparing',
+    orderDate: '2026-11-10T10:00:00Z',
+  });
+  failOnKey = null;
+
+  assert.equal(failedOrder.success, false);
+  assert.equal(failedOrder.quotaExceeded, true);
+  assert.equal(failedOrder.rolledBack, true);
+  // PRODUCTS must be restored to exact pre-operation state (availableStock=10, reservedStock=0)
+  assert.equal(backing.get(STORAGE_KEYS.PRODUCTS), preProductsJson);
+  assert.equal(backing.get(STORAGE_KEYS.ORDERS), preOrdersJson);
+  assert.equal(backing.get(STORAGE_KEYS.MOVEMENTS), preMovementsJson);
+  assert.equal(storageService.getProductById(prod.id)?.availableStock, 10);
+  assert.equal(storageService.getOrders().length, 0);
+
+  // Succeed creating an order cleanly, then fail on last key (FINANCIAL_TRANSACTIONS) during delivered status update
+  const okOrder = storageService.createOrder({
+    marketplaceId: 'noon',
+    customerName: 'عميل سليم',
+    shippingAddress: 'الرياض',
+    items: [
+      {
+        productId: prod.id,
+        productSku: prod.sku,
+        productName: prod.name,
+        imageUrl: prod.imageUrl,
+        quantity: 2,
+        unitPrice: 200,
+      },
+    ],
+    totalAmount: 400,
+    shippingCost: 20,
+    marketplaceCommission: 40,
+    status: 'preparing',
+    orderDate: '2026-11-10T10:00:00Z',
+  });
+  assert.equal(okOrder.success, true);
+
+  assert.equal(storageService.updateOrderStatus(okOrder.order!.id, 'with_delivery').success, true);
+  const preDeliverProducts = backing.get(STORAGE_KEYS.PRODUCTS);
+  const preDeliverOrders = backing.get(STORAGE_KEYS.ORDERS);
+  const preDeliverTx = backing.get(STORAGE_KEYS.FINANCIAL_TRANSACTIONS);
+
+  // Fail on FINANCIAL_TRANSACTIONS (last key of delivered transition) -> must roll back PRODUCTS, ORDERS, MOVEMENTS
+  failOnKey = STORAGE_KEYS.FINANCIAL_TRANSACTIONS;
+  const failedDeliver = storageService.updateOrderStatus(okOrder.order!.id, 'delivered');
+  failOnKey = null;
+  assert.equal(failedDeliver.success, false);
+  assert.equal(failedDeliver.rolledBack, true);
+  assert.equal(backing.get(STORAGE_KEYS.PRODUCTS), preDeliverProducts);
+  assert.equal(backing.get(STORAGE_KEYS.ORDERS), preDeliverOrders);
+  assert.equal(backing.get(STORAGE_KEYS.FINANCIAL_TRANSACTIONS), preDeliverTx);
+
+  // Idempotency: duplicate transactions and duplicate movement IDs are not duplicated
+  const txSample: FinancialTransaction = {
+    id: 'tx-idem-1',
+    orderId: okOrder.order!.id,
+    marketplaceId: 'noon',
+    type: 'courier_shipping',
+    amount: 20,
+    currency: 'SAR',
+    status: 'confirmed',
+    source: 'automatic',
+    date: '2026-11-10T10:00:00Z',
+    notes: 'شحن',
+  };
+  assert.equal(storageService.recordFinancialTransactionWithResult(txSample).success, true);
+  assert.equal(storageService.recordFinancialTransactionWithResult({ ...txSample }).success, true);
+  assert.equal(
+    storageService.getFinancialTransactions().filter((t) => t.id === 'tx-idem-1').length,
+    1
+  );
+
+  // Movement idempotency: repeating the same StockMovement id or lifecycle signature does not duplicate
+  const movSample: StockMovement = {
+    id: 'mov-idem-1',
+    productId: prod.id,
+    productName: prod.name,
+    productSku: prod.sku,
+    type: 'order_created',
+    quantityChange: -2,
+    previousPhysical: 10,
+    newPhysical: 10,
+    previousAvailable: 10,
+    newAvailable: 8,
+    reason: 'اختبار تكرار',
+    operator: 'مدير العمليات',
+    referenceOrderId: 'ORD-IDEM-CHECK',
+    timestamp: '2026-11-10T10:00:00Z',
+  };
+  assert.equal(storageService.recordStockMovements([movSample]).success, true);
+  assert.equal(storageService.recordStockMovements([{ ...movSample, id: 'mov-idem-2' }]).success, true);
+  assert.equal(
+    storageService.getMovements().filter((m) => m.referenceOrderId === 'ORD-IDEM-CHECK').length,
+    1
+  );
+
+  // Corrupted JSON preservation: never silently overwrite or trigger resetToSample
+  const rawCorrupted = '{"broken": [1, 2,';
+  backing.set(STORAGE_KEYS.PRODUCTS, rawCorrupted);
+  const readAfterCorruption = storageService.getProducts();
+  assert.deepEqual(readAfterCorruption, []);
+  assert.equal(backing.get(STORAGE_KEYS.PRODUCTS), rawCorrupted);
+  assert.ok(storageService.getCorruptedKeys().includes(STORAGE_KEYS.PRODUCTS));
+
+  // Saving a product while PRODUCTS is corrupted must refuse overwrite
+  const blockedWrite = storageService.saveProduct(prod);
+  assert.equal(blockedWrite.success, false);
+  assert.equal(backing.get(STORAGE_KEYS.PRODUCTS), rawCorrupted);
+});
+
+// ---------------------------------------------------------------------------
+// 11. Comprehensive Financial Summary Scenarios (All 8 Required Cases)
+// ---------------------------------------------------------------------------
+test('computeFinancialSummary handles all 8 confirmed/pending/cancelled, refund, filter & deduplication scenarios accurately', () => {
+  const prod = makeProduct({ id: 'p-fin', sku: 'FIN-1', baseCost: 50 });
+
+  const ordNoonJan = makeOrder({
+    id: 'ORD-NOON-JAN',
+    marketplaceId: 'noon',
+    status: 'delivered',
+    totalAmount: 1000,
+    marketplaceCommission: 100,
+    orderDate: '2026-11-10T10:00:00Z',
+    items: [
+      {
+        productId: prod.id,
+        productSku: prod.sku,
+        productName: prod.name,
+        imageUrl: prod.imageUrl,
+        quantity: 2,
+        unitPrice: 500,
+        unitCostSnapshot: 50,
+      },
+    ],
+  });
+
+  const ordAmazonJan = makeOrder({
+    id: 'ORD-AMZ-JAN',
+    marketplaceId: 'amazon',
+    status: 'delivered',
+    totalAmount: 500,
+    marketplaceCommission: 50,
+    orderDate: '2026-11-10T10:00:00Z',
+    items: [
+      {
+        productId: prod.id,
+        productSku: prod.sku,
+        productName: prod.name,
+        imageUrl: prod.imageUrl,
+        quantity: 1,
+        unitPrice: 500,
+        unitCostSnapshot: 50,
+      },
+    ],
+  });
+
+  const ordNoonOld = makeOrder({
+    id: 'ORD-NOON-OLD',
+    marketplaceId: 'noon',
+    status: 'delivered',
+    totalAmount: 400,
+    marketplaceCommission: 40,
+    orderDate: '2026-09-05T10:00:00Z',
+    items: [
+      {
+        productId: prod.id,
+        productSku: prod.sku,
+        productName: prod.name,
+        imageUrl: prod.imageUrl,
+        quantity: 1,
+        unitPrice: 400,
+        unitCostSnapshot: 50,
+      },
+    ],
+  });
+
+  const txs: FinancialTransaction[] = [
+    // Confirmed commission for Noon Jan
+    {
+      id: 'tx-comm-1',
+      orderId: ordNoonJan.id,
+      marketplaceId: 'noon',
+      type: 'marketplace_commission',
+      amount: 100,
+      currency: 'SAR',
+      status: 'confirmed',
+      source: 'automatic',
+      date: '2026-11-10T10:00:00Z',
+      notes: 'عمولة',
+    },
+    // Duplicate automatic commission with different ID (Scenario 8: deduplication)
+    {
+      id: 'tx-comm-1-dup-auto',
+      orderId: ordNoonJan.id,
+      marketplaceId: 'noon',
+      type: 'marketplace_commission',
+      amount: 100,
+      currency: 'SAR',
+      status: 'confirmed',
+      source: 'automatic',
+      date: '2026-11-10T10:00:00Z',
+      notes: 'عمولة مكررة',
+    },
+    // Scenario 1: Pending return shipping (MUST NOT enter returnShippingExpenses or confirmedExpenses)
+    {
+      id: 'tx-ret-ship-pend',
+      orderId: ordNoonJan.id,
+      returnId: 'RET-1',
+      marketplaceId: 'noon',
+      type: 'return_shipping',
+      amount: 35,
+      currency: 'SAR',
+      status: 'pending',
+      source: 'automatic',
+      date: '2026-11-11T10:00:00Z',
+      notes: 'شحن مرتجع معلق',
+    },
+    // Scenario 2: Confirmed return shipping (MUST enter returnShippingExpenses and confirmedExpenses)
+    {
+      id: 'tx-ret-ship-conf',
+      orderId: ordNoonJan.id,
+      returnId: 'RET-2',
+      marketplaceId: 'noon',
+      type: 'return_shipping',
+      amount: 25,
+      currency: 'SAR',
+      status: 'confirmed',
+      source: 'automatic',
+      date: '2026-11-12T10:00:00Z',
+      notes: 'شحن مرتجع مؤكد',
+    },
+    // Scenario 3: Cancelled transaction (MUST NOT enter confirmed OR pending totals)
+    {
+      id: 'tx-cancelled-1',
+      orderId: ordNoonJan.id,
+      marketplaceId: 'noon',
+      type: 'courier_shipping',
+      amount: 99,
+      currency: 'SAR',
+      status: 'cancelled',
+      source: 'manual',
+      date: '2026-11-12T10:00:00Z',
+      notes: 'شحنة ملغاة',
+    },
+    // Scenario 4: Confirmed customer refund (MUST be subtracted in confirmedSettlement)
+    {
+      id: 'tx-refund-conf',
+      orderId: ordNoonJan.id,
+      marketplaceId: 'noon',
+      type: 'customer_refund',
+      amount: 120,
+      currency: 'SAR',
+      status: 'confirmed',
+      source: 'manual',
+      date: '2026-11-12T12:00:00Z',
+      notes: 'استرداد مؤكد للعميل',
+    },
+    // Scenario 5: Pending customer refund (MUST NOT be subtracted from confirmedSettlement; only expectedSettlement)
+    {
+      id: 'tx-refund-pend',
+      orderId: ordNoonJan.id,
+      marketplaceId: 'noon',
+      type: 'customer_refund',
+      amount: 80,
+      currency: 'SAR',
+      status: 'pending',
+      source: 'manual',
+      date: '2026-11-12T13:00:00Z',
+      notes: 'استرداد معلق',
+    },
+    // Amazon commission in November (for Scenario 6 marketplace filter check)
+    {
+      id: 'tx-amz-comm',
+      orderId: ordAmazonJan.id,
+      marketplaceId: 'amazon',
+      type: 'marketplace_commission',
+      amount: 50,
+      currency: 'SAR',
+      status: 'confirmed',
+      source: 'automatic',
+      date: '2026-11-10T10:00:00Z',
+      notes: 'عمولة أمازون',
+    },
+    // Old Noon commission in September (for Scenario 7 date range filter check)
+    {
+      id: 'tx-old-comm',
+      orderId: ordNoonOld.id,
+      marketplaceId: 'noon',
+      type: 'marketplace_commission',
+      amount: 40,
+      currency: 'SAR',
+      status: 'confirmed',
+      source: 'automatic',
+      date: '2026-09-05T10:00:00Z',
+      notes: 'عمولة سبتمبر',
+    },
+  ];
+
+  // Duplicate ID scenario (push identical id object)
+  txs.push({ ...txs[0] });
+
+  const novRange = {
+    start: new Date('2026-11-01T00:00:00Z'),
+    end: new Date('2026-11-30T23:59:59Z'),
+  };
+
+  // Filtered by Noon + November DateRange
+  const noonNov = computeFinancialSummary(
+    [ordNoonJan, ordAmazonJan, ordNoonOld],
+    txs,
+    [prod],
+    novRange,
+    'noon'
+  );
+
+  assert.equal(noonNov.deliveredRevenue, 1000);
+  assert.equal(noonNov.confirmedRevenue, 1000);
+  // Confirmed commission (100, deduplicated from 3 copies) + confirmed return shipping (25) = 125
+  assert.equal(noonNov.marketplaceCommissions, 100);
+  assert.equal(noonNov.returnShippingExpenses, 25);
+  assert.equal(noonNov.confirmedExpenses, 125);
+  // Confirmed refund = 120
+  assert.equal(noonNov.confirmedRefunds, 120);
+  // Confirmed settlement = 1000 - 125 - 120 = 755
+  assert.equal(noonNov.confirmedSettlement, 755);
+
+  // Pending return shipping (35) + Pending refund (80) = 115
+  assert.equal(noonNov.pendingReturnShipping, 35);
+  assert.equal(noonNov.pendingExpenses, 35);
+  assert.equal(noonNov.pendingRefunds, 80);
+  assert.equal(noonNov.pendingTransactionsTotal, 115);
+
+  // Expected settlement = 755 - 35 - 80 = 640
+  assert.equal(noonNov.expectedSettlement, 640);
+
+  // Cancelled tx (99) tracked separately and NEVER enters confirmed or pending
+  assert.equal(noonNov.cancelledTransactionsCount, 1);
+  assert.equal(noonNov.cancelledTransactionsTotal, 99);
+
+  // Filtered by Amazon + November DateRange (Scenario 6 & 7 cross-check)
+  const amzNov = computeFinancialSummary(
+    [ordNoonJan, ordAmazonJan, ordNoonOld],
+    txs,
+    [prod],
+    novRange,
+    'amazon'
+  );
+  assert.equal(amzNov.deliveredRevenue, 500);
+  assert.equal(amzNov.marketplaceCommissions, 50);
+  assert.equal(amzNov.confirmedRefunds, 0);
+  assert.equal(amzNov.pendingTransactionsTotal, 0);
+  assert.equal(amzNov.confirmedSettlement, 450);
 });

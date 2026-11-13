@@ -191,10 +191,10 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({ locale, onNavigate }
     return loss;
   }, [damagedReturns, allProducts]);
 
-  // Actual accounting ledger summary
+  // Actual accounting ledger summary (synchronized with active dashboard date & marketplace filters)
   const financialSummary = useMemo(
-    () => storageService.getFinancialSummary(),
-    [filteredOrders, filteredReturns]
+    () => storageService.getFinancialSummary(activeDateRange, selectedMarketplace as MarketplaceId),
+    [activeDateRange, selectedMarketplace, filteredOrders, filteredReturns]
   );
 
   // ----------------------------------------------------------------------
@@ -889,29 +889,50 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({ locale, onNavigate }
             </span>
           </div>
 
-          {/* Shipping & Marketplace Commissions Disclosure */}
-          <div className="p-3.5 bg-[#F7F8FA] rounded-xl border border-[#E8ECF2] flex flex-col justify-between">
+          {/* Confirmed Ledger Expenses, Pending Obligations & Settlements Disclosure */}
+          <div className="p-3.5 bg-[#F7F8FA] rounded-xl border border-[#E8ECF2] flex flex-col justify-between space-y-1.5">
             <div>
               <span className="text-[11px] text-[#64748B] block mb-1 font-semibold">
-                {locale === 'ar' ? 'رسوم الشحن وعمولات المنصات' : 'Shipping & Marketplace Fees'}
+                {locale === 'ar' ? 'المصروفات والاستردادات المؤكدة' : 'Confirmed Expenses & Refunds'}
               </span>
               <span className="text-sm font-bold text-[#172033] block font-mono-code">
-                {financialSummary.courierShippingExpenses + financialSummary.marketplaceCommissions > 0
-                  ? `${(financialSummary.courierShippingExpenses + financialSummary.marketplaceCommissions).toLocaleString()} ${settings.currency}`
-                  : locale === 'ar'
-                  ? `0 ${settings.currency} (مسجلة بالدفتر)`
-                  : `0 ${settings.currency} (in ledger)`}
+                {(financialSummary.confirmedExpenses + financialSummary.confirmedRefunds).toLocaleString()} {settings.currency}
               </span>
+              <div className="text-[10px] text-[#64748B] mt-1 space-y-0.5">
+                <div className="flex items-center justify-between gap-2">
+                  <span>{locale === 'ar' ? 'صافي التسوية المؤكد:' : 'Confirmed settlement:'}</span>
+                  <strong className="font-mono-code text-[#16A36A]">
+                    {financialSummary.confirmedSettlement.toLocaleString()} {settings.currency}
+                  </strong>
+                </div>
+                {(financialSummary.pendingTransactionsTotal > 0 || financialSummary.estimatedUnrecordedCommissions > 0) && (
+                  <div className="flex items-center justify-between gap-2 text-amber-800">
+                    <span>{locale === 'ar' ? 'التزامات معلقة/مقدرة:' : 'Pending/Est. obligations:'}</span>
+                    <strong className="font-mono-code">
+                      {(financialSummary.pendingTransactionsTotal + financialSummary.estimatedUnrecordedCommissions).toLocaleString()} {settings.currency}
+                    </strong>
+                  </div>
+                )}
+              </div>
               {financialSummary.ordersMissingCostCount > 0 && (
                 <span className="text-[10px] text-amber-700 block mt-1 font-semibold">
                   {locale === 'ar'
-                    ? `⚠️ ${financialSummary.ordersMissingCostCount} طلب بانتظار توثيق التكلفة`
-                    : `⚠️ ${financialSummary.ordersMissingCostCount} orders missing COGS`}
+                    ? `${financialSummary.ordersMissingCostCount} طلب بانتظار توثيق التكلفة`
+                    : `${financialSummary.ordersMissingCostCount} orders missing COGS`}
+                </span>
+              )}
+              {financialSummary.ordersMissingCommissionCount > 0 && (
+                <span className="text-[10px] text-amber-700 block font-semibold">
+                  {locale === 'ar'
+                    ? `${financialSummary.ordersMissingCommissionCount} طلب بدون عمولة موثقة`
+                    : `${financialSummary.ordersMissingCommissionCount} orders missing commission`}
                 </span>
               )}
             </div>
-            <span className="text-[10px] text-[#64748B] block mt-1">
-              {locale === 'ar' ? 'سجل محاسبي فعلي مثبت' : 'Verified ledger transactions'}
+            <span className="text-[10px] text-[#64748B] block">
+              {locale === 'ar'
+                ? `التسوية المتوقعة: ${financialSummary.expectedSettlement.toLocaleString()} ${settings.currency}`
+                : `Expected settlement: ${financialSummary.expectedSettlement.toLocaleString()} ${settings.currency}`}
             </span>
           </div>
         </div>

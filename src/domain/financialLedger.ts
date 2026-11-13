@@ -1,7 +1,9 @@
 /**
  * Pure financial breakdown and accounting ledger helpers.
- * Strictly separates recorded values from missing/unrecorded inputs,
- * preserves historical COGS snapshots, and never fabricates speculative net profits.
+ * Strictly separates:
+ * - Confirmed Net Profit vs Recorded-Cost Margin vs Estimated Net Profit
+ * - Confirmed vs Pending vs Cancelled financial ledger transactions
+ * - Historical COGS snapshots from mutable catalog baseCost edits
  */
 
 import {
@@ -13,18 +15,30 @@ import {
   Product,
 } from '../types';
 
+/** Documented heuristic rate used ONLY for informational estimates when marketplace commission is unrecorded. */
+export const ESTIMATED_MARKETPLACE_COMMISSION_RATE = 0.12;
+
 export function resolveOrderItemUnitCost(
   item: OrderItem,
   products: Product[]
 ): { unitCost: number | null; source: 'snapshot' | 'catalog' | 'missing' } {
-  if (typeof item.unitCostSnapshot === 'number' && Number.isFinite(item.unitCostSnapshot) && item.unitCostSnapshot > 0) {
+  if (
+    typeof item.unitCostSnapshot === 'number' &&
+    Number.isFinite(item.unitCostSnapshot) &&
+    item.unitCostSnapshot > 0
+  ) {
     return { unitCost: item.unitCostSnapshot, source: 'snapshot' };
   }
 
   const product = products.find(
     (p) => p.id === item.productId || (item.productSku && p.sku === item.productSku)
   );
-  if (product && typeof product.baseCost === 'number' && Number.isFinite(product.baseCost) && product.baseCost > 0) {
+  if (
+    product &&
+    typeof product.baseCost === 'number' &&
+    Number.isFinite(product.baseCost) &&
+    product.baseCost > 0
+  ) {
     return { unitCost: product.baseCost, source: 'catalog' };
   }
 
@@ -73,11 +87,14 @@ export function computeOrderFinancialBreakdown(
     Number.isFinite(order.marketplaceCommission) &&
     order.marketplaceCommission >= 0;
 
-  // Strictly report recorded commission; never inject an estimated 12% fee into confirmedNet.
+  if (!isCommissionRecorded) {
+    missingReasons.push('عمولة المنصة غير مسجلة لهذا الطلب؛ يظهر هامش التكاليف المسجلة فقط حتى توثيق العمولة.');
+  }
+
   const marketplaceCommission = isCommissionRecorded ? order.marketplaceCommission! : 0;
   const estimatedMarketplaceCommission = isCommissionRecorded
     ? undefined
-    : Math.round(totalSellingPrice * 0.12 * 100) / 100;
+    : Math.round(totalSellingPrice * ESTIMATED_MARKETPLACE_COMMISSION_RATE * 100) / 100;
   const serviceFees = 0;
 
   let extraAdjustments = 0;
@@ -96,19 +113,47 @@ export function computeOrderFinancialBreakdown(
   const refundAmount =
     order.hasPostDeliveryReturn || order.status === 'rejected' ? totalSellingPrice : 0;
 
+  // Recorded-Cost Margin can be computed whenever order is delivered and all item COGS exist,
+  // explicitly reflecting ONLY recorded expenses (excluding missing marketplace commission).
+  let recordedCostMargin: number | null = null;
   let confirmedNet: number | null = null;
+  let estimatedNet: number | null = null;
   let isProfitCalculable = false;
 
-  if (isDelivered && hasAllCosts && !isCancelled) {
-    confirmedNet =
-      totalSellingPrice -
-      marketplaceCommission -
-      shippingFee -
-      packagingCost -
-      totalCostOfGoods +
-      extraAdjustments;
-    isProfitCalculable = true;
+  if (isDelivered && !isCancelled && hasAllCosts) {
+    recordedCostMargin =
+      Math.round(
+        (totalSellingPrice -
+          marketplaceCommission -
+          shippingFee -
+          packagingCost -
+          totalCostOfGoods +
+          extraAdjustments) *
+          100
+      ) / 100;
+
+    if (isCommissionRecorded) {
+      confirmedNet = recordedCostMargin;
+      estimatedNet = recordedCostMargin;
+      isProfitCalculable = true;
+    } else {
+      // Missing marketplace commission: NEVER claim confirmedNet!
+      confirmedNet = null;
+      isProfitCalculable = false;
+      estimatedNet =
+        Math.round((recordedCostMargin - (estimatedMarketplaceCommission ?? 0)) * 100) / 100;
+    }
   }
+
+  const uncalculatedReason = !isProfitCalculable
+    ? isCancelled
+      ? 'تم إلغاء الطلب قبل الشحن.'
+      : !isDelivered
+      ? 'الطلب لم يتم تسليمه نهائياً بعد.'
+      : missingReasons.length > 0
+      ? missingReasons.join(' ')
+      : 'بيانات التكلفة غير مكتملة.'
+    : undefined;
 
   return {
     orderId: order.id,
@@ -125,17 +170,52 @@ export function computeOrderFinancialBreakdown(
     productCostOfGoods: hasAllCosts ? totalCostOfGoods : null,
     cogsSource,
     refundAmount,
+    recordedCostMargin,
     confirmedNet,
+    estimatedNet,
     isProfitCalculable,
-    uncalculatedReason: !isProfitCalculable
-      ? missingReasons.length > 0
-        ? missingReasons.join(' ')
-        : !isDelivered
-        ? 'الطلب لم يتم تسليمه نهائياً بعد.'
-        : 'بيانات التكلفة غير مكتملة.'
-      : undefined,
+    uncalculatedReason,
+    missingCostReasons: missingReasons,
   };
 }
+
+export interface FinancialSummaryResult {
+  deliveredRevenue: number;
+  confirmedRevenue: number;
+  deliveredOrdersCount: number;
+  // Confirmed ledger categories (status === 'confirmed' | 'settled')
+  courierShippingExpenses: number;
+  returnShippingExpenses: number;
+  damageWriteoffs: number;
+  marketplaceCommissions: number;
+  packagingExpenses: number;
+  confirmedExpenses: number;
+  confirmedRefunds: number;
+  // Pending ledger categories (status === 'pending')
+  pendingCourierShipping: number;
+  pendingReturnShipping: number;
+  pendingDamageWriteoffs: number;
+  pendingMarketplaceCommissions: number;
+  pendingExpenses: number;
+  pendingRefunds: number;
+  pendingTransactionsTotal: number;
+  // Estimated / unrecorded items
+  estimatedUnrecordedCommissions: number;
+  estimatedExpenses: number;
+  // Cancelled ledger items (strictly excluded from confirmed & pending)
+  cancelledTransactionsCount: number;
+  cancelledTransactionsTotal: number;
+  // Settlements
+  confirmedSettlement: number;
+  expectedSettlement: number;
+  estimatedSettlement: number;
+  // Diagnostics
+  ordersMissingCostCount: number;
+  ordersMissingCommissionCount: number;
+}
+
+const isConfirmedStatus = (status: FinancialTransaction['status']): boolean =>
+  status === 'confirmed' || status === 'settled';
 
 export function computeFinancialSummary(
   orders: Order[],
@@ -143,59 +223,182 @@ export function computeFinancialSummary(
   products: Product[],
   dateRange?: { start: Date; end: Date },
   marketplace?: MarketplaceId
-) {
-  const deliveredOrders = orders.filter((o) => o.status === 'delivered');
-  const deliveredRevenue = deliveredOrders.reduce((sum, o) => sum + o.totalAmount, 0);
+): FinancialSummaryResult {
+  const startMs = dateRange ? dateRange.start.getTime() : null;
+  const endMs = dateRange ? dateRange.end.getTime() : null;
 
-  const relevantTx = transactions.filter((tx) => {
-    if (marketplace && marketplace !== 'all' && tx.marketplaceId !== marketplace) return false;
-    if (dateRange) {
-      const time = new Date(tx.date).getTime();
-      if (time < dateRange.start.getTime() || time > dateRange.end.getTime()) return false;
+  const filteredOrders = orders.filter((order) => {
+    if (marketplace && marketplace !== 'all' && order.marketplaceId !== marketplace) {
+      return false;
+    }
+    if (startMs !== null && endMs !== null) {
+      const orderTime = new Date(order.orderDate || order.createdAt).getTime();
+      if (orderTime < startMs || orderTime > endMs) return false;
     }
     return true;
   });
 
-  const courierShippingExpenses = relevantTx
-    .filter((t) => t.type === 'courier_shipping')
-    .reduce((sum, t) => sum + t.amount, 0);
+  const deliveredOrders = filteredOrders.filter((o) => o.status === 'delivered');
+  const deliveredRevenue =
+    Math.round(deliveredOrders.reduce((sum, o) => sum + o.totalAmount, 0) * 100) / 100;
+  const confirmedRevenue = deliveredRevenue;
 
-  const returnShippingExpenses = relevantTx
-    .filter((t) => t.type === 'return_shipping')
-    .reduce((sum, t) => sum + t.amount, 0);
+  const relevantTx = transactions.filter((tx) => {
+    if (marketplace && marketplace !== 'all' && tx.marketplaceId !== marketplace) return false;
+    if (startMs !== null && endMs !== null) {
+      const time = new Date(tx.date).getTime();
+      if (time < startMs || time > endMs) return false;
+    }
+    return true;
+  });
 
-  const damageWriteoffs = relevantTx
-    .filter((t) => t.type === 'damage_writeoff')
-    .reduce((sum, t) => sum + t.amount, 0);
+  // Deduplicate transactions to prevent double-counting identical or retried postings
+  const seenIds = new Set<string>();
+  const seenAutoSignatures = new Set<string>();
+  const dedupedTx: FinancialTransaction[] = [];
 
-  const marketplaceCommissions = relevantTx
-    .filter((t) => t.type === 'marketplace_commission')
-    .reduce((sum, t) => sum + t.amount, 0);
+  for (const tx of relevantTx) {
+    if (tx.id && seenIds.has(tx.id)) continue;
+    if (tx.source === 'automatic' && tx.type !== 'adjustment') {
+      const signature =
+        tx.type === 'damage_writeoff'
+          ? `auto|${tx.orderId}|${tx.returnId || ''}|${tx.type}|${tx.status}|${tx.amount}|${tx.notes || ''}`
+          : `auto|${tx.orderId}|${tx.returnId || ''}|${tx.type}|${tx.status}`;
+      if (seenAutoSignatures.has(signature)) continue;
+      seenAutoSignatures.add(signature);
+    }
+    if (tx.id) seenIds.add(tx.id);
+    dedupedTx.push(tx);
+  }
 
-  const confirmedRefunds = relevantTx
-    .filter((t) => t.type === 'customer_refund')
-    .reduce((sum, t) => sum + t.amount, 0);
+  let courierShippingExpenses = 0;
+  let returnShippingExpenses = 0;
+  let damageWriteoffs = 0;
+  let marketplaceCommissions = 0;
+  let packagingExpenses = 0;
+  let confirmedRefunds = 0;
+
+  let pendingCourierShipping = 0;
+  let pendingReturnShipping = 0;
+  let pendingDamageWriteoffs = 0;
+  let pendingMarketplaceCommissions = 0;
+  let pendingPackagingFees = 0;
+  let pendingRefunds = 0;
+
+  let cancelledTransactionsCount = 0;
+  let cancelledTransactionsTotal = 0;
+
+  const ordersWithCommissionTx = new Set<string>();
+
+  for (const tx of dedupedTx) {
+    const amount = Number.isFinite(tx.amount) ? Math.max(0, tx.amount) : 0;
+
+    if (tx.status === 'cancelled') {
+      cancelledTransactionsCount++;
+      cancelledTransactionsTotal += amount;
+      continue;
+    }
+
+    if (isConfirmedStatus(tx.status)) {
+      if (tx.type === 'courier_shipping') courierShippingExpenses += amount;
+      else if (tx.type === 'return_shipping') returnShippingExpenses += amount;
+      else if (tx.type === 'damage_writeoff') damageWriteoffs += amount;
+      else if (tx.type === 'marketplace_commission') {
+        marketplaceCommissions += amount;
+        if (tx.orderId) ordersWithCommissionTx.add(tx.orderId);
+      } else if (tx.type === 'packaging_fee') packagingExpenses += amount;
+      else if (tx.type === 'customer_refund') confirmedRefunds += amount;
+    } else if (tx.status === 'pending') {
+      if (tx.type === 'courier_shipping') pendingCourierShipping += amount;
+      else if (tx.type === 'return_shipping') pendingReturnShipping += amount;
+      else if (tx.type === 'damage_writeoff') pendingDamageWriteoffs += amount;
+      else if (tx.type === 'marketplace_commission') {
+        pendingMarketplaceCommissions += amount;
+        if (tx.orderId) ordersWithCommissionTx.add(tx.orderId);
+      } else if (tx.type === 'packaging_fee') pendingPackagingFees += amount;
+      else if (tx.type === 'customer_refund') pendingRefunds += amount;
+    }
+  }
+
+  const confirmedExpenses =
+    courierShippingExpenses +
+    returnShippingExpenses +
+    damageWriteoffs +
+    marketplaceCommissions +
+    packagingExpenses;
+
+  const pendingExpenses =
+    pendingCourierShipping +
+    pendingReturnShipping +
+    pendingDamageWriteoffs +
+    pendingMarketplaceCommissions +
+    pendingPackagingFees;
+
+  const pendingTransactionsTotal = pendingExpenses + pendingRefunds;
 
   let ordersMissingCostCount = 0;
+  let ordersMissingCommissionCount = 0;
+  let estimatedUnrecordedCommissions = 0;
+
   for (const o of deliveredOrders) {
-    const hasMissing = o.items.some((item) => resolveOrderItemUnitCost(item, products).unitCost === null);
-    if (hasMissing) ordersMissingCostCount++;
+    const hasMissingCost = o.items.some(
+      (item) => resolveOrderItemUnitCost(item, products).unitCost === null
+    );
+    if (hasMissingCost) ordersMissingCostCount++;
+
+    const hasOrderCommission =
+      typeof o.marketplaceCommission === 'number' &&
+      Number.isFinite(o.marketplaceCommission) &&
+      o.marketplaceCommission >= 0;
+
+    if (!hasOrderCommission && !ordersWithCommissionTx.has(o.id)) {
+      ordersMissingCommissionCount++;
+      estimatedUnrecordedCommissions +=
+        Math.round(o.totalAmount * ESTIMATED_MARKETPLACE_COMMISSION_RATE * 100) / 100;
+    }
   }
+
+  estimatedUnrecordedCommissions = Math.round(estimatedUnrecordedCommissions * 100) / 100;
+  const estimatedExpenses =
+    Math.round((pendingExpenses + estimatedUnrecordedCommissions) * 100) / 100;
+
+  const confirmedSettlement =
+    Math.round((confirmedRevenue - confirmedExpenses - confirmedRefunds) * 100) / 100;
+  const expectedSettlement =
+    Math.round(
+      (confirmedSettlement -
+        pendingExpenses -
+        pendingRefunds -
+        estimatedUnrecordedCommissions) *
+        100
+    ) / 100;
 
   return {
     deliveredRevenue,
+    confirmedRevenue,
     deliveredOrdersCount: deliveredOrders.length,
     courierShippingExpenses,
     returnShippingExpenses,
     damageWriteoffs,
     marketplaceCommissions,
+    packagingExpenses,
+    confirmedExpenses,
     confirmedRefunds,
+    pendingCourierShipping,
+    pendingReturnShipping,
+    pendingDamageWriteoffs,
+    pendingMarketplaceCommissions,
+    pendingExpenses,
+    pendingRefunds,
+    pendingTransactionsTotal,
+    estimatedUnrecordedCommissions,
+    estimatedExpenses,
+    cancelledTransactionsCount,
+    cancelledTransactionsTotal,
+    confirmedSettlement,
+    expectedSettlement,
+    estimatedSettlement: expectedSettlement,
     ordersMissingCostCount,
-    estimatedSettlement:
-      deliveredRevenue -
-      marketplaceCommissions -
-      courierShippingExpenses -
-      returnShippingExpenses -
-      damageWriteoffs,
+    ordersMissingCommissionCount,
   };
 }

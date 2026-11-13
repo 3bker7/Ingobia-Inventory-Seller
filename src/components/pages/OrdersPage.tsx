@@ -1148,7 +1148,11 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
                     </span>
                     {fin.isProfitCalculable ? (
                       <span className="text-xs text-[#16A36A] font-semibold">
-                        {isRtl ? 'صافي ربح مؤكد' : 'Verified Net Profit'}
+                        {isRtl ? 'صافي ربح مؤكد' : 'Confirmed Net Profit'}
+                      </span>
+                    ) : fin.recordedCostMargin !== null && fin.commissionStatus === 'missing' ? (
+                      <span className="text-xs text-amber-800 font-semibold">
+                        {isRtl ? 'هامش التكاليف المسجلة فقط' : 'Recorded-Cost Margin Only'}
                       </span>
                     ) : (
                       <span className="text-xs text-amber-800 font-semibold">
@@ -1207,10 +1211,44 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
 
                   {fin.isProfitCalculable && fin.confirmedNet !== null ? (
                     <div className="p-2.5 bg-emerald-50 rounded-xl border border-emerald-200 flex items-center justify-between">
-                      <span className="font-bold text-emerald-900">{isRtl ? 'صافي الربح التقديري المعتمد:' : 'Net Profit:'}</span>
+                      <span className="font-bold text-emerald-900">{isRtl ? 'صافي الربح المؤكد:' : 'Confirmed Net Profit:'}</span>
                       <strong className="font-mono-code text-sm font-bold text-[#16A36A]">
                         +{fin.confirmedNet.toFixed(2)} {settings.currency}
                       </strong>
+                    </div>
+                  ) : fin.recordedCostMargin !== null && fin.commissionStatus === 'missing' ? (
+                    <div className="space-y-2">
+                      <div className="p-2.5 bg-blue-50/70 rounded-xl border border-blue-200 flex items-center justify-between">
+                        <div>
+                          <span className="font-bold text-blue-950 block">
+                            {isRtl ? 'هامش التكاليف المسجلة (قبل العمولة):' : 'Recorded-Cost Margin (excl. unrecorded fee):'}
+                          </span>
+                          <span className="text-[10px] text-blue-800">
+                            {isRtl
+                              ? 'لا يُعد ربحاً نهائياً مؤكداً لعدم تسجيل عمولة المنصة'
+                              : 'Not confirmed net profit until marketplace commission is recorded'}
+                          </span>
+                        </div>
+                        <strong className="font-mono-code text-sm font-bold text-[#2563EB]">
+                          {fin.recordedCostMargin.toFixed(2)} {settings.currency}
+                        </strong>
+                      </div>
+                      {fin.estimatedNet !== null && (
+                        <div className="p-2 bg-white rounded-xl border border-amber-200 flex items-center justify-between text-[11px]">
+                          <span className="text-amber-900 font-semibold">
+                            {isRtl
+                              ? `صافي تقديري استرشادي (بافتراض عمولة ~12%: -${fin.estimatedMarketplaceCommission?.toFixed(2)} ${settings.currency}):`
+                              : `Estimated Net (heuristic ~12% fee: -${fin.estimatedMarketplaceCommission?.toFixed(2)} ${settings.currency}):`}
+                          </span>
+                          <strong className="font-mono-code text-amber-900">
+                            {fin.estimatedNet.toFixed(2)} {settings.currency}
+                          </strong>
+                        </div>
+                      )}
+                      <div className="p-2 bg-amber-50 rounded-xl border border-amber-200 text-amber-900 text-[11px] flex items-center gap-2">
+                        <AlertCircle className="w-4 h-4 shrink-0 text-[#D99A27]" />
+                        <span>{fin.uncalculatedReason}</span>
+                      </div>
                     </div>
                   ) : (
                     <div className="p-2.5 bg-amber-50 rounded-xl border border-amber-200 text-amber-900 text-[11px] flex items-center gap-2">

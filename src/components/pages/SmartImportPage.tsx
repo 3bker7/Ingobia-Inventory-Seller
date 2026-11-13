@@ -216,6 +216,11 @@ export const SmartImportPage: React.FC<SmartImportPageProps> = ({
       settings.sellerName
     );
 
+    if (!res.success) {
+      showToast(res.error || (locale === 'ar' ? 'تعذر حفظ الطلبات المستوردة.' : 'Failed to save imported orders.'), 'error');
+      return;
+    }
+
     setImportSummary(res);
     setStep('completed');
     onOrdersImported?.();

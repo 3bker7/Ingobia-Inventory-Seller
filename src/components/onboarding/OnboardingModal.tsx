@@ -141,12 +141,16 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
       });
     });
 
-    // Save currency if unchanged, then atomically persist onboarding settings & profile
-    storageService.completeOnboarding(
+    const onboardingRes = storageService.completeOnboarding(
       configuredMarketplaces,
       merchantName.trim() || 'أحمد بكر',
       storeName.trim() || 'متجر الأناقة الحديثة'
     );
+
+    if (!onboardingRes.success) {
+      console.error('Failed to persist onboarding:', onboardingRes.error);
+      return;
+    }
 
     onComplete();
   };

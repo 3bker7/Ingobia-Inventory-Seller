@@ -12,7 +12,6 @@ import {
   FileSpreadsheet,
   Settings,
   X,
-  FlaskConical,
   Terminal,
 } from 'lucide-react';
 import { Locale } from '../../locales/translations';
@@ -22,14 +21,12 @@ interface MobileBottomNavProps {
   currentTab: string;
   onSelectTab: (tab: string) => void;
   locale: Locale;
-  onOpenTestSuite?: () => void;
 }
 
 export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
   currentTab,
   onSelectTab,
   locale,
-  onOpenTestSuite,
 }) => {
   const [isMoreOpen, setIsMoreOpen] = useState(false);
   const isRtl = locale === 'ar';
@@ -195,21 +192,6 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
                 );
               })}
             </div>
-
-            {/* Test suite button in More sheet */}
-            {onOpenTestSuite && (
-              <button
-                type="button"
-                onClick={() => {
-                  setIsMoreOpen(false);
-                  onOpenTestSuite();
-                }}
-                className="w-full py-2.5 px-4 bg-slate-100 hover:bg-slate-200 text-[#172033] rounded-2xl font-bold text-xs flex items-center justify-center gap-2 transition-colors cursor-pointer"
-              >
-                <FlaskConical className="w-4 h-4 text-purple-600" />
-                <span>{isRtl ? 'تشغيل حزمة اختبارات منطق العمليات' : 'Run In-App Logic Test Suite'}</span>
-              </button>
-            )}
           </div>
         </div>
       )}

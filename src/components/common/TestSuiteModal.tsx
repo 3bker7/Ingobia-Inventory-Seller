@@ -482,13 +482,13 @@ export const TestSuiteModal: React.FC<TestSuiteModalProps> = ({ isOpen, onClose,
             updatedAt: '2026-11-10T10:00:00Z',
           };
           const breakdownA = computeOrderFinancialBreakdown(ordNoCost, [pNoCost]);
-          if (breakdownA.isProfitCalculable !== false || breakdownA.confirmedNet !== null) {
+          if (breakdownA.isProfitCalculable !== false || breakdownA.confirmedNet !== null || breakdownA.recordedCostMargin !== null) {
             throw new Error('Speculative profit was computed without COGS');
           }
 
           const pWithCost = makeTestProduct({ id: 'p-cost', sku: 'COST-1', baseCost: 140 });
-          const ordWithCost: Order = {
-            id: 'ord-with-cost',
+          const ordMissingComm: Order = {
+            id: 'ord-missing-comm',
             marketplaceId: 'noon',
             customerName: 'عميل',
             shippingAddress: 'الرياض',
@@ -503,15 +503,31 @@ export const TestSuiteModal: React.FC<TestSuiteModalProps> = ({ isOpen, onClose,
             createdAt: '2026-11-10T10:00:00Z',
             updatedAt: '2026-11-10T10:00:00Z',
           };
-          const breakdownB = computeOrderFinancialBreakdown(ordWithCost, [pWithCost]);
-          if (breakdownB.confirmedNet !== 75 || breakdownB.commissionStatus !== 'missing' || breakdownB.productCostOfGoods !== 100) {
-            throw new Error(`Expected net=75 using snapshot cost=100 & zero unrecorded fee, got ${breakdownB.confirmedNet}`);
+          const breakdownB = computeOrderFinancialBreakdown(ordMissingComm, [pWithCost]);
+          if (
+            breakdownB.isProfitCalculable !== false ||
+            breakdownB.confirmedNet !== null ||
+            breakdownB.recordedCostMargin !== 75 ||
+            breakdownB.estimatedNet !== 51 ||
+            breakdownB.commissionStatus !== 'missing' ||
+            breakdownB.productCostOfGoods !== 100
+          ) {
+            throw new Error(
+              `Expected missing commission -> confirmedNet=null, margin=75, est=51; got net=${breakdownB.confirmedNet}, margin=${breakdownB.recordedCostMargin}`
+            );
+          }
+
+          const ordComplete: Order = { ...ordMissingComm, id: 'ord-complete', marketplaceCommission: 20 };
+          const breakdownC = computeOrderFinancialBreakdown(ordComplete, [pWithCost]);
+          if (!breakdownC.isProfitCalculable || breakdownC.confirmedNet !== 55 || breakdownC.recordedCostMargin !== 55) {
+            throw new Error(`Expected complete breakdown confirmedNet=55, got ${breakdownC.confirmedNet}`);
           }
 
           t.status = 'passed';
           t.details = [
-            'computeOrderFinancialBreakdown حظر الربح التخمينى عند غياب التكلفة',
-            'تم احتساب الصافي 75 وفق التكلفة التاريخية 100 ووسم العمولة غير المسجلة كـ missing دون خصم 12% وهمي',
+            'computeOrderFinancialBreakdown حظر الربح عند غياب COGS (confirmedNet=null)',
+            'عند غياب العمولة: confirmedNet=null، هامش التكاليف المسجلة=75، والتقديري=51',
+            'عند اكتمال التكلفة والعمولة المسجلة (20): صافي الربح المؤكد=55',
           ];
         } else if (t.id === 'test_onboarding_dynamic_zero_platforms') {
           if (DEFAULT_MERCHANT_PROFILE.selectedMarketplaceIds.length !== 0 || DEFAULT_MERCHANT_PROFILE.isOnboarded !== false) {

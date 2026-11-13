@@ -187,7 +187,6 @@ export default function App() {
             onToggleCollapse={() => setIsSidebarCollapsed(!isSidebarCollapsed)}
             activeOrdersCount={activeOrdersCount}
             pendingReturnsCount={pendingReturnsCount}
-            onOpenTestSuite={() => setIsTestSuiteOpen(true)}
           />
         </div>
 
@@ -226,10 +225,6 @@ export default function App() {
                 onToggleCollapse={() => {}}
                 activeOrdersCount={activeOrdersCount}
                 pendingReturnsCount={pendingReturnsCount}
-                onOpenTestSuite={() => {
-                  setIsMobileMenuOpen(false);
-                  setIsTestSuiteOpen(true);
-                }}
               />
             </div>
           </div>
@@ -345,7 +340,11 @@ export default function App() {
             )}
 
             {currentTab === 'developerCenter' && (
-              <DeveloperCenterPage locale={locale} />
+              <DeveloperCenterPage
+                locale={locale}
+                onOpenTestSuite={() => setIsTestSuiteOpen(true)}
+                onDataChange={refreshBadges}
+              />
             )}
           </main>
         </div>
@@ -355,7 +354,6 @@ export default function App() {
           currentTab={currentTab}
           onSelectTab={(tab) => handleSelectTab(tab as ActiveTab)}
           locale={locale}
-          onOpenTestSuite={() => setIsTestSuiteOpen(true)}
         />
 
         {/* In-App Operations Logic Test Suite Modal */}

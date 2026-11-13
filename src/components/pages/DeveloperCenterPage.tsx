@@ -16,18 +16,47 @@ import {
   Sparkles,
   ExternalLink,
   BookOpen,
+  Globe,
+  Database,
+  Trash2,
+  FlaskConical,
+  Play,
 } from 'lucide-react';
 import { DeveloperExportService, ProjectSnapshot, SnapshotSection } from '../../services/developerExport';
+import { storageService } from '../../services/storage';
 import { Locale } from '../../locales/translations';
 import { useToast } from '../common/Toast';
+import { ConfirmDialog } from '../common/ConfirmDialog';
+
+const SHARED_PUBLISH_URL = 'https://ais-pre-jf2fibe2uk3ofofxe2hths-193553168543.europe-west3.run.app';
 
 interface DeveloperCenterPageProps {
   locale: Locale;
+  onOpenTestSuite?: () => void;
+  onDataChange?: () => void;
 }
 
-export const DeveloperCenterPage: React.FC<DeveloperCenterPageProps> = ({ locale }) => {
+export const DeveloperCenterPage: React.FC<DeveloperCenterPageProps> = ({
+  locale,
+  onOpenTestSuite,
+  onDataChange,
+}) => {
   const isRtl = locale === 'ar';
   const { showToast } = useToast();
+  const [dataRefreshTick, setDataRefreshTick] = useState(0);
+  const [copiedUrl, setCopiedUrl] = useState(false);
+  const [confirmMode, setConfirmMode] = useState<'load_demo' | 'clear_all' | null>(null);
+
+  const liveCounts = {
+    products: storageService.getProducts().length,
+    orders: storageService.getOrders().length,
+    returns: storageService.getReturns().length,
+    transactions: storageService.getFinancialTransactions().length,
+  };
+  const currentBrowserOrigin =
+    typeof window !== 'undefined' && window.location?.origin ? window.location.origin : '';
+  const publishUrl = SHARED_PUBLISH_URL;
+  void dataRefreshTick;
 
   const [snapshot, setSnapshot] = useState<ProjectSnapshot>(() =>
     DeveloperExportService.getLatestOrGenerateSnapshot()
@@ -127,6 +156,52 @@ export const DeveloperCenterPage: React.FC<DeveloperCenterPageProps> = ({ locale
         'success'
       );
     }
+  };
+
+  const handleCopyPublishUrl = async (urlToCopy: string) => {
+    const ok = await DeveloperExportService.copyToClipboard(urlToCopy);
+    if (ok) {
+      setCopiedUrl(true);
+      setTimeout(() => setCopiedUrl(false), 2500);
+      showToast(
+        isRtl ? 'تم نسخ رابط النشر والوصول بنجاح.' : 'Publish URL copied to clipboard.',
+        'success'
+      );
+    } else {
+      showToast(isRtl ? 'تعذر نسخ الرابط.' : 'Failed to copy URL.', 'error');
+    }
+  };
+
+  const handleLoadDemoData = () => {
+    const res = storageService.loadDemoSampleData();
+    if (!res.success) {
+      showToast(res.error || (isRtl ? 'فشل توليد البيانات التجريبية.' : 'Failed to load demo data.'), 'error');
+      return;
+    }
+    setDataRefreshTick((t) => t + 1);
+    onDataChange?.();
+    showToast(
+      isRtl
+        ? 'تم توليد بيانات المنتجات والطلبات التجريبية بنجاح داخل بيئة التجربة.'
+        : 'Demo catalog, orders, returns, and ledger generated successfully.',
+      'success'
+    );
+  };
+
+  const handleClearAllData = () => {
+    const res = storageService.clearAllStoreData();
+    if (!res.success) {
+      showToast(res.error || (isRtl ? 'فشل مسح البيانات.' : 'Failed to clear store data.'), 'error');
+      return;
+    }
+    setDataRefreshTick((t) => t + 1);
+    onDataChange?.();
+    showToast(
+      isRtl
+        ? 'تم مسح جميع البيانات التجريبية وإعادة المتجر نظيفاً وفارغاً جاهزاً للإنتاج.'
+        : 'All store operational data cleared cleanly to empty production state.',
+      'success'
+    );
   };
 
   return (
@@ -230,6 +305,138 @@ export const DeveloperCenterPage: React.FC<DeveloperCenterPageProps> = ({ locale
               { hour: '2-digit', minute: '2-digit' }
             )}
           </span>
+        </div>
+      </div>
+
+      {/* 2.5 Developer Publish Link & Isolated QA/Demo Controls */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        {/* Site Publish & Browser Access Link */}
+        <div className="bg-white rounded-3xl border border-[#E8ECF2] p-5 shadow-xs space-y-3.5">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <span className="p-1.5 rounded-xl bg-blue-50 text-[#2563EB] border border-blue-200">
+                <Globe className="w-4 h-4" />
+              </span>
+              <div>
+                <h3 className="text-sm font-bold text-[#172033]">
+                  {isRtl ? 'رابط نشر الموقع والدخول من أي متصفح' : 'Live Site Publish & Browser Access URL'}
+                </h3>
+                <p className="text-[11px] text-[#64748B]">
+                  {isRtl
+                    ? 'رابط النشر العام لفتح المنصة واختبارها من أي جهاز أو متصفح.'
+                    : 'Shareable deployment URL for testing and accessing the live app from any browser.'}
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <div className="p-3 bg-[#F7F8FA] rounded-2xl border border-[#E8ECF2] flex flex-wrap items-center justify-between gap-2.5">
+            <code className="text-xs font-mono-code text-[#172033] break-all flex-1 min-w-[200px]" dir="ltr">
+              {publishUrl}
+            </code>
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={() => handleCopyPublishUrl(publishUrl)}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-[#172033] bg-white hover:bg-slate-100 border border-[#E8ECF2] rounded-xl transition-colors cursor-pointer"
+              >
+                {copiedUrl ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5 text-[#2563EB]" />}
+                <span>{isRtl ? 'نسخ الرابط' : 'Copy URL'}</span>
+              </button>
+              <a
+                href={publishUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-white bg-[#2563EB] hover:bg-blue-700 rounded-xl transition-colors"
+              >
+                <ExternalLink className="w-3.5 h-3.5" />
+                <span>{isRtl ? 'فتح الموقع' : 'Open App'}</span>
+              </a>
+            </div>
+          </div>
+
+          {currentBrowserOrigin && currentBrowserOrigin !== publishUrl && (
+            <div className="flex items-center justify-between gap-2 text-[11px] text-[#64748B] px-1">
+              <span>{isRtl ? 'رابط الجلسة الحالية:' : 'Current session origin:'}</span>
+              <code className="font-mono-code text-[#172033]" dir="ltr">{currentBrowserOrigin}</code>
+            </div>
+          )}
+        </div>
+
+        {/* Developer-Only Demo Data & Logic Test Suite */}
+        <div className="bg-white rounded-3xl border border-[#E8ECF2] p-5 shadow-xs space-y-3.5">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <span className="p-1.5 rounded-xl bg-amber-50 text-amber-700 border border-amber-200">
+                <Database className="w-4 h-4" />
+              </span>
+              <div>
+                <h3 className="text-sm font-bold text-[#172033]">
+                  {isRtl ? 'بيئة التجربة والاختبار (للمطور فقط)' : 'Developer QA & Demo Data Sandbox'}
+                </h3>
+                <p className="text-[11px] text-[#64748B]">
+                  {isRtl
+                    ? 'يبدأ المتجر العام فارغاً تماماً بدون أي منتجات وهمية؛ يمكنك توليد بيانات تجريبية أو مسحها هنا فقط.'
+                    : 'Public storefront starts completely empty; generate trial data or run isolated QA tests strictly here.'}
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-4 gap-2 text-center text-[11px]">
+            <div className="p-2 bg-[#F7F8FA] rounded-xl border border-[#E8ECF2]">
+              <span className="text-[#64748B] block">{isRtl ? 'المنتجات' : 'Products'}</span>
+              <strong className="text-sm font-mono-code text-[#172033]">{liveCounts.products}</strong>
+            </div>
+            <div className="p-2 bg-[#F7F8FA] rounded-xl border border-[#E8ECF2]">
+              <span className="text-[#64748B] block">{isRtl ? 'الطلبات' : 'Orders'}</span>
+              <strong className="text-sm font-mono-code text-[#172033]">{liveCounts.orders}</strong>
+            </div>
+            <div className="p-2 bg-[#F7F8FA] rounded-xl border border-[#E8ECF2]">
+              <span className="text-[#64748B] block">{isRtl ? 'المرتجعات' : 'Returns'}</span>
+              <strong className="text-sm font-mono-code text-[#172033]">{liveCounts.returns}</strong>
+            </div>
+            <div className="p-2 bg-[#F7F8FA] rounded-xl border border-[#E8ECF2]">
+              <span className="text-[#64748B] block">{isRtl ? 'القيود' : 'Ledger'}</span>
+              <strong className="text-sm font-mono-code text-[#172033]">{liveCounts.transactions}</strong>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 pt-1">
+            <button
+              type="button"
+              onClick={() =>
+                liveCounts.products > 0 || liveCounts.orders > 0
+                  ? setConfirmMode('load_demo')
+                  : handleLoadDemoData()
+              }
+              className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded-xl transition-colors cursor-pointer"
+            >
+              <Sparkles className="w-3.5 h-3.5" />
+              <span>{isRtl ? 'توليد بيانات وهمية للتجربة' : 'Generate Demo Data'}</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setConfirmMode('clear_all')}
+              className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold text-[#DC5555] bg-rose-50 hover:bg-rose-100 border border-rose-200 rounded-xl transition-colors cursor-pointer"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              <span>{isRtl ? 'تفريغ المتجر للإطلاق (صفر بيانات)' : 'Clear Store to Empty'}</span>
+            </button>
+
+            {onOpenTestSuite && (
+              <button
+                type="button"
+                onClick={onOpenTestSuite}
+                className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold text-purple-800 bg-purple-50 hover:bg-purple-100 border border-purple-200 rounded-xl transition-colors cursor-pointer ms-auto"
+              >
+                <FlaskConical className="w-3.5 h-3.5 text-purple-600" />
+                <span>{isRtl ? 'حزمة اختبارات قواعد العمليات' : 'Operations Test Suite'}</span>
+                <Play className="w-3 h-3" />
+              </button>
+            )}
+          </div>
         </div>
       </div>
 
@@ -448,6 +655,37 @@ export const DeveloperCenterPage: React.FC<DeveloperCenterPageProps> = ({ locale
           </div>
         </div>
       </div>
+
+      <ConfirmDialog
+        isOpen={confirmMode !== null}
+        onClose={() => setConfirmMode(null)}
+        onConfirm={() => {
+          if (confirmMode === 'load_demo') handleLoadDemoData();
+          if (confirmMode === 'clear_all') handleClearAllData();
+          setConfirmMode(null);
+        }}
+        title={
+          confirmMode === 'load_demo'
+            ? isRtl
+              ? 'توليد بيانات تجريبية داخل بيئة المطور'
+              : 'Generate Demo Trial Dataset'
+            : isRtl
+            ? 'تفريغ المتجر والعودة للحالة الفارغة'
+            : 'Clear All Operational Store Data'
+        }
+        description={
+          confirmMode === 'load_demo'
+            ? isRtl
+              ? 'سيتم استبدال السجلات الحالية ببيانات تجريبية متزامنة لاختبار الطلبات والمرتجعات والدفتر المالي قبل الاعتماد.'
+              : 'This replaces current store records with synchronized demo products, orders, returns, and ledger entries for pre-launch QA.'
+            : isRtl
+            ? 'سيتم مسح جميع المنتجات والطلبات والمرتجعات والحركات والقيود المالية ليصبح المتجر فارغاً تماماً وجاهزاً للإطلاق الفعلي.'
+            : 'All products, orders, returns, movements, and financial transactions will be cleared to an empty production state.'
+        }
+        confirmText={isRtl ? 'تأكيد التنفيذ' : 'Confirm'}
+        cancelText={isRtl ? 'إلغاء' : 'Cancel'}
+        isDestructive={confirmMode === 'clear_all'}
+      />
     </div>
   );
 };
