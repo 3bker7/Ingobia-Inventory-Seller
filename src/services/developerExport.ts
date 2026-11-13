@@ -53,13 +53,20 @@ export class DeveloperExportService {
   public static createFullSnapshot(developerAccount = 'a7med3bker@gmail.com'): ProjectSnapshot {
     const snapshotId = this.generateSnapshotId();
     const timestamp = new Date().toISOString();
-    const version = '3.5.0-Production-CustodyLedger';
+    const version = '3.6.0-DomainModular-CustodyLedger';
 
     const sourceFilesList = [
       '/src/types/index.ts',
+      '/src/domain/inventoryCustody.ts',
+      '/src/domain/financialLedger.ts',
+      '/src/domain/orderLifecycle.ts',
+      '/src/domain/returnLifecycle.ts',
+      '/src/domain/smartImportCustody.ts',
+      '/src/services/seedData.ts',
       '/src/services/storage.ts',
       '/src/services/excel.ts',
       '/src/services/developerExport.ts',
+      '/src/tests/businessLogic.test.ts',
       '/src/components/layout/Header.tsx',
       '/src/components/layout/Sidebar.tsx',
       '/src/components/layout/MobileBottomNav.tsx',
@@ -317,81 +324,29 @@ Active Navigation Tabs:
         snapshotId,
         titleEn: 'Part 5: Storage Engine & State Transitions (Actual Source Code)',
         titleAr: 'الجزء الخامس: محرك التخزين والتحولات الذرية للحالة (كود المصدر الفعلي)',
-        sourceFiles: ['/src/services/storage.ts'],
+        sourceFiles: ['/src/domain/orderLifecycle.ts', '/src/services/storage.ts'],
         classification: 'ACTUAL_SOURCE_CODE',
-        dependencies: ['localStorage', 'Product', 'Order', 'StockMovement'],
+        dependencies: ['localStorage', 'Product', 'Order', 'StockMovement', 'ALLOWED_ORDER_TRANSITIONS'],
         content: `================================================================================
 PROJECT SNAPSHOT: ${snapshotId}
-SECTION 5 OF ${totalSections}: STORAGE ENGINE & STATE TRANSITIONS (SOURCE CODE)
+SECTION 5 OF ${totalSections}: ORDER STATE MACHINE & STORAGE FACADE
 TIMESTAMP: ${timestamp}
 ================================================================================
 
-// EXCERPT: ATOMIC ORDER DISPATCH & CUSTODY TRANSITIONS (/src/services/storage.ts)
-public updateOrderStatus(orderId: string, newStatus: OrderStatus, operator = 'النظام'): boolean {
-  const orders = this.getOrders();
-  const orderIndex = orders.findIndex((o) => o.id === orderId);
-  if (orderIndex === -1) return false;
+// STRICT ORDER STATE MACHINE (/src/domain/orderLifecycle.ts)
+export const ALLOWED_ORDER_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
+  preparing: ['with_delivery', 'cancelled'],
+  with_delivery: ['delivered', 'rejected'],
+  delivered: [],
+  rejected: [],
+  cancelled: [],
+};
 
-  const order = orders[orderIndex];
-  const oldStatus = order.status;
-  if (oldStatus === newStatus) return true;
-
-  const products = this.getProducts();
-
-  // Handover to courier: Reserved -> Outbound In Transit
-  if (oldStatus === 'preparing' && newStatus === 'with_delivery') {
-    for (const item of order.items) {
-      const prod = products.find((p) => p.id === item.productId || p.sku === item.productSku);
-      if (prod) {
-        prod.reservedStock = Math.max(0, prod.reservedStock - item.quantity);
-        prod.outboundInTransitStock = (prod.outboundInTransitStock || 0) + item.quantity;
-      }
-    }
-    order.dispatchedAt = new Date().toISOString();
-  }
-
-  // Delivery confirmation: Outbound In Transit -> Sold (Permanent physical deduction)
-  if (oldStatus === 'with_delivery' && newStatus === 'delivered') {
-    for (const item of order.items) {
-      const prod = products.find((p) => p.id === item.productId || p.sku === item.productSku);
-      if (prod) {
-        prod.outboundInTransitStock = Math.max(0, (prod.outboundInTransitStock || 0) - item.quantity);
-        prod.physicalStock = Math.max(0, prod.physicalStock - item.quantity);
-      }
-    }
-    order.deliveredAt = new Date().toISOString();
-    order.isClosed = true;
-
-    // Record verified sales revenue in accounting ledger
-    this.recordFinancialTransaction({
-      orderId: order.id,
-      orderNumber: order.orderNumber,
-      marketplace: order.marketplace,
-      type: 'delivered_sales_revenue',
-      amount: order.totalAmount,
-      descriptionAr: \`إيراد مبيعات مؤكد بعد تسليم الطلب \${order.orderNumber}\`,
-      descriptionEn: \`Confirmed sales revenue for delivered order \${order.orderNumber}\`,
-    });
-  }
-
-  // Doorstep rejection: Outbound In Transit -> Return In Transit
-  if (oldStatus === 'with_delivery' && newStatus === 'rejected') {
-    for (const item of order.items) {
-      const prod = products.find((p) => p.id === item.productId || p.sku === item.productSku);
-      if (prod) {
-        prod.outboundInTransitStock = Math.max(0, (prod.outboundInTransitStock || 0) - item.quantity);
-        prod.returnInTransitStock = (prod.returnInTransitStock || 0) + item.quantity;
-      }
-    }
-    order.rejectedAt = new Date().toISOString();
-    order.isClosed = true;
-    this.initiateReturnFromOrder(order, 'customer_rejected', 'تم رفض الشحنة عند باب العميل');
-  }
-
-  this.save(STORAGE_KEYS.PRODUCTS, products);
-  this.save(STORAGE_KEYS.ORDERS, orders);
-  return true;
-}`,
+// StorageService.updateOrderStatus delegates to updateOrderStatusPure(...) and persists changes.
+// - preparing -> with_delivery: reservedStock -> outboundInTransitStock
+// - preparing -> cancelled: reservedStock -> availableStock, order.isClosed = true
+// - with_delivery -> delivered: outboundInTransitStock & physicalStock deducted, financial ledger entries recorded
+// - with_delivery -> rejected: outboundInTransitStock -> returnInTransitStock, ReturnRecord opened`,
       },
 
       // -------------------------------------------------------------
@@ -440,48 +395,35 @@ TIMESTAMP: ${timestamp}
         snapshotId,
         titleEn: 'Part 7: 7-Stage Returns Management & Physical Inspection Logic',
         titleAr: 'الجزء السابع: إدارة المرتجعات بـ 7 مراحل ومنطق الفحص الفيزيائي',
-        sourceFiles: ['/src/components/pages/ReturnsPage.tsx', '/src/services/storage.ts'],
+        sourceFiles: ['/src/domain/returnLifecycle.ts', '/src/components/pages/ReturnsPage.tsx', '/src/services/storage.ts'],
         classification: 'ACTUAL_SOURCE_CODE',
-        dependencies: ['ReturnRecord', 'ReturnStatus', 'InspectionOutcome'],
+        dependencies: ['ReturnRecord', 'ReturnStatus', 'InspectionOutcome', 'ALLOWED_RETURN_TRANSITIONS'],
         content: `================================================================================
 PROJECT SNAPSHOT: ${snapshotId}
 SECTION 7 OF ${totalSections}: 7-STAGE RETURNS & PHYSICAL INSPECTION LOGIC
 TIMESTAMP: ${timestamp}
 ================================================================================
 
-// 7-STAGE RETURN LIFECYCLE
-1. 'initiated'             : Return request created.
-2. 'in_transit_back'        : Parcel moving back with courier.
-3. 'received_at_warehouse'  : Parcel confirmed physically received at dock.
-4. 'under_inspection'      : Item unboxed and undergoing quality audit.
-5. 'decision_pending'      : Inspection complete, awaiting supervisor approval.
-6. 'restocked'             : Item approved as pristine and returned to sellable stock.
-7. 'damaged'               : Item confirmed damaged/unsellable; written off.
+// RETURN STATE MACHINE (/src/domain/returnLifecycle.ts)
+export const ALLOWED_RETURN_TRANSITIONS: Record<ReturnStatus, ReturnStatus[]> = {
+  return_initiated: ['pickup_pending', 'in_transit_back', 'received_at_warehouse'],
+  pickup_pending: ['in_transit_back', 'received_at_warehouse'],
+  in_transit_back: ['received_at_warehouse'],
+  received_at_warehouse: ['under_inspection'],
+  under_inspection: [],
+  inspection_completed: [],
+  closed: [],
+  delivery_rejected: ['pickup_pending', 'in_transit_back', 'received_at_warehouse'],
+  product_received: ['under_inspection'],
+  restocked: [],
+  damaged: [],
+};
 
-// PHYSICAL RECEIPT AT WAREHOUSE (CRITICAL CUSTODY RULE)
-public advanceReturnStatus(returnId: string, nextStatus: ReturnStatus, operator = 'أمين المستودع'): boolean {
-  const returns = this.getReturns();
-  const ret = returns.find((r) => r.id === returnId);
-  if (!ret) return false;
-
-  // Parcel arrived at warehouse dock: ReturnInTransit -> AwaitingInspection
-  if (nextStatus === 'received_at_warehouse') {
-    const products = this.getProducts();
-    for (const item of ret.items) {
-      const prod = products.find((p) => p.id === item.productId || p.sku === item.productSku);
-      if (prod) {
-        prod.returnInTransitStock = Math.max(0, (prod.returnInTransitStock || 0) - item.quantity);
-        prod.awaitingInspectionStock = (prod.awaitingInspectionStock || 0) + item.quantity;
-        // Available stock is STRICTLY UNTOUCHED!
-      }
-    }
-    ret.warehouseReceivedAt = new Date().toISOString();
-    this.save(STORAGE_KEYS.PRODUCTS, products);
-  }
-  ret.returnStatus = nextStatus;
-  this.save(STORAGE_KEYS.RETURNS, returns);
-  return true;
-}
+// advanceReturnStatusPure & processReturnInspectionPure enforce:
+// 1. No skipping received_at_warehouse before inspection.
+// 2. Post-delivery returns restore physicalStock once at dock receipt (physicalRestoredAtReceipt guard).
+// 3. Restockable sets stockRestored = true and prevents duplicate restocks.
+// 4. Damaged isolates units in damagedStock and writes off historical COGS.
 
 // 4 INSPECTION OUTCOMES
 1. 'restockable'      : AwaitingInspection -> AvailableStock. Item is sellable again.
@@ -542,9 +484,9 @@ Every inventory mutation logs an audit event containing:
         snapshotId,
         titleEn: 'Part 9: Financial Accounting Ledger & Strict Profit Calculability',
         titleAr: 'الجزء التاسع: دفتر الأستاذ المحاسبي وقواعد احتساب الأرباح الصارمة',
-        sourceFiles: ['/src/services/storage.ts', '/src/types/index.ts'],
+        sourceFiles: ['/src/domain/financialLedger.ts', '/src/services/storage.ts', '/src/types/index.ts'],
         classification: 'ACTUAL_SOURCE_CODE',
-        dependencies: ['FinancialTransaction', 'OrderFinancialBreakdown'],
+        dependencies: ['FinancialTransaction', 'OrderFinancialBreakdown', 'computeOrderFinancialBreakdown'],
         content: `================================================================================
 PROJECT SNAPSHOT: ${snapshotId}
 SECTION 9 OF ${totalSections}: FINANCIAL LEDGER & STRICT PROFIT CALCULABILITY
@@ -553,63 +495,34 @@ TIMESTAMP: ${timestamp}
 
 1. STRICT PROFIT CALCULABILITY RULE
 --------------------------------------------------------------------------------
-RULE: An order's net profit can ONLY be calculated if all core components are known:
+RULE: An order's net profit is computed by computeOrderFinancialBreakdown (/src/domain/financialLedger.ts):
 - Selling Price Total
-- Actual Courier Shipping Fee
-- Marketplace Commission
-- Cost of Goods Sold (baseCost * quantity)
+- Actual Courier Shipping Fee & Packaging Cost
+- Recorded Marketplace Commission (never injects unrecorded estimates into confirmedNet)
+- Cost of Goods Sold (prioritizes item.unitCostSnapshot captured at order creation, falls back to catalog baseCost)
 
-If the product purchase cost (COGS) is missing, 'isProfitCalculable' is set to FALSE,
-and 'netProfit' is set to NULL. The system displays an explicit notice:
-"غير قابل للاحتساب (لغياب تكلفة الشراء)" rather than inventing synthetic profits.
+If any product purchase cost (COGS) is missing or order is not delivered:
+'isProfitCalculable' = FALSE and 'confirmedNet' = NULL.
+If marketplaceCommission was not recorded, 'commissionStatus' = 'missing' and 'marketplaceCommission' = 0.
 
-2. ORDER FINANCIAL BREAKDOWN FUNCTION (/src/services/storage.ts)
+2. ORDER FINANCIAL BREAKDOWN (/src/domain/financialLedger.ts)
 --------------------------------------------------------------------------------
-public getOrderFinancialBreakdown(orderId: string): OrderFinancialBreakdown | null {
-  const order = this.getOrders().find((o) => o.id === orderId);
-  if (!order) return null;
+const resolved = resolveOrderItemUnitCost(item, products); // snapshot -> catalog -> missing
+const isCommissionRecorded =
+  typeof order.marketplaceCommission === 'number' &&
+  Number.isFinite(order.marketplaceCommission) &&
+  order.marketplaceCommission >= 0;
+const marketplaceCommission = isCommissionRecorded ? order.marketplaceCommission! : 0;
 
-  const products = this.getProducts();
-  let cogsTotal = 0;
-  let isCogsMissing = false;
-
-  for (const item of order.items) {
-    const prod = products.find((p) => p.id === item.productId || p.sku === item.productSku);
-    if (!prod || prod.baseCost === undefined || prod.baseCost === null || prod.baseCost <= 0) {
-      isCogsMissing = true;
-    } else {
-      cogsTotal += prod.baseCost * item.quantity;
-    }
-  }
-
-  const sellingPrice = order.totalAmount;
-  const shipping = order.shippingFee || 0;
-  const commission = order.marketplaceCommission || (order.marketplace === 'noon' ? sellingPrice * 0.12 : sellingPrice * 0.10);
-
-  if (isCogsMissing) {
-    return {
-      orderId: order.id,
-      sellingPriceTotal: sellingPrice,
-      marketplaceCommission: commission,
-      actualShippingFee: shipping,
-      cogsTotal: null,
-      netProfit: null,
-      isProfitCalculable: false,
-      missingDataReasonAr: 'تكلفة شراء المنتج (COGS) غير مسجلة.',
-      missingDataReasonEn: 'Product purchase cost is missing.',
-    };
-  }
-
-  const netProfit = sellingPrice - commission - shipping - cogsTotal;
-  return {
-    orderId: order.id,
-    sellingPriceTotal: sellingPrice,
-    marketplaceCommission: commission,
-    actualShippingFee: shipping,
-    cogsTotal,
-    netProfit,
-    isProfitCalculable: true,
-  };
+if (isDelivered && hasAllCosts && !isCancelled) {
+  confirmedNet =
+    totalSellingPrice -
+    marketplaceCommission -
+    shippingFee -
+    packagingCost -
+    totalCostOfGoods +
+    extraAdjustments;
+  isProfitCalculable = true;
 }`,
       },
 
@@ -736,9 +649,9 @@ TIMESTAMP: ${timestamp}
         snapshotId,
         titleEn: 'Part 13: In-App Business Logic Test Suite, Verification & Known Limitations',
         titleAr: 'الجزء الثالث عشر: حزمة اختبارات منطق العمليات، التحقق والقيود التقنية',
-        sourceFiles: ['/src/components/common/TestSuiteModal.tsx'],
+        sourceFiles: ['/src/components/common/TestSuiteModal.tsx', '/src/tests/businessLogic.test.ts'],
         classification: 'VERIFIED_AUDIT',
-        dependencies: ['TestSuiteModal', 'UnitTestsInBrowser'],
+        dependencies: ['TestSuiteModal', 'src/domain/*', 'node:test'],
         content: `================================================================================
 PROJECT SNAPSHOT: ${snapshotId}
 SECTION 13 OF ${totalSections}: TEST SUITE, AUDIT & KNOWN LIMITATIONS

@@ -74,6 +74,7 @@ export interface OrderItem {
   productName: string; // snapshot at order time
   imageUrl: string;
   unitPrice: number; // snapshot at order time
+  unitCostSnapshot?: number; // COGS snapshot at order/import time so catalog edits don't rewrite historical profits
   quantity: number;
 }
 
@@ -119,15 +120,18 @@ export interface OrderFinancialBreakdown {
   orderId: string;
   sellingPriceTotal: number;
   itemCount: number;
-  marketplaceCommission: number;
+  marketplaceCommission: number; // strictly recorded commission (0 if unrecorded)
+  commissionStatus?: 'recorded' | 'missing';
+  estimatedMarketplaceCommission?: number; // informational reference only, never inside confirmedNet
   serviceFees: number;
   originalShippingFee: number;
   returnShippingFee: number;
   packagingCost: number;
   extraAdjustments: number;
   productCostOfGoods: number | null; // null if missing
+  cogsSource?: 'snapshot' | 'catalog' | 'mixed' | 'missing';
   refundAmount: number;
-  confirmedNet: number | null; // null if cost missing
+  confirmedNet: number | null; // null if cost missing or not delivered
   isProfitCalculable: boolean;
   uncalculatedReason?: string;
 }
@@ -239,6 +243,7 @@ export interface ReturnRecord {
   returnShippingCost?: number;
   returnCostPayer?: 'seller' | 'marketplace' | 'customer';
   receivedAtWarehouseDate?: string;
+  physicalRestoredAtReceipt?: boolean; // tracks whether post-delivery receipt already added quantity back to physicalStock
   inspectionDate?: string;
   notes?: string;
   activities?: OrderActivityEvent[];

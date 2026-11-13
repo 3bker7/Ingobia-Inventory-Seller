@@ -27,6 +27,7 @@ import {
   ExternalLink,
 } from 'lucide-react';
 import { storageService } from '../../services/storage';
+import { resolveOrderItemUnitCost } from '../../domain/financialLedger';
 import { translations, Locale } from '../../locales/translations';
 import { ActiveTab } from '../layout/Sidebar';
 import {
@@ -53,45 +54,56 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({ locale, onNavigate }
   // 1. Dashboard Filters State
   const [dateFilter, setDateFilter] = useState<DateFilterOption>('allTime');
   const [selectedMarketplace, setSelectedMarketplace] = useState<string>('all');
-  const [customStartDate, setCustomStartDate] = useState<string>('2026-11-01');
-  const [customEndDate, setCustomEndDate] = useState<string>('2026-11-11');
+  const todayIso = useMemo(() => new Date().toISOString().slice(0, 10), []);
+  const monthStartIso = useMemo(() => {
+    const now = new Date();
+    return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
+  }, []);
+  const [customStartDate, setCustomStartDate] = useState<string>(monthStartIso);
+  const [customEndDate, setCustomEndDate] = useState<string>(todayIso);
 
-  // Compute Active Date Range
+  // Compute Active Date Range dynamically from current system clock
   const activeDateRange = useMemo<{ start: Date; end: Date; daysCount: number }>(() => {
-    // Baseline anchor date from applet context: 2026-11-11
-    const anchor = new Date('2026-11-11T23:59:59Z');
+    const now = new Date();
+    const endOfToday = new Date(now);
+    endOfToday.setHours(23, 59, 59, 999);
 
     if (dateFilter === 'allTime') {
       const start = new Date('2020-01-01T00:00:00Z');
-      return { start, end: anchor, daysCount: 365 * 5 };
+      return { start, end: endOfToday, daysCount: Math.max(1, Math.round((endOfToday.getTime() - start.getTime()) / 86400000)) };
     }
     if (dateFilter === 'today') {
-      const start = new Date('2026-11-11T00:00:00Z');
-      return { start, end: anchor, daysCount: 1 };
+      const start = new Date(now);
+      start.setHours(0, 0, 0, 0);
+      return { start, end: endOfToday, daysCount: 1 };
     }
     if (dateFilter === '7days') {
-      const start = new Date('2026-11-04T00:00:00Z');
-      return { start, end: anchor, daysCount: 7 };
+      const start = new Date(now);
+      start.setDate(start.getDate() - 6);
+      start.setHours(0, 0, 0, 0);
+      return { start, end: endOfToday, daysCount: 7 };
     }
     if (dateFilter === '30days') {
-      const start = new Date('2026-10-12T00:00:00Z');
-      return { start, end: anchor, daysCount: 30 };
+      const start = new Date(now);
+      start.setDate(start.getDate() - 29);
+      start.setHours(0, 0, 0, 0);
+      return { start, end: endOfToday, daysCount: 30 };
     }
     if (dateFilter === 'thisMonth') {
-      const start = new Date('2026-11-01T00:00:00Z');
-      return { start, end: anchor, daysCount: 11 };
+      const start = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
+      return { start, end: endOfToday, daysCount: Math.max(1, now.getDate()) };
     }
     if (dateFilter === 'prevMonth') {
-      const start = new Date('2026-10-01T00:00:00Z');
-      const end = new Date('2026-10-31T23:59:59Z');
-      return { start, end, daysCount: 31 };
+      const start = new Date(now.getFullYear(), now.getMonth() - 1, 1, 0, 0, 0, 0);
+      const end = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59, 999);
+      return { start, end, daysCount: end.getDate() };
     }
-    // Custom
-    const start = new Date(customStartDate || '2026-11-01');
-    const end = new Date(customEndDate || '2026-11-11');
+    // Custom (inclusive end-of-day)
+    const start = new Date(`${customStartDate || monthStartIso}T00:00:00`);
+    const end = new Date(`${customEndDate || todayIso}T23:59:59.999`);
     const diffDays = Math.max(1, Math.round((end.getTime() - start.getTime()) / (1000 * 3600 * 24)));
     return { start, end, daysCount: diffDays };
-  }, [dateFilter, customStartDate, customEndDate]);
+  }, [dateFilter, customStartDate, customEndDate, monthStartIso, todayIso]);
 
   // Active Marketplaces
   const configuredMarketplaces = useMemo(() => storageService.getMarketplaces(), []);
@@ -123,13 +135,21 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({ locale, onNavigate }
   const ordersWithDelivery = filteredOrders.filter((o) => o.status === 'with_delivery');
 
   // Returns in Transit
-  const returnsInTransit = filteredReturns.filter((r) => r.returnStatus === 'in_transit_back');
+  const returnsInTransit = filteredReturns.filter(
+    (r) => !r.isCompleted && (r.returnStatus === 'in_transit_back' || r.returnStatus === 'pickup_pending' || r.returnStatus === 'return_initiated')
+  );
   // Returns Received & Under Inspection
   const returnsAwaitingInspection = filteredReturns.filter(
-    (r) => r.returnStatus === 'under_inspection' || r.returnStatus === 'product_received'
+    (r) =>
+      !r.isCompleted &&
+      (r.returnStatus === 'received_at_warehouse' ||
+        r.returnStatus === 'under_inspection' ||
+        r.returnStatus === 'product_received')
   );
   // Damaged Products
-  const damagedReturns = filteredReturns.filter((r) => r.returnStatus === 'damaged');
+  const damagedReturns = filteredReturns.filter(
+    (r) => r.inspectionOutcome === 'damaged' || r.returnStatus === 'damaged'
+  );
 
   // Total Successful Sales Value (Delivered orders only!)
   const totalDeliveredRevenue = useMemo(() => {
@@ -157,16 +177,14 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({ locale, onNavigate }
     }, 0);
   }, [damagedReturns]);
 
-  // Actual Known Financial Loss (COGS + known loss of damaged goods when recorded)
+  // Actual Known Financial Loss (strictly recorded unit cost only; never substitute selling price)
   const actualRecordedLosses = useMemo(() => {
     let loss = 0;
     for (const ret of damagedReturns) {
       for (const item of ret.items) {
-        const prod = allProducts.find((p) => p.id === item.productId || p.sku === item.productSku);
-        if (prod && prod.baseCost) {
-          loss += prod.baseCost * item.quantity;
-        } else {
-          loss += item.unitPrice * item.quantity;
+        const { unitCost } = resolveOrderItemUnitCost(item, allProducts);
+        if (unitCost !== null) {
+          loss += unitCost * item.quantity;
         }
       }
     }
@@ -880,7 +898,9 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({ locale, onNavigate }
               <span className="text-sm font-bold text-[#172033] block font-mono-code">
                 {financialSummary.courierShippingExpenses + financialSummary.marketplaceCommissions > 0
                   ? `${(financialSummary.courierShippingExpenses + financialSummary.marketplaceCommissions).toLocaleString()} ${settings.currency}`
-                  : locale === 'ar' ? '0 ريال (مسجلة بالدفتر)' : '0 (in ledger)'}
+                  : locale === 'ar'
+                  ? `0 ${settings.currency} (مسجلة بالدفتر)`
+                  : `0 ${settings.currency} (in ledger)`}
               </span>
               {financialSummary.ordersMissingCostCount > 0 && (
                 <span className="text-[10px] text-amber-700 block mt-1 font-semibold">

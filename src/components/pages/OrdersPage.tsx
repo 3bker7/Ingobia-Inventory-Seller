@@ -40,6 +40,7 @@ interface OrdersPageProps {
   onCloseInitialAddModal?: () => void;
   initialStatusFilter?: string;
   onNavigateToCompleted?: () => void;
+  onOrdersChange?: () => void;
 }
 
 interface SkuLineItem {
@@ -54,6 +55,7 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
   onCloseInitialAddModal,
   initialStatusFilter,
   onNavigateToCompleted,
+  onOrdersChange,
 }) => {
   const t = translations[locale];
   const { showToast } = useToast();
@@ -106,6 +108,7 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
 
   const refreshOrders = () => {
     setOrders(storageService.getActiveOrders());
+    onOrdersChange?.();
   };
 
   const filteredOrders = useMemo(() => {
@@ -254,6 +257,8 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
         productName: isRtl && prod.nameAr ? prod.nameAr : prod.name,
         imageUrl: prod.imageUrl,
         unitPrice: listingPrice,
+        unitCostSnapshot:
+          typeof prod.baseCost === 'number' && prod.baseCost > 0 ? prod.baseCost : undefined,
         quantity: it.quantity,
       };
     });
@@ -967,7 +972,7 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
               <div>
                 <label className="block text-[10px] text-[#64748B] mb-0.5">
-                  {isRtl ? 'تكلفة الشحن (ر.س):' : 'Shipping fee:'}
+                  {isRtl ? `تكلفة الشحن (${settings.currency}):` : `Shipping fee (${settings.currency}):`}
                 </label>
                 <input
                   type="number"
@@ -980,7 +985,7 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
 
               <div>
                 <label className="block text-[10px] text-[#64748B] mb-0.5">
-                  {isRtl ? 'تكلفة التغليف (ر.س):' : 'Packaging fee:'}
+                  {isRtl ? `تكلفة التغليف (${settings.currency}):` : `Packaging fee (${settings.currency}):`}
                 </label>
                 <input
                   type="number"
@@ -1006,7 +1011,7 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
 
               <div>
                 <label className="block text-[10px] text-[#64748B] mb-0.5">
-                  {isRtl ? 'خصم مالي (ر.س):' : 'Discount:'}
+                  {isRtl ? `خصم مالي (${settings.currency}):` : `Discount (${settings.currency}):`}
                 </label>
                 <input
                   type="number"
@@ -1099,7 +1104,9 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
               {viewOrder.shippingCost ? (
                 <div className="text-end">
                   <span className="text-[10px] text-[#64748B] block">{isRtl ? 'رسوم التوصيل:' : 'Shipping fee:'}</span>
-                  <span className="font-bold text-[#172033] font-mono-code">{viewOrder.shippingCost} ر.س</span>
+                  <span className="font-bold text-[#172033] font-mono-code">
+                    {viewOrder.shippingCost} {settings.currency}
+                  </span>
                 </div>
               ) : null}
             </div>
@@ -1153,25 +1160,45 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
                   <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px] pt-1">
                     <div className="p-2 bg-white rounded-xl border border-slate-200">
                       <span className="text-[#64748B] block text-[10px]">{isRtl ? 'قيمة البيع:' : 'Gross sale:'}</span>
-                      <strong className="font-mono-code text-[#172033]">{fin.sellingPriceTotal} ر.س</strong>
+                      <strong className="font-mono-code text-[#172033]">
+                        {fin.sellingPriceTotal} {settings.currency}
+                      </strong>
                     </div>
 
                     <div className="p-2 bg-white rounded-xl border border-slate-200">
-                      <span className="text-[#64748B] block text-[10px]">{isRtl ? 'عمولة المنصة المقدرة:' : 'Commission:'}</span>
-                      <strong className="font-mono-code text-rose-700">-{fin.marketplaceCommission} ر.س</strong>
+                      <span className="text-[#64748B] block text-[10px]">
+                        {isRtl
+                          ? fin.commissionStatus === 'recorded'
+                            ? 'عمولة المنصة المسجلة:'
+                            : 'عمولة المنصة:'
+                          : fin.commissionStatus === 'recorded'
+                          ? 'Recorded Commission:'
+                          : 'Commission:'}
+                      </span>
+                      {fin.commissionStatus === 'recorded' ? (
+                        <strong className="font-mono-code text-rose-700">
+                          -{fin.marketplaceCommission} {settings.currency}
+                        </strong>
+                      ) : (
+                        <span className="text-[10px] text-amber-700 font-bold">
+                          {isRtl ? 'غير مسجلة' : 'Not recorded'}
+                        </span>
+                      )}
                     </div>
 
                     <div className="p-2 bg-white rounded-xl border border-slate-200">
                       <span className="text-[#64748B] block text-[10px]">{isRtl ? 'تكلفة الشحن والتغليف:' : 'Shipping & pack:'}</span>
                       <strong className="font-mono-code text-rose-700">
-                        -{(fin.originalShippingFee + fin.packagingCost).toFixed(2)} ر.س
+                        -{(fin.originalShippingFee + fin.packagingCost).toFixed(2)} {settings.currency}
                       </strong>
                     </div>
 
                     <div className="p-2 bg-white rounded-xl border border-slate-200">
                       <span className="text-[#64748B] block text-[10px]">{isRtl ? 'تكلفة شراء البضاعة:' : 'Cost of Goods:'}</span>
                       {fin.productCostOfGoods !== null ? (
-                        <strong className="font-mono-code text-rose-700">-{fin.productCostOfGoods} ر.س</strong>
+                        <strong className="font-mono-code text-rose-700">
+                          -{fin.productCostOfGoods} {settings.currency}
+                        </strong>
                       ) : (
                         <span className="text-[10px] text-amber-700 font-bold">{isRtl ? 'غير مسجل' : 'Missing'}</span>
                       )}

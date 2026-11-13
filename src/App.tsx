@@ -71,7 +71,7 @@ export default function App() {
     ).length;
 
     const pendingReturns = returns.filter(
-      (r) => r.returnStatus !== 'restocked' && r.returnStatus !== 'damaged'
+      (r) => !r.isCompleted && r.returnStatus !== 'closed'
     ).length;
 
     setActiveOrdersCount(pendingOrders);
@@ -270,6 +270,7 @@ export default function App() {
                 isAddModalOpenInitially={openNewOrderModal}
                 onCloseInitialAddModal={() => setOpenNewOrderModal(false)}
                 initialStatusFilter={ordersFilter}
+                onOrdersChange={refreshBadges}
                 onNavigateToCompleted={() => {
                   setCurrentTab('completedOrders');
                   refreshBadges();
@@ -280,6 +281,7 @@ export default function App() {
             {currentTab === 'completedOrders' && (
               <CompletedOrdersPage
                 locale={locale}
+                onDataChange={refreshBadges}
                 onNavigateToReturns={() => {
                   setReturnsFilter(undefined);
                   setCurrentTab('returns');
@@ -294,6 +296,7 @@ export default function App() {
               <ReturnsPage
                 locale={locale}
                 initialStatusFilter={returnsFilter}
+                onReturnsChange={refreshBadges}
               />
             )}
 
@@ -312,6 +315,7 @@ export default function App() {
             {currentTab === 'smartImport' && (
               <SmartImportPage
                 locale={locale}
+                onOrdersImported={refreshBadges}
                 onNavigateToOrders={() => {
                   setCurrentTab('orders');
                   refreshBadges();

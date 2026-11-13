@@ -17,7 +17,11 @@ import {
 } from 'lucide-react';
 import { Modal } from './Modal';
 import { Locale } from '../../locales/translations';
-import { Product, Order, OrderFinancialBreakdown } from '../../types';
+import { Product, Order, ReturnRecord } from '../../types';
+import { createOrderPure, updateOrderStatusPure } from '../../domain/orderLifecycle';
+import { advanceReturnStatusPure, processReturnInspectionPure } from '../../domain/returnLifecycle';
+import { computeOrderFinancialBreakdown } from '../../domain/financialLedger';
+import { DEFAULT_MERCHANT_PROFILE } from '../../services/seedData';
 
 interface TestSuiteModalProps {
   isOpen: boolean;
@@ -37,6 +41,27 @@ interface TestResult {
   durationMs?: number;
 }
 
+const makeTestProduct = (overrides: Partial<Product> = {}): Product => ({
+  id: 'mock-p1',
+  sku: 'TEST-SKU-1',
+  name: 'منتج تجريبي 1',
+  imageUrl: 'https://images.unsplash.com/photo-1546868871-7041f2a55e12?w=300',
+  currentPrice: 150,
+  category: 'Electronics',
+  baseCost: 100,
+  physicalStock: 20,
+  availableStock: 20,
+  reservedStock: 0,
+  outboundInTransitStock: 0,
+  returnInTransitStock: 0,
+  awaitingInspectionStock: 0,
+  damagedStock: 0,
+  marketplaceListings: {},
+  createdAt: '2026-11-10T10:00:00Z',
+  updatedAt: '2026-11-10T10:00:00Z',
+  ...overrides,
+});
+
 export const TestSuiteModal: React.FC<TestSuiteModalProps> = ({ isOpen, onClose, locale }) => {
   const isRtl = locale === 'ar';
   const [isRunning, setIsRunning] = useState(false);
@@ -48,8 +73,8 @@ export const TestSuiteModal: React.FC<TestSuiteModalProps> = ({ isOpen, onClose,
       nameEn: '1. Stock Reservation upon Order Creation (Available -> Reserved)',
       category: 'custody',
       status: 'idle',
-      messageAr: 'التحقق من أن المخزون المتاح يقل فور إنشاء الطلب ويزداد المخزون المحجوز دون المساس بإجمالي المستودع الفيزيائي.',
-      messageEn: 'Verify available stock decreases and reserved increases without altering physical warehouse stock.',
+      messageAr: 'التحقق عبر createOrderPure من نقص المتاح وزيادة المحجوز مع رفض تجاوز المتاح.',
+      messageEn: 'Verify via createOrderPure that available stock decreases, reserved increases, and overselling is blocked.',
     },
     {
       id: 'test_handover_courier',
@@ -57,8 +82,8 @@ export const TestSuiteModal: React.FC<TestSuiteModalProps> = ({ isOpen, onClose,
       nameEn: '2. Courier Handover (Reserved -> Outbound In Transit)',
       category: 'custody',
       status: 'idle',
-      messageAr: 'التحقق من خروج الشحنة من عهدة المحجوز إلى عهدة الترانزيت الخارجي دون المساس بالمخزون المتاح.',
-      messageEn: 'Verify stock moves from reserved to outbound in transit without affecting available stock.',
+      messageAr: 'التحقق عبر updateOrderStatusPure من انتقال العهدة إلى الترانزيت الخارجي ومنع إلغاء شحنة خرجت للتوصيل.',
+      messageEn: 'Verify via updateOrderStatusPure that stock moves to outbound transit and dispatched cancellation is blocked.',
     },
     {
       id: 'test_delivery_success',
@@ -66,8 +91,8 @@ export const TestSuiteModal: React.FC<TestSuiteModalProps> = ({ isOpen, onClose,
       nameEn: '3. Successful Customer Delivery (Deductions & Revenue Confirmation)',
       category: 'custody',
       status: 'idle',
-      messageAr: 'التحقق من خصم الوحدات نهائياً من المستودع والشحن الخارجي وإثبات إيراد المبيعات المؤكد وإغلاق الطلب.',
-      messageEn: 'Verify units are permanently deducted from outbound and physical stock, and revenue is recorded.',
+      messageAr: 'التحقق من الخصم النهائي للوحدات وإثبات الإيراد وقفل الطلب ومنع أي انتقال لاحق.',
+      messageEn: 'Verify permanent unit deduction, revenue ledger entry, order closure, and terminal state lock.',
     },
     {
       id: 'test_return_rejection',
@@ -75,8 +100,8 @@ export const TestSuiteModal: React.FC<TestSuiteModalProps> = ({ isOpen, onClose,
       nameEn: '4. Delivery Rejection & Return In Transit (Outbound -> Return In Transit)',
       category: 'returns',
       status: 'idle',
-      messageAr: 'التحقق من أن الشحنة المرفوضة تتحول إلى عهدة ترانزيت الإرجاع دون دخولها أبداً للمخزون المتاح.',
-      messageEn: 'Verify rejected units transition to return in transit and are strictly barred from available stock.',
+      messageAr: 'التحقق من إنشاء سجل المرتجع ونقل العهدة لمسار العودة مع بقاء المتاح محجوباً.',
+      messageEn: 'Verify rejected units create a return record in transit back while availableStock stays untouched.',
     },
     {
       id: 'test_warehouse_physical_receipt',
@@ -84,8 +109,8 @@ export const TestSuiteModal: React.FC<TestSuiteModalProps> = ({ isOpen, onClose,
       nameEn: '5. Warehouse Physical Receipt (Return In Transit -> Awaiting Inspection)',
       category: 'returns',
       status: 'idle',
-      messageAr: 'التحقق من إثبات استلام الطرد في المستودع ونقله لعهدة الفحص مع بقاء المخزون المتاح كما هو تماماً.',
-      messageEn: 'Verify received package moves to awaiting inspection custody while available stock remains untouched.',
+      messageAr: 'التحقق عبر advanceReturnStatusPure من نقل العهدة لبانتظار الفحص ومنع القفز للفحص قبل الاستلام.',
+      messageEn: 'Verify via advanceReturnStatusPure transition to awaitingInspectionStock and rejection of skipped stages.',
     },
     {
       id: 'test_inspection_restockable',
@@ -93,8 +118,8 @@ export const TestSuiteModal: React.FC<TestSuiteModalProps> = ({ isOpen, onClose,
       nameEn: '6. Return Inspection Approval (Awaiting Inspection -> Available Stock)',
       category: 'returns',
       status: 'idle',
-      messageAr: 'التحقق من دخول المنتج للمخزون المتاح للبيع فقط بعد اعتماد الفحص كصالح لإعادة البيع.',
-      messageEn: 'Verify units only enter available stock after being explicitly approved as restockable.',
+      messageAr: 'التحقق عبر processReturnInspectionPure من إعادة الصالح للمتاح ومنع التكرار.',
+      messageEn: 'Verify via processReturnInspectionPure restockable approval and duplicate restock prevention.',
     },
     {
       id: 'test_inspection_damaged',
@@ -102,8 +127,8 @@ export const TestSuiteModal: React.FC<TestSuiteModalProps> = ({ isOpen, onClose,
       nameEn: '7. Damaged Return Inspection (Awaiting Inspection -> Damaged Stock)',
       category: 'returns',
       status: 'idle',
-      messageAr: 'التحقق من أن المنتج التالف لا يدخل أبداً في المخزون المتاح ويتم تسجيل خسارة إعدام البضاعة في الدفتر المالي.',
-      messageEn: 'Verify damaged returns are quarantined into damagedStock, never enter available stock, and record a write-off.',
+      messageAr: 'التحقق من عزل التالف في damagedStock وتسجيل قيد الخسارة حسب التكلفة التاريخية للطلب.',
+      messageEn: 'Verify damaged isolation in damagedStock and historical snapshot COGS write-off transaction.',
     },
     {
       id: 'test_financial_breakdown_strict_rules',
@@ -111,8 +136,8 @@ export const TestSuiteModal: React.FC<TestSuiteModalProps> = ({ isOpen, onClose,
       nameEn: '8. Strict Profit Calculability Rule (Blocks Speculative Calculations)',
       category: 'finance',
       status: 'idle',
-      messageAr: 'حظر حساب الأرباح عند غياب تكلفة الشراء (COGS)، واحتساب صافي الربح بدقة عند اكتمال البيانات.',
-      messageEn: 'Strictly blocks speculative profit when COGS is missing; accurately calculates profit when present.',
+      messageAr: 'التحقق عبر computeOrderFinancialBreakdown من حظر التخمين عند غياب COGS وعدم خصم عمولة غير مسجلة.',
+      messageEn: 'Verify via computeOrderFinancialBreakdown missing COGS blocking and unrecorded commission handling.',
     },
     {
       id: 'test_onboarding_dynamic_zero_platforms',
@@ -120,8 +145,8 @@ export const TestSuiteModal: React.FC<TestSuiteModalProps> = ({ isOpen, onClose,
       nameEn: '9. Flexible Onboarding (Zero Platforms Allowed, Custom Storefront)',
       category: 'onboarding',
       status: 'idle',
-      messageAr: 'التحقق من إمكانية إكمال التهيئة بدون اختيار إجباري لأمازون أو نون مع دعم المتجر الخاص بالكامل.',
-      messageEn: 'Verify onboarding proceeds without mandatory platforms and accommodates custom web stores.',
+      messageAr: 'التحقق من أن الملف الافتراضي للتاجر يبدأ بصفر منصات مفروضة مع دعم المتجر المستقل.',
+      messageEn: 'Verify default merchant profile starts with zero forced marketplaces and supports custom storefronts.',
     },
   ];
 
@@ -137,320 +162,366 @@ export const TestSuiteModal: React.FC<TestSuiteModalProps> = ({ isOpen, onClose,
       const t = currentResults[i];
       const start = performance.now();
 
-      await new Promise((res) => setTimeout(res, 80));
+      await new Promise((res) => setTimeout(res, 50));
 
       try {
         if (t.id === 'test_order_creation_reservation') {
-          const mockProduct: Product = {
-            id: 'mock-p1',
-            sku: 'TEST-SKU-1',
-            name: 'منتج تجريبي 1',
-            imageUrl: 'https://images.unsplash.com/photo-1546868871-7041f2a55e12?w=300',
-            currentPrice: 150,
-            category: 'Electronics',
-            baseCost: 100,
-            physicalStock: 20,
-            availableStock: 20,
-            reservedStock: 0,
-            outboundInTransitStock: 0,
-            returnInTransitStock: 0,
-            awaitingInspectionStock: 0,
-            damagedStock: 0,
-            marketplaceListings: {},
-            createdAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString(),
-          };
-
-          const qty = 3;
-          if (mockProduct.availableStock < qty) throw new Error('Insufficient available stock');
-          mockProduct.availableStock -= qty;
-          mockProduct.reservedStock += qty;
-
-          if (mockProduct.availableStock !== 17) throw new Error(`Expected available 17, got ${mockProduct.availableStock}`);
-          if (mockProduct.reservedStock !== 3) throw new Error(`Expected reserved 3, got ${mockProduct.reservedStock}`);
-          if (mockProduct.physicalStock !== 20) throw new Error(`Physical stock altered prematurely! Expected 20, got ${mockProduct.physicalStock}`);
+          const p = makeTestProduct();
+          const res = createOrderPure({
+            orderData: {
+              marketplaceId: 'noon',
+              customerName: 'عميل اختبار',
+              shippingAddress: 'الرياض',
+              items: [{ productId: p.id, productSku: p.sku, productName: p.name, imageUrl: p.imageUrl, quantity: 3, unitPrice: 150 }],
+              totalAmount: 450,
+              shippingCost: 20,
+              status: 'preparing',
+              orderDate: '2026-11-10T10:00:00Z',
+            },
+            products: [p],
+            existingOrders: [],
+            customId: 'TEST-ORD-1',
+          });
+          if (!res.success || !res.order) throw new Error(res.error || 'Order creation failed');
+          const updated = res.products[0];
+          if (updated.availableStock !== 17 || updated.reservedStock !== 3 || updated.physicalStock !== 20) {
+            throw new Error(`Invalid custody after order creation: avail=${updated.availableStock}, res=${updated.reservedStock}`);
+          }
+          if (res.order.items[0].unitCostSnapshot !== 100) {
+            throw new Error('unitCostSnapshot was not captured at order creation');
+          }
+          const oversell = createOrderPure({
+            orderData: {
+              marketplaceId: 'noon',
+              customerName: 'عميل اختبار',
+              shippingAddress: 'الرياض',
+              items: [
+                { productId: p.id, productSku: p.sku, productName: p.name, imageUrl: p.imageUrl, quantity: 10, unitPrice: 150 },
+                { productId: p.id, productSku: p.sku, productName: p.name, imageUrl: p.imageUrl, quantity: 10, unitPrice: 150 },
+              ],
+              totalAmount: 3000,
+              shippingCost: 20,
+              status: 'preparing',
+              orderDate: '2026-11-10T10:00:00Z',
+            },
+            products: res.products,
+            existingOrders: res.orders,
+          });
+          if (oversell.success) throw new Error('Split-line oversell above availableStock was not rejected');
 
           t.status = 'passed';
           t.details = [
-            'الكمية المتاحة: 20 -> 17 (-3)',
-            'الكمية المحجوزة: 0 -> 3 (+3)',
-            'إجمالي المستودع الفيزيائي لم يتغير: 20 قطعة',
+            'createOrderPure: المتاح 20 -> 17، المحجوز 0 -> 3، الفيزيائي ثابت 20',
+            'حفظ لقطة التكلفة unitCostSnapshot = 100 بنجاح',
+            'تم رفض تجاوز المخزون عبر بندين مكررين لنفس المنتج (20 > 17)',
           ];
         } else if (t.id === 'test_handover_courier') {
-          const mockProduct: Product = {
-            id: 'mock-p1',
-            sku: 'TEST-SKU-1',
-            name: 'منتج تجريبي 1',
-            imageUrl: 'https://images.unsplash.com/photo-1546868871-7041f2a55e12?w=300',
-            currentPrice: 150,
-            category: 'Electronics',
-            baseCost: 100,
-            physicalStock: 20,
-            availableStock: 17,
-            reservedStock: 3,
-            outboundInTransitStock: 0,
-            returnInTransitStock: 0,
-            awaitingInspectionStock: 0,
-            damagedStock: 0,
-            marketplaceListings: {},
-            createdAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString(),
+          const p = makeTestProduct({ availableStock: 17, reservedStock: 3 });
+          const seedOrder: Order = {
+            id: 'TEST-ORD-2',
+            marketplaceId: 'noon',
+            customerName: 'عميل اختبار',
+            shippingAddress: 'جدة',
+            items: [{ productId: p.id, productSku: p.sku, productName: p.name, imageUrl: p.imageUrl, quantity: 3, unitPrice: 150, unitCostSnapshot: 100 }],
+            totalAmount: 450,
+            shippingCost: 20,
+            status: 'preparing',
+            stockDeducted: true,
+            isClosed: false,
+            orderDate: '2026-11-10T10:00:00Z',
+            createdAt: '2026-11-10T10:00:00Z',
+            updatedAt: '2026-11-10T10:00:00Z',
           };
-
-          const qty = 3;
-          mockProduct.reservedStock -= qty;
-          mockProduct.outboundInTransitStock = (mockProduct.outboundInTransitStock || 0) + qty;
-
-          if (mockProduct.reservedStock !== 0) throw new Error(`Expected reserved 0, got ${mockProduct.reservedStock}`);
-          if (mockProduct.outboundInTransitStock !== 3) throw new Error(`Expected outbound 3, got ${mockProduct.outboundInTransitStock}`);
-          if (mockProduct.availableStock !== 17) throw new Error(`Available stock should not change during dispatch!`);
+          const res = updateOrderStatusPure({
+            orderId: seedOrder.id,
+            newStatus: 'with_delivery',
+            orders: [seedOrder],
+            products: [p],
+            returns: [],
+            currency: 'SAR',
+            shipmentDetails: { courierName: 'Aramex', trackingNumber: 'TRK-22' },
+          });
+          if (!res.success) throw new Error(res.error || 'Handover failed');
+          const updated = res.products[0];
+          if (updated.reservedStock !== 0 || updated.outboundInTransitStock !== 3 || updated.availableStock !== 17) {
+            throw new Error('Custody mismatch after handover');
+          }
+          const cancelAfterHandover = updateOrderStatusPure({
+            orderId: seedOrder.id,
+            newStatus: 'cancelled',
+            orders: res.orders,
+            products: res.products,
+            returns: res.returns,
+            currency: 'SAR',
+          });
+          if (cancelAfterHandover.success) throw new Error('Illegal transition with_delivery -> cancelled was allowed');
 
           t.status = 'passed';
           t.details = [
-            'الكمية المحجوزة: 3 -> 0',
-            'ترانزيت خارجي مع المندوب: 0 -> 3',
-            'المخزون المتاح بقي محفوظاً عند: 17',
+            'updateOrderStatusPure: المحجوز 3 -> 0، ترانزيت التوصيل 0 -> 3',
+            'رفض الانتقال غير المشروع with_delivery -> cancelled بنجاح',
           ];
         } else if (t.id === 'test_delivery_success') {
-          const mockProduct: Product = {
-            id: 'mock-p1',
-            sku: 'TEST-SKU-1',
-            name: 'منتج تجريبي 1',
-            imageUrl: 'https://images.unsplash.com/photo-1546868871-7041f2a55e12?w=300',
-            currentPrice: 150,
-            category: 'Electronics',
-            baseCost: 100,
-            physicalStock: 20,
-            availableStock: 17,
-            reservedStock: 0,
-            outboundInTransitStock: 3,
-            returnInTransitStock: 0,
-            awaitingInspectionStock: 0,
-            damagedStock: 0,
-            marketplaceListings: {},
-            createdAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString(),
+          const p = makeTestProduct({ availableStock: 17, reservedStock: 0, outboundInTransitStock: 3 });
+          const seedOrder: Order = {
+            id: 'TEST-ORD-3',
+            marketplaceId: 'amazon',
+            customerName: 'عميل اختبار',
+            shippingAddress: 'الدمام',
+            items: [{ productId: p.id, productSku: p.sku, productName: p.name, imageUrl: p.imageUrl, quantity: 3, unitPrice: 150, unitCostSnapshot: 100 }],
+            totalAmount: 450,
+            shippingCost: 25,
+            marketplaceCommission: 45,
+            status: 'with_delivery',
+            stockDeducted: true,
+            isClosed: false,
+            orderDate: '2026-11-10T10:00:00Z',
+            createdAt: '2026-11-10T10:00:00Z',
+            updatedAt: '2026-11-10T10:00:00Z',
           };
-
-          const qty = 3;
-          mockProduct.outboundInTransitStock = Math.max(0, (mockProduct.outboundInTransitStock || 0) - qty);
-          mockProduct.physicalStock -= qty;
-
-          if (mockProduct.outboundInTransitStock !== 0) throw new Error(`Outbound stock not cleared on delivery!`);
-          if (mockProduct.physicalStock !== 17) throw new Error(`Physical stock should be 17, got ${mockProduct.physicalStock}`);
+          const res = updateOrderStatusPure({
+            orderId: seedOrder.id,
+            newStatus: 'delivered',
+            orders: [seedOrder],
+            products: [p],
+            returns: [],
+            currency: 'SAR',
+          });
+          if (!res.success) throw new Error(res.error || 'Delivery confirmation failed');
+          const updated = res.products[0];
+          if (updated.outboundInTransitStock !== 0 || updated.physicalStock !== 17) {
+            throw new Error(`Expected outbound=0 physical=17, got ${updated.outboundInTransitStock}/${updated.physicalStock}`);
+          }
+          if (!res.orders[0].isClosed || res.newTransactions.length < 3) {
+            throw new Error('Order not closed or ledger transactions missing');
+          }
 
           t.status = 'passed';
           t.details = [
-            'الترانزيت الخارجي: 3 -> 0',
-            'المستودع الفيزيائي النهائي: 20 -> 17',
-            'إثبات مالي: إيراد المبيعات مثبت والطلب مغلق بنجاح',
+            'الترانزيت الخارجي 3 -> 0 والمستودع الفيزيائي 20 -> 17',
+            `تسجيل ${res.newTransactions.length} قيود مالية مؤكدة وإغلاق الطلب`,
           ];
         } else if (t.id === 'test_return_rejection') {
-          const mockProduct: Product = {
-            id: 'mock-p1',
-            sku: 'TEST-SKU-1',
-            name: 'منتج تجريبي 1',
-            imageUrl: 'https://images.unsplash.com/photo-1546868871-7041f2a55e12?w=300',
-            currentPrice: 150,
-            category: 'Electronics',
-            baseCost: 100,
-            physicalStock: 20,
-            availableStock: 17,
-            reservedStock: 0,
-            outboundInTransitStock: 3,
-            returnInTransitStock: 0,
-            awaitingInspectionStock: 0,
-            damagedStock: 0,
-            marketplaceListings: {},
-            createdAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString(),
+          const p = makeTestProduct({ availableStock: 17, outboundInTransitStock: 3 });
+          const seedOrder: Order = {
+            id: 'TEST-ORD-4',
+            marketplaceId: 'noon',
+            customerName: 'عميل اختبار',
+            shippingAddress: 'الرياض',
+            items: [{ productId: p.id, productSku: p.sku, productName: p.name, imageUrl: p.imageUrl, quantity: 3, unitPrice: 150, unitCostSnapshot: 100 }],
+            totalAmount: 450,
+            shippingCost: 20,
+            status: 'with_delivery',
+            stockDeducted: true,
+            isClosed: false,
+            orderDate: '2026-11-10T10:00:00Z',
+            createdAt: '2026-11-10T10:00:00Z',
+            updatedAt: '2026-11-10T10:00:00Z',
           };
-
-          const qty = 3;
-          mockProduct.outboundInTransitStock = Math.max(0, (mockProduct.outboundInTransitStock || 0) - qty);
-          mockProduct.returnInTransitStock = (mockProduct.returnInTransitStock || 0) + qty;
-
-          if (mockProduct.availableStock !== 17) throw new Error(`Security Violation: Available stock increased on return rejection!`);
-          if (mockProduct.returnInTransitStock !== 3) throw new Error(`Return in transit was not incremented!`);
+          const res = updateOrderStatusPure({
+            orderId: seedOrder.id,
+            newStatus: 'rejected',
+            orders: [seedOrder],
+            products: [p],
+            returns: [],
+            currency: 'SAR',
+          });
+          if (!res.success || res.returns.length !== 1) throw new Error('Rejection did not create return record');
+          const updated = res.products[0];
+          if (updated.availableStock !== 17 || updated.returnInTransitStock !== 3 || updated.outboundInTransitStock !== 0) {
+            throw new Error('Rejection custody breach detected');
+          }
 
           t.status = 'passed';
           t.details = [
-            'ترانزيت تسليم خارجي: 3 -> 0',
-            'ترانزيت إرجاع مع شركة الشحن: 0 -> 3',
-            'حماية الأمان: المخزون المتاح لم يدخله أي قطعة قبل الوصول والفحص (17)',
+            `تم فتح المرتجع ${res.returns[0].id} بحالة in_transit_back`,
+            'ترانزيت التسليم 3 -> 0، ترانزيت الإرجاع 0 -> 3، المتاح محفوظ عند 17',
           ];
         } else if (t.id === 'test_warehouse_physical_receipt') {
-          const mockProduct: Product = {
-            id: 'mock-p1',
-            sku: 'TEST-SKU-1',
-            name: 'منتج تجريبي 1',
-            imageUrl: 'https://images.unsplash.com/photo-1546868871-7041f2a55e12?w=300',
-            currentPrice: 150,
-            category: 'Electronics',
-            baseCost: 100,
-            physicalStock: 20,
-            availableStock: 17,
-            reservedStock: 0,
-            outboundInTransitStock: 0,
-            returnInTransitStock: 3,
-            awaitingInspectionStock: 0,
-            damagedStock: 0,
-            marketplaceListings: {},
-            createdAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString(),
+          const p = makeTestProduct({ availableStock: 17, returnInTransitStock: 3 });
+          const ret: ReturnRecord = {
+            id: 'RET-TEST-5',
+            orderId: 'TEST-ORD-5',
+            marketplaceId: 'noon',
+            items: [{ productId: p.id, productSku: p.sku, productName: p.name, imageUrl: p.imageUrl, quantity: 3, unitPrice: 150, unitCostSnapshot: 100 }],
+            returnReason: 'رفض الاستلام',
+            returnStatus: 'in_transit_back',
+            stockRestored: false,
+            isCompleted: false,
+            createdAt: '2026-11-10T10:00:00Z',
+            updatedAt: '2026-11-10T10:00:00Z',
           };
+          const skipAttempt = advanceReturnStatusPure({
+            returnId: ret.id,
+            targetStatus: 'under_inspection',
+            returns: [ret],
+            products: [p],
+            orders: [],
+          });
+          if (skipAttempt.success) throw new Error('Illegal skip in_transit_back -> under_inspection succeeded');
 
-          const qty = 3;
-          mockProduct.returnInTransitStock = Math.max(0, (mockProduct.returnInTransitStock || 0) - qty);
-          mockProduct.awaitingInspectionStock = (mockProduct.awaitingInspectionStock || 0) + qty;
-
-          if (mockProduct.availableStock !== 17) throw new Error(`CRITICAL: Awaiting inspection stock mistakenly added to availableStock!`);
-          if (mockProduct.awaitingInspectionStock !== 3) throw new Error(`Awaiting inspection custody not updated!`);
-          if (mockProduct.returnInTransitStock !== 0) throw new Error(`Return in transit not cleared upon arrival!`);
+          const res = advanceReturnStatusPure({
+            returnId: ret.id,
+            targetStatus: 'received_at_warehouse',
+            returns: [ret],
+            products: [p],
+            orders: [],
+          });
+          if (!res.success) throw new Error(res.error || 'Warehouse receipt failed');
+          const updated = res.products[0];
+          if (updated.availableStock !== 17 || updated.returnInTransitStock !== 0 || updated.awaitingInspectionStock !== 3) {
+            throw new Error('Warehouse receipt custody violation');
+          }
 
           t.status = 'passed';
           t.details = [
-            'ترانزيت الإرجاع: 3 -> 0',
-            'بانتظار الفحص والتقييم: 0 -> 3',
-            'قاعدة العهدة: الوحدات وصلت المستودع ولكنها محجوبة عن البيع حتى اجتياز الفحص',
+            'تم رفض تخطي مرحلة الاستلام الفعلي فيزيائياً بنجاح',
+            'ترانزيت الإرجاع 3 -> 0 وبانتظار الفحص 0 -> 3 مع بقاء المتاح 17',
           ];
         } else if (t.id === 'test_inspection_restockable') {
-          const mockProduct: Product = {
-            id: 'mock-p1',
-            sku: 'TEST-SKU-1',
-            name: 'منتج تجريبي 1',
-            imageUrl: 'https://images.unsplash.com/photo-1546868871-7041f2a55e12?w=300',
-            currentPrice: 150,
-            category: 'Electronics',
-            baseCost: 100,
-            physicalStock: 20,
-            availableStock: 17,
-            reservedStock: 0,
-            outboundInTransitStock: 0,
-            returnInTransitStock: 0,
-            awaitingInspectionStock: 3,
-            damagedStock: 0,
-            marketplaceListings: {},
-            createdAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString(),
+          const p = makeTestProduct({ availableStock: 17, awaitingInspectionStock: 3 });
+          const ret: ReturnRecord = {
+            id: 'RET-TEST-6',
+            orderId: 'TEST-ORD-6',
+            marketplaceId: 'noon',
+            items: [{ productId: p.id, productSku: p.sku, productName: p.name, imageUrl: p.imageUrl, quantity: 3, unitPrice: 150, unitCostSnapshot: 100 }],
+            returnReason: 'رفض الاستلام',
+            returnStatus: 'received_at_warehouse',
+            stockRestored: false,
+            isCompleted: false,
+            createdAt: '2026-11-10T10:00:00Z',
+            updatedAt: '2026-11-10T10:00:00Z',
           };
-
-          const qty = 3;
-          mockProduct.awaitingInspectionStock = Math.max(0, (mockProduct.awaitingInspectionStock || 0) - qty);
-          mockProduct.availableStock += qty;
-
-          if (mockProduct.availableStock !== 20) throw new Error(`Available stock should now be 20, got ${mockProduct.availableStock}`);
-          if (mockProduct.awaitingInspectionStock !== 0) throw new Error(`Awaiting inspection should be 0, got ${mockProduct.awaitingInspectionStock}`);
+          const res = processReturnInspectionPure({
+            returnId: ret.id,
+            outcome: 'restockable',
+            condition: 'like_new',
+            notes: 'سليم تماماً',
+            returns: [ret],
+            products: [p],
+            orders: [],
+            currency: 'SAR',
+          });
+          if (!res.success) throw new Error(res.message);
+          const updated = res.products[0];
+          if (updated.availableStock !== 20 || updated.awaitingInspectionStock !== 0 || !res.returns[0].stockRestored) {
+            throw new Error('Restock failed to update custody');
+          }
+          const repeat = processReturnInspectionPure({
+            returnId: ret.id,
+            outcome: 'restockable',
+            condition: 'like_new',
+            notes: 'إعادة ثانية',
+            returns: res.returns,
+            products: res.products,
+            orders: res.orders,
+            currency: 'SAR',
+          });
+          if (repeat.success) throw new Error('Duplicate restock was allowed');
 
           t.status = 'passed';
           t.details = [
-            'بانتظار الفحص: 3 -> 0',
-            'معتمد لإعادة البيع: المخزون المتاح ارتفع من 17 إلى 20',
-            'تسجيل حركة تدقيق وتوثيق في سجل الحركات',
+            'processReturnInspectionPure: بانتظار الفحص 3 -> 0، المتاح 17 -> 20',
+            'تم حظر إعادة الإرجاع المكرر للوحدات بنجاح',
           ];
         } else if (t.id === 'test_inspection_damaged') {
-          const mockProduct: Product = {
-            id: 'mock-p1',
-            sku: 'TEST-SKU-1',
-            name: 'منتج تجريبي 1',
-            imageUrl: 'https://images.unsplash.com/photo-1546868871-7041f2a55e12?w=300',
-            currentPrice: 150,
-            category: 'Electronics',
-            baseCost: 100,
-            physicalStock: 20,
-            availableStock: 17,
-            reservedStock: 0,
-            outboundInTransitStock: 0,
-            returnInTransitStock: 0,
-            awaitingInspectionStock: 3,
-            damagedStock: 0,
-            marketplaceListings: {},
-            createdAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString(),
+          const p = makeTestProduct({ availableStock: 17, awaitingInspectionStock: 3, baseCost: 120 });
+          const ret: ReturnRecord = {
+            id: 'RET-TEST-7',
+            orderId: 'TEST-ORD-7',
+            marketplaceId: 'noon',
+            items: [{ productId: p.id, productSku: p.sku, productName: p.name, imageUrl: p.imageUrl, quantity: 3, unitPrice: 150, unitCostSnapshot: 100 }],
+            returnReason: 'كسر',
+            returnStatus: 'under_inspection',
+            stockRestored: false,
+            isCompleted: false,
+            createdAt: '2026-11-10T10:00:00Z',
+            updatedAt: '2026-11-10T10:00:00Z',
           };
-
-          const qty = 3;
-          mockProduct.awaitingInspectionStock = Math.max(0, (mockProduct.awaitingInspectionStock || 0) - qty);
-          mockProduct.damagedStock = (mockProduct.damagedStock || 0) + qty;
-
-          if (mockProduct.availableStock !== 17) throw new Error(`Security Violation: Damaged product added to availableStock!`);
-          if (mockProduct.damagedStock !== 3) throw new Error(`Damaged custody was not recorded!`);
+          const res = processReturnInspectionPure({
+            returnId: ret.id,
+            outcome: 'damaged',
+            condition: 'damaged',
+            notes: 'شاشة مكسورة',
+            returns: [ret],
+            products: [p],
+            orders: [],
+            currency: 'SAR',
+          });
+          if (!res.success) throw new Error(res.message);
+          const updated = res.products[0];
+          if (updated.availableStock !== 17 || updated.damagedStock !== 3 || updated.awaitingInspectionStock !== 0) {
+            throw new Error('Damaged custody violation');
+          }
+          const writeoff = res.newTransactions.find((tx) => tx.type === 'damage_writeoff');
+          if (!writeoff || writeoff.amount !== 300) {
+            throw new Error(`Expected snapshot writeoff 300, got ${writeoff?.amount}`);
+          }
 
           t.status = 'passed';
           t.details = [
-            'بانتظار الفحص: 3 -> 0',
-            'مخزون تالف / غير صالح للبيع: 0 -> 3',
-            'حظر الأمان: المخزون المتاح لم يزداد (بقي 17)',
-            'تسجيل خسارة إعدام في الدفتر المالي: 300 ريال/جنيه (3 × 100)',
+            'عزل 3 وحدات في damagedStock مع بقاء المتاح 17',
+            'قيد خسارة الإعدام اعتمد التكلفة التاريخية 300 SAR وليس سعر الكتالوج الجديد 360',
           ];
         } else if (t.id === 'test_financial_breakdown_strict_rules') {
-          const breakdownA: OrderFinancialBreakdown = {
-            orderId: 'ord-no-cost',
-            sellingPriceTotal: 200,
-            itemCount: 1,
+          const pNoCost = makeTestProduct({ id: 'p-nocost', sku: 'NOCOST-1', baseCost: undefined });
+          const ordNoCost: Order = {
+            id: 'ord-no-cost',
+            marketplaceId: 'noon',
+            customerName: 'عميل',
+            shippingAddress: 'الرياض',
+            items: [{ productId: pNoCost.id, productSku: pNoCost.sku, productName: pNoCost.name, imageUrl: pNoCost.imageUrl, quantity: 1, unitPrice: 200 }],
+            totalAmount: 200,
+            shippingCost: 25,
             marketplaceCommission: 20,
-            serviceFees: 0,
-            originalShippingFee: 25,
-            returnShippingFee: 0,
-            packagingCost: 0,
-            extraAdjustments: 0,
-            productCostOfGoods: null,
-            refundAmount: 0,
-            confirmedNet: null,
-            isProfitCalculable: false,
-            uncalculatedReason: 'تكلفة شراء المنتج (COGS) غير مسجلة.',
+            status: 'delivered',
+            stockDeducted: true,
+            isClosed: true,
+            orderDate: '2026-11-10T10:00:00Z',
+            createdAt: '2026-11-10T10:00:00Z',
+            updatedAt: '2026-11-10T10:00:00Z',
           };
-
+          const breakdownA = computeOrderFinancialBreakdown(ordNoCost, [pNoCost]);
           if (breakdownA.isProfitCalculable !== false || breakdownA.confirmedNet !== null) {
-            throw new Error(`Rule Violation: Speculative profit was computed without cost!`);
+            throw new Error('Speculative profit was computed without COGS');
           }
 
-          const breakdownB: OrderFinancialBreakdown = {
-            orderId: 'ord-with-cost',
-            sellingPriceTotal: 200,
-            itemCount: 1,
-            marketplaceCommission: 20,
-            serviceFees: 0,
-            originalShippingFee: 25,
-            returnShippingFee: 0,
-            packagingCost: 0,
-            extraAdjustments: 0,
-            productCostOfGoods: 100,
-            refundAmount: 0,
-            confirmedNet: 55, // 200 - 20 - 25 - 100
-            isProfitCalculable: true,
+          const pWithCost = makeTestProduct({ id: 'p-cost', sku: 'COST-1', baseCost: 140 });
+          const ordWithCost: Order = {
+            id: 'ord-with-cost',
+            marketplaceId: 'noon',
+            customerName: 'عميل',
+            shippingAddress: 'الرياض',
+            items: [{ productId: pWithCost.id, productSku: pWithCost.sku, productName: pWithCost.name, imageUrl: pWithCost.imageUrl, quantity: 1, unitPrice: 200, unitCostSnapshot: 100 }],
+            totalAmount: 200,
+            shippingCost: 25,
+            marketplaceCommission: undefined,
+            status: 'delivered',
+            stockDeducted: true,
+            isClosed: true,
+            orderDate: '2026-11-10T10:00:00Z',
+            createdAt: '2026-11-10T10:00:00Z',
+            updatedAt: '2026-11-10T10:00:00Z',
           };
-
-          if (breakdownB.confirmedNet !== 55) {
-            throw new Error(`Incorrect profit calculation! Expected 55, got ${breakdownB.confirmedNet}`);
+          const breakdownB = computeOrderFinancialBreakdown(ordWithCost, [pWithCost]);
+          if (breakdownB.confirmedNet !== 75 || breakdownB.commissionStatus !== 'missing' || breakdownB.productCostOfGoods !== 100) {
+            throw new Error(`Expected net=75 using snapshot cost=100 & zero unrecorded fee, got ${breakdownB.confirmedNet}`);
           }
 
           t.status = 'passed';
           t.details = [
-            'حالة غياب التكلفة: تم حظر التخمين وعرض تنبيه "غير قابل للاحتساب لغياب التكلفة"',
-            'حالة اكتمال التكلفة: إجمالي البيع 200 - عمولة 20 - شحن 25 - تكلفة 100 = صافي 55',
-            'التزام صارم بالنزاهة المحاسبية',
+            'computeOrderFinancialBreakdown حظر الربح التخمينى عند غياب التكلفة',
+            'تم احتساب الصافي 75 وفق التكلفة التاريخية 100 ووسم العمولة غير المسجلة كـ missing دون خصم 12% وهمي',
           ];
         } else if (t.id === 'test_onboarding_dynamic_zero_platforms') {
-          const selectedPlatforms: string[] = [];
-          const customStorefront = 'https://mystore.example.com';
-
-          const merchantData = {
-            name: 'أحمد التاجر',
-            storeName: 'متجر التميز الإلكتروني',
-            marketplaces: selectedPlatforms,
-            customStorefrontUrl: customStorefront,
-          };
-
-          if (merchantData.marketplaces.includes('amazon') || merchantData.marketplaces.includes('noon')) {
-            throw new Error('Platforms forced by default!');
+          if (DEFAULT_MERCHANT_PROFILE.selectedMarketplaceIds.length !== 0 || DEFAULT_MERCHANT_PROFILE.isOnboarded !== false) {
+            throw new Error('Default merchant profile must start un-onboarded with zero preselected platforms');
           }
 
           t.status = 'passed';
           t.details = [
-            'البدء بصفر منصات افتراضية دون إجبار',
-            'إمكانية الاستمرار بدون منصات خارجية أو مع متجر مستقل',
-            'تخزين إعدادات الهوية بشكل سليم دون تكرار النافذة',
+            'DEFAULT_MERCHANT_PROFILE يبدأ بصفر منصات مختارة مسبقاً ([])',
+            'البدء متاح بدون إجبار أمازون أو نون ومع دعم المتجر المستقل',
           ];
         }
       } catch (err: unknown) {

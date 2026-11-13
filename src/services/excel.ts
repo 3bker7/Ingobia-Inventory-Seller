@@ -11,8 +11,9 @@
  */
 
 import * as XLSX from 'xlsx';
-import { ExcelValidationResult, ExcelImportRow, Product, MarketplaceConfig } from '../types';
+import { ExcelValidationResult, ExcelImportRow, Product, StockMovement } from '../types';
 import { storageService } from './storage';
+import { computeEditedAvailableStock } from '../domain/inventoryCustody';
 
 export const CORE_COLUMNS = [
   'Product Name',
@@ -229,10 +230,13 @@ export async function parseAndValidateExcel(file: File): Promise<ExcelValidation
         : 'https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=160&auto=format&fit=crop&q=80';
 
     const rawStock = stockIdx !== -1 ? row[stockIdx] : 0;
-    const physicalStock = Math.max(0, Math.floor(parseNum(rawStock, 0)));
+    const numericStock = parseNum(rawStock, NaN);
+    const physicalStock = Number.isFinite(numericStock) ? Math.max(0, Math.floor(numericStock)) : 0;
 
     if (!name) errors.push('اسم المنتج مطلوب.');
-    if (isNaN(parseNum(rawStock))) errors.push('المخزون الفعلي يجب أن يكون رقماً صحيحاً $\\ge 0$.');
+    if (!Number.isFinite(numericStock) || numericStock < 0) {
+      errors.push('المخزون الفعلي يجب أن يكون رقماً صحيحاً أكبر من أو يساوي 0.');
+    }
 
     const key = (sku || name).toLowerCase();
     const isDuplicateInFile = duplicateKeysInFile.has(key);
@@ -270,7 +274,7 @@ export async function parseAndValidateExcel(file: File): Promise<ExcelValidation
 
     const rowData: ExcelImportRow = {
       productName: name,
-      sku: sku || `SKU-${Date.now().toString().slice(-4)}`,
+      sku: sku || `SKU-${Date.now().toString().slice(-4)}-${i}`,
       imageUrl,
       physicalStock,
       noonPrice: dynamicMktData['noon']?.price || 0,
@@ -318,12 +322,16 @@ export function executeExcelImport(
   importedNew: number;
   updatedExisting: number;
   totalProcessed: number;
+  skippedInvalid?: number;
 } {
   let importedNew = 0;
   let updatedExisting = 0;
+  let skippedInvalid = 0;
   const marketplaces = storageService.getMarketplaces();
+  const movementsToRecord: StockMovement[] = [];
 
-  for (const row of validRows) {
+  for (let rowIdx = 0; rowIdx < validRows.length; rowIdx++) {
+    const row = validRows[rowIdx];
     const existing =
       (row.sku && storageService.getProductBySku(row.sku)) ||
       storageService.getProductByName(row.productName);
@@ -331,10 +339,15 @@ export function executeExcelImport(
     if (existing) {
       const prevPhysical = existing.physicalStock;
       const prevAvailable = existing.availableStock;
-      const stockDiff = row.physicalStock - prevPhysical;
+      const stockCheck = computeEditedAvailableStock(existing, row.physicalStock);
+      if (!stockCheck.valid) {
+        skippedInvalid++;
+        continue;
+      }
 
+      const stockDiff = row.physicalStock - prevPhysical;
       existing.physicalStock = row.physicalStock;
-      existing.availableStock = Math.max(0, existing.availableStock + stockDiff);
+      existing.availableStock = stockCheck.newAvailable;
 
       // Update dynamic marketplace listings
       if (row.marketplaceData) {
@@ -357,9 +370,8 @@ export function executeExcelImport(
       storageService.saveProduct(existing);
 
       if (stockDiff !== 0) {
-        const movements = storageService.getMovements();
-        movements.unshift({
-          id: `mov-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+        movementsToRecord.push({
+          id: `mov-${Date.now()}-${rowIdx}-${Math.random().toString(36).substring(2, 6)}`,
           productId: existing.id,
           productSku: existing.sku || existing.name,
           productName: existing.name,
@@ -369,7 +381,7 @@ export function executeExcelImport(
           newPhysical: existing.physicalStock,
           previousAvailable: prevAvailable,
           newAvailable: existing.availableStock,
-          reason: `تحديث عبر استيراد إكسيل المجمع الموحد`,
+          reason: 'تحديث عبر استيراد إكسيل المجمع الموحد',
           operator,
           timestamp: new Date().toISOString(),
         });
@@ -377,10 +389,9 @@ export function executeExcelImport(
 
       updatedExisting++;
     } else {
-      // Register new central product
       const newProduct: Product = {
-        id: `prod-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
-        sku: row.sku || `SKU-${Date.now().toString().slice(-4)}`,
+        id: `prod-${Date.now()}-${rowIdx}-${Math.random().toString(36).substring(2, 6)}`,
+        sku: row.sku || `SKU-${Date.now().toString().slice(-4)}-${rowIdx}`,
         name: row.productName,
         imageUrl: row.imageUrl,
         currentPrice: row.noonPrice || row.amazonPrice || 100,
@@ -407,7 +418,6 @@ export function executeExcelImport(
           };
         }
       } else {
-        // Fallback for noon / amazon
         for (const mkt of marketplaces) {
           const p = mkt.id === 'noon' ? row.noonPrice : mkt.id === 'amazon' ? row.amazonPrice : 100;
           const q = mkt.id === 'noon' ? row.noonQuantity : mkt.id === 'amazon' ? row.amazonQuantity : 0;
@@ -423,9 +433,8 @@ export function executeExcelImport(
 
       storageService.saveProduct(newProduct);
 
-      const movements = storageService.getMovements();
-      movements.unshift({
-        id: `mov-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+      movementsToRecord.push({
+        id: `mov-${Date.now()}-${rowIdx}-${Math.random().toString(36).substring(2, 6)}`,
         productId: newProduct.id,
         productSku: newProduct.sku || newProduct.name,
         productName: newProduct.name,
@@ -435,7 +444,7 @@ export function executeExcelImport(
         newPhysical: newProduct.physicalStock,
         previousAvailable: 0,
         newAvailable: newProduct.availableStock,
-        reason: `إنشاء منتج جديد عبر استيراد إكسيل المجمع`,
+        reason: 'إنشاء منتج جديد عبر استيراد إكسيل المجمع',
         operator,
         timestamp: new Date().toISOString(),
       });
@@ -444,10 +453,15 @@ export function executeExcelImport(
     }
   }
 
+  if (movementsToRecord.length > 0) {
+    storageService.recordStockMovements(movementsToRecord);
+  }
+
   return {
     success: true,
     importedNew,
     updatedExisting,
     totalProcessed: validRows.length,
+    skippedInvalid,
   };
 }

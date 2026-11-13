@@ -23,6 +23,7 @@ import {
 } from 'lucide-react';
 import { Product, MarketplaceId } from '../../types';
 import { storageService } from '../../services/storage';
+import { computeEditedAvailableStock } from '../../domain/inventoryCustody';
 import { translations, Locale } from '../../locales/translations';
 import { Modal } from '../common/Modal';
 import { ConfirmDialog } from '../common/ConfirmDialog';
@@ -171,25 +172,38 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({
       return;
     }
 
-    const availableStock = Math.max(
-      0,
-      formPhysicalStock - (editingProduct ? editingProduct.reservedStock : 0)
-    );
+    const targetPhysical = Math.floor(Number(formPhysicalStock));
+    if (!Number.isFinite(targetPhysical) || targetPhysical < 0) {
+      showToast(isRtl ? 'المخزون الفعلي يجب أن يكون رقماً صحيحاً أكبر من أو يساوي 0.' : 'Physical stock must be >= 0.', 'warning');
+      return;
+    }
 
+    let availableStock = targetPhysical;
+    if (editingProduct) {
+      const custodyCheck = computeEditedAvailableStock(editingProduct, targetPhysical);
+      if (!custodyCheck.valid) {
+        showToast(custodyCheck.error || (isRtl ? 'لا يمكن خفض المخزون عن الوحدات المحجوزة أو التالفة.' : 'Cannot reduce stock below locked custody.'), 'error');
+        return;
+      }
+      availableStock = custodyCheck.newAvailable;
+    }
+
+    const nowIso = new Date().toISOString();
     const listings: Product['marketplaceListings'] = {
+      ...(editingProduct?.marketplaceListings || {}),
       noon: {
         marketplaceId: 'noon',
         price: Number(formNoonPrice) || 0,
         quantity: Math.max(0, Number(formNoonQty) || 0),
         listingStatus: Number(formNoonQty) > 0 ? 'active' : 'out_of_stock',
-        lastUpdated: new Date().toISOString(),
+        lastUpdated: nowIso,
       },
       amazon: {
         marketplaceId: 'amazon',
         price: Number(formAmzPrice) || 0,
         quantity: Math.max(0, Number(formAmzQty) || 0),
         listingStatus: Number(formAmzQty) > 0 ? 'active' : 'out_of_stock',
-        lastUpdated: new Date().toISOString(),
+        lastUpdated: nowIso,
       },
     };
 
@@ -213,6 +227,7 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({
         );
       }
 
+      const physicalDiff = targetPhysical - editingProduct.physicalStock;
       const updated: Product = {
         ...editingProduct,
         name: formName.trim(),
@@ -221,12 +236,33 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({
         category: formCategory.trim() || editingProduct.category,
         baseCost: Number(formBaseCost) || undefined,
         imageUrl: formImageUrl.trim(),
-        physicalStock: Number(formPhysicalStock),
+        physicalStock: targetPhysical,
         availableStock,
         marketplaceListings: listings,
       };
 
       storageService.saveProduct(updated);
+
+      if (physicalDiff !== 0) {
+        storageService.recordStockMovements([
+          {
+            id: `mov-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+            productId: updated.id,
+            productSku: updated.sku || updated.name,
+            productName: updated.name,
+            type: 'manual_adjustment',
+            quantityChange: physicalDiff,
+            previousPhysical: editingProduct.physicalStock,
+            newPhysical: updated.physicalStock,
+            previousAvailable: editingProduct.availableStock,
+            newAvailable: updated.availableStock,
+            reason: 'تعديل رصيد المخزون من بطاقة المنتج',
+            operator: settings.sellerName,
+            timestamp: nowIso,
+          },
+        ]);
+      }
+
       showToast(t.toasts.productUpdated, 'success');
       setEditingProduct(null);
     } else {
@@ -526,15 +562,15 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({
                       </td>
 
                       <td className="py-3.5 px-3 font-mono-code text-[11px] text-[#64748B]">
-                        {p.baseCost ? `${p.baseCost} ر.س` : <span className="text-amber-700">غير مسجل</span>}
+                        {p.baseCost ? `${p.baseCost} ${settings.currency}` : <span className="text-amber-700">{isRtl ? 'غير مسجل' : 'Missing'}</span>}
                       </td>
 
                       <td className="py-3.5 px-3 font-mono-code text-[11px] font-semibold text-[#172033]">
-                        {noon ? `${noon.price} ر.س` : '-'}
+                        {noon ? `${noon.price} ${settings.currency}` : '-'}
                       </td>
 
                       <td className="py-3.5 px-3 font-mono-code text-[11px] font-semibold text-[#172033]">
-                        {amz ? `${amz.price} ر.س` : '-'}
+                        {amz ? `${amz.price} ${settings.currency}` : '-'}
                       </td>
 
                       <td className="py-3.5 px-3 text-center font-bold font-mono-code text-[#16A36A]">
@@ -711,7 +747,7 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({
                         <div className="flex items-center justify-between">
                           <span className="text-[#64748B]">{isRtl ? 'سعر التكلفة المسجل:' : 'Recorded Base Cost:'}</span>
                           <strong className="font-mono-code text-[#172033]">
-                            {previewProduct.baseCost ? `${previewProduct.baseCost} ر.س` : (
+                            {previewProduct.baseCost ? `${previewProduct.baseCost} ${settings.currency}` : (
                               <span className="text-amber-800 font-bold">{isRtl ? 'غير محدد' : 'Missing'}</span>
                             )}
                           </strong>

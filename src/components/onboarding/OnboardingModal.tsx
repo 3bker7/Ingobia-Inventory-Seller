@@ -141,16 +141,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
       });
     });
 
-    // 2. Save settings (do NOT inject Amazon if merchant selected 0 marketplaces)
-    const currentSettings = storageService.getSettings();
-    storageService.saveSettings({
-      ...currentSettings,
-      sellerName: merchantName.trim() || currentSettings.sellerName,
-      storeName: storeName.trim() || currentSettings.storeName,
-      marketplaces: configuredMarketplaces.length > 0 ? configuredMarketplaces : currentSettings.marketplaces,
-    });
-
-    // 3. Mark merchant profile onboarded
+    // Save currency if unchanged, then atomically persist onboarding settings & profile
     storageService.completeOnboarding(
       configuredMarketplaces,
       merchantName.trim() || 'أحمد بكر',

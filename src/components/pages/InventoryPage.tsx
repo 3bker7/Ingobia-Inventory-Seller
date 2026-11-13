@@ -91,20 +91,25 @@ export const InventoryPage: React.FC<InventoryPageProps> = ({ locale }) => {
       return;
     }
 
-    const success = storageService.manualStockAdjustment(
+    const res = storageService.manualStockAdjustmentWithResult(
       adjustingProduct.id,
       newPhysicalStock,
       adjustmentReason.trim(),
       settings.sellerName
     );
 
-    if (success) {
+    if (res.success) {
       showToast(
         locale === 'ar' ? 'تمت تسوية المخزون وتسجيل حركة التدقيق بنجاح.' : 'Stock adjusted successfully.',
         'success'
       );
       setAdjustingProduct(null);
       refreshData();
+    } else {
+      showToast(
+        res.error || (locale === 'ar' ? 'تعذر تنفيذ التسوية الجردية.' : 'Stock adjustment failed.'),
+        'error'
+      );
     }
   };
 

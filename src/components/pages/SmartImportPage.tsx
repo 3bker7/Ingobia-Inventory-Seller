@@ -35,12 +35,14 @@ interface SmartImportPageProps {
   locale: Locale;
   onNavigateToOrders: () => void;
   onNavigateToCompleted: () => void;
+  onOrdersImported?: () => void;
 }
 
 export const SmartImportPage: React.FC<SmartImportPageProps> = ({
   locale,
   onNavigateToOrders,
   onNavigateToCompleted,
+  onOrdersImported,
 }) => {
   const t = translations[locale];
   const { showToast } = useToast();
@@ -216,6 +218,7 @@ export const SmartImportPage: React.FC<SmartImportPageProps> = ({
 
     setImportSummary(res);
     setStep('completed');
+    onOrdersImported?.();
     showToast(
       locale === 'ar'
         ? `تم استيراد ${res.importedCount} طلب نشط و ${res.historicalCount} طلب تاريخي بنجاح.`

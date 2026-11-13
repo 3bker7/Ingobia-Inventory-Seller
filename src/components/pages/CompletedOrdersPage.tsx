@@ -17,11 +17,13 @@ import { useToast } from '../common/Toast';
 interface CompletedOrdersPageProps {
   locale: Locale;
   onNavigateToReturns?: () => void;
+  onDataChange?: () => void;
 }
 
 export const CompletedOrdersPage: React.FC<CompletedOrdersPageProps> = ({
   locale,
   onNavigateToReturns,
+  onDataChange,
 }) => {
   const t = translations[locale];
   const { showToast } = useToast();
@@ -80,6 +82,7 @@ export const CompletedOrdersPage: React.FC<CompletedOrdersPageProps> = ({
       setReturnReason('');
       setReturnNotes('');
       refreshOrders();
+      onDataChange?.();
       if (onNavigateToReturns) {
         // Optionally notify user they can track in Returns page
       }

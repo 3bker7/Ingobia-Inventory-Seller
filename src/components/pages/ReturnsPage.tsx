@@ -27,9 +27,14 @@ import { useToast } from '../common/Toast';
 interface ReturnsPageProps {
   locale: Locale;
   initialStatusFilter?: string;
+  onReturnsChange?: () => void;
 }
 
-export const ReturnsPage: React.FC<ReturnsPageProps> = ({ locale, initialStatusFilter }) => {
+export const ReturnsPage: React.FC<ReturnsPageProps> = ({
+  locale,
+  initialStatusFilter,
+  onReturnsChange,
+}) => {
   const t = translations[locale];
   const { showToast } = useToast();
   const settings = storageService.getSettings();
@@ -60,6 +65,7 @@ export const ReturnsPage: React.FC<ReturnsPageProps> = ({ locale, initialStatusF
 
   const refreshReturns = () => {
     setReturns(storageService.getReturns());
+    onReturnsChange?.();
   };
 
   const isRtl = locale === 'ar';
@@ -151,41 +157,35 @@ export const ReturnsPage: React.FC<ReturnsPageProps> = ({ locale, initialStatusF
   };
 
   const handleStartInspection = (ret: ReturnRecord) => {
-    storageService.advanceReturnStatus(
+    const res = storageService.advanceReturnStatus(
       ret.id,
       'under_inspection',
       settings.sellerName,
       isRtl ? 'بدء الفحص الفني وتقييم حالة المنتج' : 'Started technical inspection'
     );
-    showToast(isRtl ? 'تم تحويل المرتجع لحالة (قيد الفحص الفني).' : 'Moved to Under Inspection.', 'success');
-    refreshReturns();
+    if (res.success) {
+      showToast(isRtl ? 'تم تحويل المرتجع لحالة (قيد الفحص الفني).' : 'Moved to Under Inspection.', 'success');
+      refreshReturns();
+    } else {
+      showToast(res.error || (isRtl ? 'تعذر بدء الفحص الفني.' : 'Failed to start inspection'), 'error');
+    }
   };
 
   const handleAddManualNote = () => {
     if (!detailReturn || !newNoteInput.trim()) return;
 
-    const returnsList = storageService.getReturns();
-    const ret = returnsList.find((r) => r.id === detailReturn.id);
-    if (ret) {
-      if (!ret.activities) ret.activities = [];
-      ret.activities.push({
-        id: `act-${Date.now()}`,
-        timestamp: new Date().toISOString(),
-        type: 'manual',
-        action: 'merchant_note',
-        actionAr: 'ملاحظة يدوية من التاجر',
-        operator: settings.sellerName,
-        notes: newNoteInput.trim(),
-      });
-      ret.notes = newNoteInput.trim();
-      storageService.saveProduct({ ...storageService.getProducts()[0] }); // trigger state
-      // direct update
-      const allReturns = storageService.getReturns().map((item) => (item.id === ret.id ? ret : item));
-      localStorage.setItem('seller_ops_returns_v2', JSON.stringify(allReturns));
-      setDetailReturn({ ...ret });
+    const res = storageService.addReturnNote(
+      detailReturn.id,
+      newNoteInput.trim(),
+      settings.sellerName
+    );
+    if (res.success && res.returnRecord) {
+      setDetailReturn({ ...res.returnRecord });
       setNewNoteInput('');
       refreshReturns();
       showToast(isRtl ? 'تمت إضافة الملاحظة بنجاح.' : 'Note added.', 'success');
+    } else {
+      showToast(res.error || (isRtl ? 'تعذر حفظ الملاحظة.' : 'Failed to save note.'), 'error');
     }
   };
 
@@ -487,7 +487,7 @@ export const ReturnsPage: React.FC<ReturnsPageProps> = ({ locale, initialStatusF
                         </div>
                         {ret.returnShippingCost ? (
                           <div className="text-[10px] text-amber-800 font-medium mt-0.5">
-                            {ret.returnShippingCost} ر.س ({isRtl ? 'رسوم المرتجع' : 'return fee'})
+                            {ret.returnShippingCost} {settings.currency} ({isRtl ? 'رسوم المرتجع' : 'return fee'})
                           </div>
                         ) : null}
                       </td>
@@ -695,7 +695,7 @@ export const ReturnsPage: React.FC<ReturnsPageProps> = ({ locale, initialStatusF
               <div className="text-end">
                 <span className="text-[10px] text-[#64748B] block">{isRtl ? 'قيمة البيع الأصلية:' : 'Original price:'}</span>
                 <span className="font-bold text-[#2563EB] font-mono-code text-sm">
-                  {inspectingReturn.items.reduce((s, i) => s + i.unitPrice * i.quantity, 0)} ر.س
+                  {inspectingReturn.items.reduce((s, i) => s + i.unitPrice * i.quantity, 0)} {settings.currency}
                 </span>
               </div>
             </div>
