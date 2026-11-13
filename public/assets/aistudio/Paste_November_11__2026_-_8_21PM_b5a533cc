@@ -1,0 +1,1330 @@
+Seller Operations – Returns, Inventory, Financial Logic, Smart Guidance & UX Overhaul
+
+Core Instruction
+
+Improve the existing Seller Operations application. This is a major refinement of the current product, not a rebuild from scratch.
+
+The priority is to make the application a reliable operational system for managing orders, shipments, returns, inventory custody, financial movements, and merchant decisions.
+
+The current experience feels fragmented, repetitive, and unnecessarily complicated. Several decisions are unclear, some statuses overlap, and the merchant cannot easily understand where a product is, who is responsible for it, what it costs, or what action should happen next.
+
+Before changing anything:
+
+1. Inspect the existing application, database schema, components, workflows, and business logic.
+2. Identify duplicated states, conflicting decisions, incorrect calculations, and disconnected dashboard metrics.
+3. Preserve existing working features and merchant data.
+4. Do not replace working systems without a clear technical reason.
+5. Implement the changes in a consistent way across the entire application.
+
+Do not generate demo products, fake orders, fictional financial transactions, or fabricated analytics. Empty accounts must remain genuinely empty.
+
+---
+
+1. Build a Complete Returns Management System
+
+Returns must become a core operational module, not a secondary page.
+
+The merchant must be able to understand the entire return journey from the moment a customer refuses delivery or requests a return until the product is physically received, inspected, and assigned its final inventory status.
+
+1.1 Return lifecycle
+
+Create one consistent return workflow with clearly defined states.
+
+Suggested lifecycle:
+
+1. Return Initiated
+2. Return Pickup / Collection Pending
+3. Return In Transit
+4. Received at Warehouse
+5. Under Inspection
+6. Inspection Completed
+7. Closed
+
+The final inspection must produce one of these outcomes:
+
+- Restockable: Product is physically received, inspected, and approved for sale.
+- Damaged: Product is received but cannot be sold.
+- Missing / Not Received: The return has not physically arrived or cannot be confirmed.
+- Requires Further Action: Inspection or documentation is incomplete.
+
+Important rules:
+
+- A return in transit must never be treated as physically available stock.
+- A product awaiting inspection must never be included in available inventory.
+- A damaged product must never be automatically returned to available inventory.
+- A return must not be considered complete just because its status changed to Received.
+- The merchant must explicitly record or confirm the inspection outcome.
+- Closing a return must not delete or rewrite the original delivery history.
+- A customer return after successful delivery must create a new return case linked to the original order.
+- Multiple return cases must not accidentally duplicate stock or financial movements.
+
+Do not create unnecessary intermediate statuses. Each status must represent a meaningful real-world event.
+
+1.2 Return decision system
+
+Create a clear decision interface based on the actual return condition.
+
+For example:
+
+When a returned product is received, the merchant should see:
+
+- Original order information.
+- Product name and SKU.
+- Quantity returned.
+- Original selling price.
+- Marketplace.
+- Shipping company.
+- Return reason.
+- Shipping and return costs.
+- Current return status.
+- Previous actions and notes.
+
+Then present only the decisions relevant to the current state.
+
+Example:
+
+If the product is physically received and inspection is pending, show:
+
+- Approve as sellable.
+- Mark as damaged.
+- Request further inspection.
+- Report missing or incorrect item.
+
+Each decision must explain its inventory and financial consequences before confirmation.
+
+Do not display unrelated decisions or allow invalid transitions.
+
+1.3 Return information and shipping company details
+
+Each order and return must support a complete shipping record.
+
+Shipping information should include:
+
+- Shipping company name.
+- Shipment tracking number.
+- Original shipment reference.
+- Return shipment reference, if different.
+- Shipping company contact details, if available.
+- Shipping service type.
+- Shipment date.
+- Expected delivery or return date, if available.
+- Actual delivery or return date.
+- Shipping cost.
+- Return shipping cost.
+- Who is responsible for the cost.
+- Shipping payment status.
+- Shipment notes.
+- Supporting documents or attachments, if supported by the current application.
+
+The system should automatically extract available information from imported order files whenever possible.
+
+However, the merchant must be able to add, edit, or correct shipping details manually.
+
+Do not invent missing shipping company details or tracking information.
+
+If the information is unavailable, display it as Not Provided.
+
+1.4 Complete order notes
+
+Every order must have a dedicated activity and notes section.
+
+Support:
+
+- Automatically generated events from order and shipment updates.
+- Manually written merchant notes.
+- Return-related notes.
+- Customer-related notes, when available.
+- Shipping company communication notes.
+- Support case references.
+- Important decisions and their reasons.
+
+Every activity should include:
+
+- Date and time.
+- Action or event.
+- Related user or source.
+- Previous state and new state when applicable.
+- Relevant notes.
+
+Automatically collected information and manually entered information must be visually distinguishable.
+
+Never overwrite an existing note or event silently.
+
+---
+
+2. Accurate Inventory Custody and Quantity Management
+
+This is one of the most important parts of the application.
+
+The inventory system must distinguish between physical stock owned by the merchant and stock physically available for sale.
+
+A product being outside the warehouse must not remain available just because it has not yet been delivered to the customer.
+
+2.1 Inventory quantity categories
+
+Use clear and mutually exclusive quantity categories.
+
+At minimum:
+
+- Available Stock: Physically present, inspected, sellable, and available for new orders.
+- Reserved Stock: Assigned to active orders but not yet handed over to the shipping company.
+- Outbound In Transit: Physically handed to a delivery company and currently outside the merchant's custody.
+- Return In Transit: Returning from the customer or delivery company but not yet received.
+- Awaiting Inspection: Physically received but not approved for sale.
+- Damaged / Unsellable: Physically present but unavailable for sale.
+- Other Confirmed Stock Adjustments: Clearly documented adjustments that do not belong to the above categories.
+
+Show the quantities separately.
+
+Do not add these categories together and label the result Available Stock.
+
+2.2 Inventory movement rules
+
+Create a reliable inventory movement engine.
+
+Example:
+
+Initial inventory:
+
+- Available: 20
+- Reserved: 0
+- Outbound In Transit: 0
+- Return In Transit: 0
+- Awaiting Inspection: 0
+- Damaged: 0
+
+A customer orders 2 units:
+
+- Available: 18
+- Reserved: 2
+
+The merchant hands the order to the shipping company:
+
+- Available: 18
+- Reserved: 0
+- Outbound In Transit: 2
+
+The customer successfully receives the order:
+
+- Outbound In Transit: 0
+- Available: 18
+- Final sold quantity: 2
+
+The customer refuses delivery and the shipment starts returning:
+
+- Outbound In Transit: 0
+- Return In Transit: 2
+- Available remains 18
+
+The return arrives at the warehouse:
+
+- Return In Transit: 0
+- Awaiting Inspection: 2
+- Available remains 18
+
+The merchant inspects and approves both units:
+
+- Awaiting Inspection: 0
+- Available: 20
+
+If one unit is damaged:
+
+- Awaiting Inspection: 0
+- Available: 19
+- Damaged: 1
+
+These transitions must happen exactly once.
+
+The application must never:
+
+- Count an in-transit product as available.
+- Deduct the same order quantity twice.
+- Add a returned product before physical receipt and inspection.
+- Increase available stock because a merchant simply changes an order status.
+- Treat an unexplained quantity reduction as a confirmed sale.
+- Create duplicate inventory movements when importing the same order again.
+
+2.3 Inventory movement ledger
+
+Every inventory movement must be recorded with:
+
+- Product ID.
+- SKU.
+- Quantity.
+- Movement type.
+- Previous quantity.
+- New quantity.
+- Previous inventory state.
+- New inventory state.
+- Related order ID.
+- Related return ID, if applicable.
+- Marketplace.
+- Shipping company, if applicable.
+- Timestamp.
+- Source of the movement.
+- User who confirmed it.
+- Reason or notes.
+
+The inventory ledger must be auditable and must not silently rewrite historical movements.
+
+Corrections should create documented adjustment movements rather than deleting history.
+
+2.4 Inventory dashboard
+
+The dashboard must show where inventory actually is.
+
+Display separate quantities for:
+
+- Available in warehouse.
+- Reserved for orders.
+- With delivery companies.
+- Returning to warehouse.
+- Awaiting inspection.
+- Damaged or unsellable.
+
+Make the distinction between merchant-owned inventory and available-to-sell inventory visually clear.
+
+The merchant should be able to click any quantity and open the exact products and orders responsible for it.
+
+---
+
+3. Simplify Manual Order Creation
+
+The current manual order creation process is unnecessarily complicated.
+
+Redesign it to be fast, clear, and practical.
+
+3.1 SKU-first product selection
+
+Do not force the merchant to search through a long product list by name.
+
+The primary product input must be SKU.
+
+Expected behavior:
+
+1. Merchant enters or scans a SKU.
+2. The system finds the matching central product record.
+3. Automatically displays:
+   - Product name.
+   - Product image, if available.
+   - SKU.
+   - Marketplace-specific selling price.
+   - Available stock.
+4. Merchant enters the required quantity.
+
+The merchant should not need to manually select the product name again.
+
+If the same product exists on multiple marketplaces, use the selected marketplace to retrieve the correct marketplace-specific price and information.
+
+If the SKU does not exist, show a clear message and provide an optional action to create or select a product.
+
+Never silently select an incorrect product.
+
+3.2 Simple order creation layout
+
+Use a compact step-by-step form:
+
+1. Select marketplace.
+2. Enter order ID, if available.
+3. Enter SKU.
+4. Confirm product and quantity.
+5. Add another product if necessary.
+6. Add shipping information.
+7. Review order total.
+8. Save order.
+
+Do not force the merchant to fill in unnecessary information.
+
+Optional fields should remain optional.
+
+3.3 Additional charges and adjustments
+
+Allow optional additional financial items.
+
+Examples:
+
+- Extra shipping charge.
+- Return shipping charge.
+- Packaging cost.
+- Handling fee.
+- Additional service charge.
+- Discount.
+- Other adjustment.
+
+Each item should contain:
+
+- Description.
+- Amount.
+- Type: Income, Expense, Discount, or Adjustment.
+- Who is responsible for paying it.
+- Related order or shipment.
+- Optional notes.
+
+Do not combine every extra charge into one unexplained number.
+
+Show the calculation clearly before saving.
+
+---
+
+4. Complete Order and Shipment Financial Accounting
+
+Expand the existing financial calculations to cover the real operational cost of orders and returns.
+
+The merchant must understand what happened financially to every order, not just see a selling price.
+
+4.1 Order financial breakdown
+
+For each order, support the following financial fields when available:
+
+- Item selling price.
+- Item quantity.
+- Gross item value.
+- Marketplace commission.
+- Marketplace service fees.
+- Original shipping fee.
+- Return shipping fee.
+- Additional shipping charges.
+- Packaging costs.
+- Other expenses.
+- Customer-paid amounts, if known.
+- Amount collected.
+- Amount transferred or settled by the marketplace, if known.
+- Product purchase cost, if entered by the merchant.
+- Confirmed financial adjustments.
+
+Do not assume that every field is available from every marketplace.
+
+Distinguish between:
+
+- Confirmed values.
+- Manually entered values.
+- Estimated values.
+- Missing values.
+
+Never calculate actual profit if product cost or required expenses are missing.
+
+If some values are unavailable, show the known subtotal and clearly identify what remains uncalculated.
+
+4.2 Return financial consequences
+
+Every return must affect financial reporting according to its actual events.
+
+Examples:
+
+- A refused delivery may create a return shipping expense.
+- A returned product is not automatically a financial loss.
+- A damaged product may create an inventory loss based on its recorded cost.
+- A restockable product should return to available inventory after inspection.
+- A refund should only be recorded when it is confirmed.
+- Marketplace fees must not be assumed refundable or non-refundable without supporting information.
+
+Separate:
+
+- Original sale value.
+- Refund value.
+- Shipping expense.
+- Return shipping expense.
+- Confirmed product loss.
+- Other confirmed expenses.
+- Unsettled amounts.
+- Estimated amounts.
+
+Avoid double-counting the same cost in the order, return, and dashboard.
+
+4.3 Financial transaction ledger
+
+Create a consistent financial ledger linked to the relevant order, return, shipment, and product.
+
+Every transaction must include:
+
+- Transaction type.
+- Amount.
+- Currency.
+- Related order.
+- Related return, if applicable.
+- Related marketplace.
+- Transaction date.
+- Source.
+- Confirmation status.
+- Notes.
+
+The dashboard must derive financial values from these recorded transactions and the actual order states.
+
+Do not maintain separate dashboard numbers that can become inconsistent with the underlying records.
+
+---
+
+5. A Unified Order and Return Decision Engine
+
+The application currently has too many unclear decisions and repeated statuses.
+
+Replace scattered decision logic with one consistent state-transition system.
+
+5.1 Decision principles
+
+Every available action must satisfy these rules:
+
+1. It must be valid for the current order or return state.
+2. It must have a clear real-world meaning.
+3. It must explain its effect on inventory.
+4. It must explain its effect on financial records.
+5. It must not repeat an action that has already been completed.
+6. It must not create conflicting states.
+7. It must preserve historical events.
+
+Before a consequential action, show a short confirmation explaining what will change.
+
+Example:
+
+"Confirm Return Received"
+
+This action will:
+
+- Move 2 units from Return In Transit to Awaiting Inspection.
+- Keep Available Stock unchanged.
+- Record the warehouse receipt date.
+- Allow the merchant to begin inspection.
+
+Do not show irrelevant actions or make the merchant choose between confusing alternatives.
+
+5.2 State transition validation
+
+Create a documented transition matrix for:
+
+- New orders.
+- Confirmed orders.
+- Reserved orders.
+- Orders handed to shipping companies.
+- Outbound shipments.
+- Successfully delivered orders.
+- Refused deliveries.
+- Return shipments.
+- Received returns.
+- Inspections.
+- Restockable products.
+- Damaged products.
+- Cancelled orders.
+- Customer-initiated returns after delivery.
+- Closed orders.
+
+Invalid transitions must be blocked.
+
+A closed order must not be casually editable from ordinary operational screens.
+
+If a correction is necessary, provide a controlled correction process with a reason and an audit record.
+
+---
+
+6. Smart Internal Merchant Guidance
+
+Create a dedicated page called Merchant Guidance or Store Advisor.
+
+This page should act as an internal operational advisor, helping the merchant understand what needs attention and what action is appropriate.
+
+It must be connected to the actual application data.
+
+This is not a generic advice page and must not generate random recommendations.
+
+6.1 Data sources
+
+The guidance engine must analyze:
+
+- Current dashboard metrics.
+- Order states.
+- Shipment states.
+- Return states.
+- Inspection results.
+- Inventory quantities.
+- Product sales history.
+- Marketplace performance.
+- Shipping costs.
+- Return costs.
+- Confirmed financial transactions.
+- Pending settlements.
+- Historical merchant decisions.
+
+The guidance must update when the underlying data changes.
+
+6.2 Guidance categories
+
+Organize advice into practical categories:
+
+- Orders.
+- Returns.
+- Shipping.
+- Inventory.
+- Products.
+- Financial Performance.
+- Marketplace Performance.
+- Urgent Actions.
+- Opportunities for Improvement.
+
+6.3 Examples of useful recommendations
+
+Return example:
+
+"Return #123 has been in transit longer than expected. Check the tracking status with the shipping company before making an inventory adjustment."
+
+Inspection example:
+
+"Three units are awaiting inspection. They are not included in available stock. Complete the inspection to determine whether they can be sold again."
+
+Inventory example:
+
+"Product SKU-100 has sold consistently while its available stock is low. Consider replenishing it before it becomes unavailable."
+
+Financial example:
+
+"This order has a recorded selling price and shipping cost, but marketplace fees are missing. Actual profit cannot yet be calculated."
+
+Shipping example:
+
+"Return shipping expenses for this shipping company have increased compared with its previous recorded shipments. Review the related orders before deciding whether to change providers."
+
+Marketplace example:
+
+"One marketplace has more active returns than the others during the selected period. Review the return reasons and shipping performance."
+
+6.4 Recommendation structure
+
+Each recommendation should include:
+
+- Short title.
+- What happened.
+- Why it matters.
+- Related product, order, return, or marketplace.
+- Financial or inventory impact, when measurable.
+- Recommended next action.
+- Priority.
+- Date generated.
+- Current status.
+
+Possible priorities:
+
+- Critical.
+- High.
+- Medium.
+- Informational.
+
+Possible recommendation statuses:
+
+- New.
+- In Progress.
+- Resolved.
+- Dismissed.
+
+The merchant should be able to open the related record directly from the recommendation.
+
+6.5 Rules and reliability
+
+Start with a deterministic internal rules engine based on real application data.
+
+Do not pretend that an AI model is analyzing information if no AI integration exists.
+
+Recommendations must include a clear reason and reference the actual data behind them.
+
+Rules:
+
+- Never invent a problem.
+- Never recommend contacting support without a specific reason.
+- Never recommend replenishment without considering available and incoming stock.
+- Never treat a pending return as a confirmed loss.
+- Never calculate profit from incomplete financial data.
+- Avoid repeating the same recommendation every time the page loads.
+- Update or resolve recommendations when their underlying condition changes.
+
+The system should help the merchant decide, not make irreversible decisions automatically.
+
+---
+
+7. My Products – Storefront Preview Experience
+
+Redesign the My Products page to offer a customer-like browsing experience.
+
+The merchant should be able to browse products as if viewing an online store rather than reading a spreadsheet.
+
+7.1 Product browsing interface
+
+Create a visual product catalog with:
+
+- Product image.
+- Product name.
+- Selling price.
+- SKU.
+- Marketplace.
+- Availability status.
+- Available quantity.
+- Product condition or listing status, if available.
+
+Support:
+
+- Product cards.
+- Search.
+- Category filters, if categories exist.
+- Marketplace filters.
+- Sorting.
+- Product details.
+- Responsive product grid.
+
+The interface should resemble a clean e-commerce storefront preview.
+
+7.2 Product detail preview
+
+Clicking a product should open a customer-style product view showing:
+
+- Main product image.
+- Product title.
+- Selling price.
+- Available status.
+- Product description, if available.
+- Relevant product details.
+- Marketplace-specific listing information.
+
+Also provide a merchant-only improvement panel with practical observations.
+
+Examples:
+
+- Missing product image.
+- Missing description.
+- Unclear product title.
+- Missing SKU.
+- Low available stock.
+- Different prices across marketplaces.
+
+Do not claim that a listing is poor or likely to convert badly without supporting information.
+
+This page is an internal product presentation and quality-review tool. It does not publish changes to external marketplaces.
+
+---
+
+8. Merchant Onboarding and Marketplace Selection Fixes
+
+Fix the current onboarding behavior.
+
+8.1 Marketplace selection must be optional and dynamic
+
+The current onboarding incorrectly forces Amazon to remain selected or forces the merchant to select another option before removing it.
+
+This is wrong.
+
+Requirements:
+
+- No marketplace is selected by default.
+- Amazon must not be mandatory.
+- Noon must not be mandatory.
+- Every marketplace selection must be independently selectable and deselectable.
+- The merchant can deselect a marketplace directly without selecting another one.
+- The merchant can continue without selecting any marketplace.
+- Do not automatically select Amazon as the first marketplace.
+- Do not force the merchant to choose from a fixed list.
+
+The marketplace selection interface must support multiple selections naturally.
+
+8.2 Website name input
+
+When the merchant selects "My Own Store / Website", immediately display a text field:
+
+"Enter your website or store name"
+
+Allow the merchant to enter a name or domain.
+
+Do not treat all websites as one generic marketplace.
+
+Store the website name as a separate merchant channel with its own stable internal identifier.
+
+8.3 Save onboarding selections once
+
+The current application asks newly registered merchants to select Amazon and Noon again after they have already completed onboarding.
+
+Fix this.
+
+Rules:
+
+- Save the merchant's initial selections.
+- Load those saved selections on subsequent visits.
+- Do not repeat onboarding after successful completion.
+- Do not automatically add Amazon or Noon.
+- Allow marketplace management later through Settings.
+- Existing merchant selections must remain unchanged after this update.
+- If a merchant has no marketplace selected, do not force a selection later.
+
+The onboarding process must never overwrite existing merchant configuration without confirmation.
+
+---
+
+9. Redesign the Learning and Tutorial Experience
+
+The current tutorials feel forced, visually weak, and inconsistent.
+
+Redesign the entire learning experience.
+
+9.1 Tutorial interface
+
+Requirements:
+
+- Large, readable instruction panel.
+- Clear typography.
+- Comfortable spacing.
+- Simple explanations.
+- Interactive 3D guide character.
+- Smooth, subtle transitions.
+- A clear visual highlight around the exact element being explained.
+- Dim unrelated elements slightly without making the page difficult to see.
+
+The tutorial must point to the actual interface element being explained.
+
+The highlight should be visible around each relevant field, button, card, menu, and control—not only on the dashboard.
+
+9.2 Character interaction
+
+Use the existing 3D character concept:
+
+- Professional male character.
+- Business suit.
+- Proportional body.
+- Featureless face without eyes, nose, or mouth.
+- Real 3D appearance, not a flat illustration.
+
+The character should have subtle idle and guidance animations where technically supported.
+
+Do not substitute a static image and claim that a fully interactive 3D character has been implemented.
+
+If a proper 3D asset or rendering capability is missing, explain the limitation and implement the best supported foundation without breaking the rest of the application.
+
+9.3 Tutorial controls
+
+Provide:
+
+- Next.
+- Back.
+- I Understand.
+- Skip Tutorial.
+- Restart Tutorial.
+
+The merchant must remain in control.
+
+Do not force the same tutorial to appear repeatedly.
+
+Save tutorial progress per merchant.
+
+Allow tutorials to be reopened from the Learning Center.
+
+9.4 Tutorial coverage
+
+Cover the actual workflows:
+
+- Dashboard.
+- Products.
+- Manual Order Creation.
+- Orders.
+- Shipping.
+- Returns.
+- Return Inspection.
+- Inventory.
+- Financial Records.
+- Merchant Guidance.
+- Excel Import and Export.
+
+Every tutorial must explain the real workflow, not just describe buttons.
+
+---
+
+10. Navigation and Responsive UX Redesign
+
+The current pages place too many controls in the top header, making the main application header difficult to see.
+
+This creates a crowded, spreadsheet-like experience.
+
+Redesign navigation around a clean, responsive application layout.
+
+10.1 Mobile navigation
+
+For mobile screens:
+
+- Use a bottom navigation bar inspired by familiar mobile applications.
+- Keep the most important destinations accessible.
+- Use clear icons and short labels.
+- Avoid excessive horizontal tabs.
+- Use expandable menus or a More section for secondary pages.
+- Keep the main page header visible and uncluttered.
+- Ensure the bottom navigation does not cover important content.
+
+Suggested main navigation:
+
+- Home.
+- Orders.
+- Products.
+- Inventory.
+- More.
+
+Secondary destinations such as Returns, Merchant Guidance, Financial Records, and Settings can be accessible through the More section or a relevant contextual navigation area.
+
+Returns must remain easy to reach because it is a core feature.
+
+10.2 Desktop navigation
+
+For desktop:
+
+- Use an adaptive sidebar or another suitable navigation pattern.
+- Keep the main content area spacious.
+- Avoid copying the mobile bottom navigation into a desktop layout.
+- Do not place every page option in the top header.
+- Keep merchant identity and store name visible.
+- Maintain a clear page title and contextual actions.
+
+10.3 Smart contextual controls
+
+Replace large horizontal collections of options with contextual controls.
+
+Examples:
+
+- Order filters appear inside the Orders page.
+- Return filters appear inside Returns.
+- Inventory filters appear inside Inventory.
+- Marketplace filters appear where they are relevant.
+- Actions appear near the record they affect.
+
+Do not repeat the same controls in multiple places without a clear reason.
+
+10.4 Visual design
+
+The application should feel like a modern commercial product, not a spreadsheet or an internal admin panel.
+
+Design priorities:
+
+- Comfortable light theme.
+- Clean visual hierarchy.
+- Clear typography.
+- Well-spaced cards.
+- Natural reading flow.
+- Strong contrast without harsh colors.
+- Consistent icons.
+- Subtle animations.
+- Responsive layouts.
+- Arabic RTL support.
+- English LTR support.
+- Mobile-first usability without sacrificing desktop quality.
+
+Avoid excessive gradients, random glow effects, dense tables, and unnecessary horizontal scrolling.
+
+Use tables only where tabular data genuinely improves understanding.
+
+---
+
+11. Dashboard – Connect Every Operational Decision
+
+The dashboard must reflect the actual state of the entire application.
+
+It must not operate as an isolated analytics screen.
+
+Every meaningful order, return, shipment, inspection, inventory, or financial decision must update the appropriate dashboard metrics.
+
+11.1 Operational overview
+
+Show:
+
+- Total orders.
+- Successfully delivered orders.
+- Active orders.
+- Orders with shipping companies.
+- Orders with pending returns.
+- Returns in transit.
+- Returns awaiting inspection.
+- Damaged inventory.
+- Available stock.
+
+Each number must be clickable and lead to the relevant records.
+
+11.2 Inventory overview
+
+Show the inventory distribution:
+
+- Available.
+- Reserved.
+- Outbound in transit.
+- Return in transit.
+- Awaiting inspection.
+- Damaged.
+
+The dashboard must make it visually obvious that products outside the warehouse are not available for sale.
+
+11.3 Financial overview
+
+Show:
+
+- Delivered sales value.
+- Confirmed refunds.
+- Confirmed shipping expenses.
+- Return shipping expenses.
+- Confirmed product losses.
+- Recorded marketplace fees.
+- Settled amounts.
+- Pending settlements.
+- Uncalculated financial amounts.
+
+Do not present incomplete calculations as confirmed profit.
+
+11.4 Return overview
+
+Create a meaningful returns summary:
+
+- Total return cases.
+- Returns in transit.
+- Returns received.
+- Awaiting inspection.
+- Restockable units.
+- Damaged units.
+- Overdue return cases, when expected dates exist.
+- Return shipping expenses.
+
+Clicking a metric must open the exact records behind it.
+
+11.5 Date filters
+
+Use consistent date filters:
+
+- Today.
+- Last 7 Days.
+- Last 30 Days.
+- This Month.
+- Previous Month.
+- All Time.
+- Custom Date Range.
+
+Default to All Time when appropriate so the merchant can see the full available history since store creation.
+
+Ensure the selected date range affects all relevant dashboard metrics consistently.
+
+Do not compare periods when the available data is insufficient.
+
+---
+
+12. Strict Testing and Validation – Required Before Completion
+
+Do not consider this update complete after making the screens look better.
+
+The business logic must be tested extensively.
+
+Create a test suite that validates every important state transition, inventory movement, financial calculation, and merchant decision.
+
+Use isolated test data. Never insert test records into real merchant accounts.
+
+12.1 Order lifecycle tests
+
+Test:
+
+- Creating an order with one product.
+- Creating an order with multiple products.
+- Creating an order using SKU.
+- Selecting the correct marketplace price.
+- Adding optional extra charges.
+- Reserving stock.
+- Handing an order to a shipping company.
+- Successful delivery.
+- Customer refusal.
+- Shipment return.
+- Order cancellation before shipping.
+- Invalid cancellation after delivery.
+- Customer return after successful delivery.
+- Closing an order.
+- Attempting to modify a closed order.
+- Correcting an order through the controlled correction process.
+
+Verify that each transition produces the correct inventory and financial consequences.
+
+12.2 Return lifecycle tests
+
+Test:
+
+- Return initiated.
+- Collection pending.
+- Return in transit.
+- Return received.
+- Inspection pending.
+- Inspection approved.
+- Inspection rejected.
+- Partially damaged return.
+- Missing returned item.
+- Incorrect returned item.
+- Return shipping cost recorded.
+- Return shipping cost missing.
+- Multiple products in one returned order.
+- Partial return of an order.
+- Multiple return cases linked to one original order.
+- Return closure.
+- Attempt to close a return before inspection.
+- Attempt to restock a product before physical receipt.
+- Attempt to restock a damaged product.
+- Reopening a return after a documented correction.
+
+Verify that no product is counted twice or restored prematurely.
+
+12.3 Inventory tests
+
+Test:
+
+- Available to Reserved.
+- Reserved to Outbound In Transit.
+- Outbound In Transit to Sold.
+- Outbound In Transit to Return In Transit.
+- Return In Transit to Awaiting Inspection.
+- Awaiting Inspection to Available.
+- Awaiting Inspection to Damaged.
+- Manual inventory adjustment.
+- Duplicate import.
+- Repeated status update.
+- Failed shipment.
+- Partial delivery.
+- Partial return.
+- Multiple orders containing the same SKU.
+- Concurrent changes to the same product.
+
+Verify inventory totals and every movement ledger entry.
+
+12.4 Financial tests
+
+Test:
+
+- Delivered sale.
+- Unsuccessful delivery.
+- Return shipping expense.
+- Confirmed refund.
+- Missing marketplace fees.
+- Missing product cost.
+- Additional shipping charge.
+- Discount.
+- Packaging expense.
+- Damaged returned product.
+- Restockable returned product.
+- Partial refund.
+- Multiple financial adjustments.
+- Duplicate transaction prevention.
+- Settlement received.
+- Pending settlement.
+- Corrected transaction.
+
+Verify that financial totals never double-count the same transaction.
+
+12.5 Marketplace and onboarding tests
+
+Test:
+
+- New merchant with no marketplace selected.
+- New merchant selecting only Noon.
+- New merchant selecting only Amazon.
+- New merchant selecting multiple marketplaces.
+- Merchant selecting and then deselecting all marketplaces.
+- Merchant adding a custom marketplace.
+- Merchant selecting a website and entering its name.
+- Merchant reopening the application.
+- Merchant editing marketplace configuration later.
+- Merchant changing a marketplace name.
+- Merchant removing a marketplace while preserving historical records.
+
+Verify that onboarding is not repeated and no marketplace is automatically selected.
+
+12.6 Dashboard consistency tests
+
+After every major test action, verify that:
+
+- Order counts are correct.
+- Return counts are correct.
+- Inventory quantities are correct.
+- Available stock is correct.
+- In-transit quantities are correct.
+- Damaged quantities are correct.
+- Financial totals are correct.
+- Pending settlements are correct.
+- Recommendations update correctly.
+- Related dashboard cards open the correct records.
+
+The dashboard must always agree with the underlying records.
+
+12.7 UX usability tests
+
+Test the application on:
+
+- Small mobile screens.
+- Large mobile screens.
+- Tablets.
+- Desktop screens.
+
+Verify:
+
+- Navigation accessibility.
+- No header obstruction.
+- No unnecessary horizontal scrolling.
+- Clear action labels.
+- Readable tutorial instructions.
+- Visible tutorial highlights.
+- Easy manual order creation.
+- Easy SKU entry.
+- Easy return processing.
+- Clear distinction between inventory states.
+- No repeated or contradictory actions.
+
+---
+
+13. Technical Architecture and Data Integrity
+
+Implement these improvements without creating disconnected systems.
+
+13.1 Single source of truth
+
+Use the underlying order, return, inventory, and financial records as the source of truth.
+
+Dashboard metrics, product quantities, and Merchant Guidance recommendations must be derived from those records.
+
+Avoid maintaining manually duplicated values that can become inconsistent.
+
+13.2 Stable relationships
+
+Maintain stable identifiers and relationships between:
+
+- Merchant.
+- Store.
+- Marketplace.
+- Product.
+- Marketplace-specific product listing.
+- Order.
+- Order item.
+- Shipment.
+- Return case.
+- Return item.
+- Inventory movement.
+- Financial transaction.
+- Recommendation.
+- Tutorial progress.
+
+Use IDs rather than mutable display names as relationship keys.
+
+13.3 Transaction safety
+
+Critical operations must be atomic where supported.
+
+For example, confirming that an order has been handed to a shipping company must update the order state and inventory movement together.
+
+If part of the operation fails, do not leave the system with conflicting records.
+
+Use idempotency protection to prevent duplicate effects from repeated requests, imports, or button clicks.
+
+13.4 Historical preservation
+
+Do not silently delete historical information when:
+
+- A marketplace is removed.
+- A product is renamed.
+- An order is closed.
+- A return is resolved.
+- A shipping company name is changed.
+- A merchant corrects a previous decision.
+
+Preserve the original event history and record corrections transparently.
+
+13.5 Data migration
+
+If the existing database uses older inventory or return states, create a safe migration plan.
+
+Before applying migrations:
+
+- Inspect existing records.
+- Identify ambiguous historical states.
+- Avoid guessing the physical location of old inventory.
+- Preserve all historical order data.
+- Do not automatically classify unknown quantities as available.
+- Mark uncertain historical information for merchant review where necessary.
+
+Never silently reset existing merchant data.
+
+---
+
+14. Implementation Priorities
+
+Implement this update in controlled phases.
+
+Phase 1 – Core Business Logic
+
+- Return lifecycle.
+- Inventory custody states.
+- Inventory movement ledger.
+- Valid state transitions.
+- Order and return relationships.
+- Idempotency and transaction safety.
+
+Phase 2 – Financial Accuracy
+
+- Order financial breakdown.
+- Return expenses.
+- Shipping costs.
+- Financial transaction ledger.
+- Dashboard financial calculations.
+
+Phase 3 – Operational Experience
+
+- SKU-first order creation.
+- Optional extra charges.
+- Shipping company details.
+- Order notes and activity history.
+- Returns management interface.
+
+Phase 4 – Merchant Guidance and Product Preview
+
+- Internal rules-based recommendations.
+- Dedicated Merchant Guidance page.
+- Customer-style product browsing.
+- Product improvement observations.
+
+Phase 5 – Onboarding and UX
+
+- Optional marketplace selection.
+- Website name entry.
+- Persistent onboarding configuration.
+- Improved tutorials.
+- Mobile and desktop navigation redesign.
+
+Phase 6 – Testing and Verification
+
+- Full business logic test suite.
+- Inventory reconciliation.
+- Financial reconciliation.
+- Dashboard consistency.
+- Responsive UX testing.
+- Existing merchant data verification.
+
+Do not prioritize visual polish over broken business logic.
+
+---
+
+Final Acceptance Criteria
+
+The update is complete only when all of the following are true:
+
+1. Every product has a clear and accurate inventory custody state.
+2. Products outside the warehouse are never shown as available stock.
+3. Every return follows a clear lifecycle with valid decisions.
+4. Return inspection determines whether products can re-enter available stock.
+5. Every important decision creates the correct inventory and financial effects.
+6. Every order has a clear shipping record and activity history.
+7. Manual order creation is fast and SKU-first.
+8. Additional costs can be recorded without complicating the normal workflow.
+9. Financial calculations are traceable and do not claim unsupported profit.
+10. Merchant Guidance is connected to real operational data.
+11. Product browsing feels like a real storefront preview.
+12. Marketplace onboarding is completely optional and never repeats unnecessarily.
+13. Tutorials are clear, interactive, readable, and easy to skip or reopen.
+14. Mobile and desktop layouts feel designed for their respective devices.
+15. No fake products, fake orders, fake analytics, or fabricated recommendations appear.
+16. Dashboard values always match the underlying records.
+17. Historical records remain intact.
+18. All critical lifecycle, inventory, and financial tests pass.
+
+Final instruction: Make the system easier to operate, not more complicated. Every screen, status, number, and decision must have a clear purpose. Remove duplicated controls and confusing terminology. Prefer a small number of meaningful decisions over a large number of unnecessary options.
+
+The merchant should always be able to answer four questions:
+
+- Where is my product right now?
+- Who is responsible for it?
+- What happened financially?
+- What should I do next?
+
+Do not mark any feature as completed unless its underlying behavior has been implemented and verified.

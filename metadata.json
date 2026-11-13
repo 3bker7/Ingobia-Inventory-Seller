@@ -1,0 +1,6 @@
+{
+  "name": "Seller Operations",
+  "description": "Multi-platform e-commerce management for Amazon, Noon, and multi-marketplace sellers with inventory sync, price history, returns lifecycle, and Excel batch processing.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
