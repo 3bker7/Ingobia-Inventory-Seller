@@ -17,6 +17,7 @@ interface PriceHistoryPageProps {
 export const PriceHistoryPage: React.FC<PriceHistoryPageProps> = ({ locale }) => {
   const t = translations[locale];
   const settings = storageService.getSettings();
+  const allMarketplaces = storageService.getAllMarketplaces();
   const priceHistory = storageService.getPriceHistory();
 
   const [searchQuery, setSearchQuery] = useState('');
@@ -81,9 +82,10 @@ export const PriceHistoryPage: React.FC<PriceHistoryPageProps> = ({ locale }) =>
             className="px-2.5 py-1.5 text-xs bg-[#F7F8FA] border border-[#E8ECF2] rounded-lg text-[#172033] focus:outline-none focus:ring-1 focus:ring-[#2563EB]"
           >
             <option value="all">{locale === 'ar' ? 'جميع المنصات' : 'All Marketplaces'}</option>
-            {settings.marketplaces.map((mkt) => (
+            {allMarketplaces.map((mkt) => (
               <option key={mkt.id} value={mkt.id}>
                 {locale === 'ar' ? mkt.nameAr : mkt.nameEn}
+                {mkt.isActive === false ? (locale === 'ar' ? ' [معطلة]' : ' [Disabled]') : ''}
               </option>
             ))}
           </select>
@@ -136,7 +138,8 @@ export const PriceHistoryPage: React.FC<PriceHistoryPageProps> = ({ locale }) =>
                 </tr>
               ) : (
                 filteredHistory.map((rec) => {
-                  const mkt = settings.marketplaces.find((m) => m.id === rec.marketplaceId);
+                  const mkt = allMarketplaces.find((m) => m.id === rec.marketplaceId);
+                  const isMktDisabled = mkt ? mkt.isActive === false : true;
                   const isDecrease = rec.changeType === 'decrease';
                   const isIncrease = rec.changeType === 'increase';
                   const diffAmount = rec.newPrice - rec.previousPrice;
@@ -164,14 +167,19 @@ export const PriceHistoryPage: React.FC<PriceHistoryPageProps> = ({ locale }) =>
                       {/* Marketplace */}
                       <td className="py-2.5 px-3">
                         <span
-                          className="px-2 py-0.5 rounded text-[10px] font-semibold border"
+                          className="px-2 py-0.5 rounded text-[10px] font-semibold border inline-flex items-center gap-1 whitespace-nowrap"
                           style={{
-                            backgroundColor: mkt?.badgeBg || '#FEF9C3',
-                            color: mkt?.badgeText || '#854D0E',
+                            backgroundColor: isMktDisabled ? '#F1F5F9' : mkt?.badgeBg || '#F1F5F9',
+                            color: isMktDisabled ? '#475569' : mkt?.badgeText || '#475569',
                             borderColor: '#E8ECF2',
                           }}
                         >
-                          {locale === 'ar' ? mkt?.nameAr || rec.marketplaceId : mkt?.nameEn || rec.marketplaceId}
+                          <span>{locale === 'ar' ? mkt?.nameAr || rec.marketplaceId : mkt?.nameEn || rec.marketplaceId}</span>
+                          {isMktDisabled && (
+                            <span className="text-[9px] opacity-80">
+                              {locale === 'ar' ? '[معطلة]' : '[Disabled]'}
+                            </span>
+                          )}
                         </span>
                       </td>
 

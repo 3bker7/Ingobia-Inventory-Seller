@@ -1,7 +1,8 @@
 /**
  * Pure Smart Order Import custody & deduplication engine.
  * Handles active (preparing / with_delivery), rejected, cancelled, and historical delivered orders
- * while preserving inventory custody invariants and COGS snapshots.
+ * while strictly validating inventory sufficiency (never silently inflating physicalStock)
+ * and preserving COGS snapshots.
  */
 
 import {
@@ -14,8 +15,14 @@ import {
 import {
   generateUniqueId,
   getLockedCustodyFloor,
+  getSellableCapacityForMarketplace,
   normalizeProductCustody,
 } from './inventoryCustody';
+
+export interface SmartImportRejectedOrder {
+  orderId: string;
+  reason: string;
+}
 
 export function saveSmartImportOrdersPure(params: {
   ordersToImport: Order[];
@@ -23,12 +30,16 @@ export function saveSmartImportOrdersPure(params: {
   existingOrders: Order[];
   products: Product[];
   returns: ReturnRecord[];
+  activeMarketplaceIds?: string[];
+  merchantId?: string;
   operator?: string;
   nowIso?: string;
 }): {
   importedCount: number;
   historicalCount: number;
   duplicateCount: number;
+  rejectedCount: number;
+  rejectedOrders: SmartImportRejectedOrder[];
   orders: Order[];
   products: Product[];
   returns: ReturnRecord[];
@@ -40,6 +51,8 @@ export function saveSmartImportOrdersPure(params: {
     existingOrders: rawOrders,
     products: rawProducts,
     returns: rawReturns,
+    activeMarketplaceIds,
+    merchantId,
     operator = 'مدير العمليات',
     nowIso = new Date().toISOString(),
   } = params;
@@ -52,6 +65,7 @@ export function saveSmartImportOrdersPure(params: {
   const returns = [...rawReturns];
   const existingReturnIds = new Set(returns.map((r) => r.id));
   const newMovements: StockMovement[] = [];
+  const rejectedOrders: SmartImportRejectedOrder[] = [];
 
   let importedCount = 0;
   let historicalCount = 0;
@@ -64,9 +78,19 @@ export function saveSmartImportOrdersPure(params: {
       continue;
     }
 
+    if (activeMarketplaceIds && !activeMarketplaceIds.includes(rawOrder.marketplaceId)) {
+      rejectedOrders.push({
+        orderId: rawOrder.id,
+        reason: `المنصة (${rawOrder.marketplaceId}) غير مفعلة في حساب التاجر الحالي.`,
+      });
+      continue;
+    }
+
     const enrichedItems: OrderItem[] = rawOrder.items.map((item) => {
       const product = products.find(
-        (p) => p.id === item.productId || (p.sku && p.sku.toLowerCase() === item.productSku.toLowerCase())
+        (p) =>
+          p.id === item.productId ||
+          (p.sku && p.sku.toLowerCase() === item.productSku.toLowerCase())
       );
       return {
         ...item,
@@ -79,8 +103,55 @@ export function saveSmartImportOrdersPure(params: {
       };
     });
 
+    const isActiveOrReturn =
+      rawOrder.status === 'preparing' ||
+      rawOrder.status === 'with_delivery' ||
+      rawOrder.status === 'rejected';
+
+    // Never silently invent physicalStock on active/return orders; reject shortfalls cleanly
+    if (isActiveOrReturn) {
+      const requiredByProd = new Map<string, number>();
+      let missingProdReason: string | null = null;
+      for (const item of enrichedItems) {
+        const product = products.find(
+          (p) =>
+            p.id === item.productId ||
+            (p.sku && p.sku.toLowerCase() === item.productSku.toLowerCase())
+        );
+        if (!product) {
+          missingProdReason = `المنتج (${item.productSku || item.productName}) غير مسجل في الكتالوج.`;
+          break;
+        }
+        requiredByProd.set(product.id, (requiredByProd.get(product.id) || 0) + item.quantity);
+      }
+
+      if (missingProdReason) {
+        rejectedOrders.push({ orderId: rawOrder.id, reason: missingProdReason });
+        continue;
+      }
+
+      let shortfallReason: string | null = null;
+      for (const [prodId, reqQty] of requiredByProd.entries()) {
+        const product = products.find((p) => p.id === prodId)!;
+        const cap = getSellableCapacityForMarketplace(product, rawOrder.marketplaceId);
+        if (cap.sellable < reqQty) {
+          shortfallReason =
+            cap.source === 'platform'
+              ? `الرصيد المخصص لمنصة (${rawOrder.marketplaceId}) للمنتج (${product.name}) غير كافٍ (المتاح: ${cap.sellable}، المطلوب: ${reqQty}).`
+              : `المخزون المتاح للمنتج (${product.name}) غير كافٍ (المتاح: ${cap.sellable}، المطلوب: ${reqQty}).`;
+          break;
+        }
+      }
+
+      if (shortfallReason) {
+        rejectedOrders.push({ orderId: rawOrder.id, reason: shortfallReason });
+        continue;
+      }
+    }
+
     const order: Order = {
       ...rawOrder,
+      merchantId: merchantId || rawOrder.merchantId,
       items: enrichedItems,
       updatedAt: nowIso,
     };
@@ -99,29 +170,57 @@ export function saveSmartImportOrdersPure(params: {
       order.closedAt = order.closedAt || order.deliveredDate || nowIso;
 
       if (isHistoricalDeducted) {
-        for (const item of order.items) {
-          const product = products.find(
-            (p) => p.id === item.productId || (p.sku && p.sku.toLowerCase() === item.productSku.toLowerCase())
+        for (let i = 0; i < order.items.length; i++) {
+          const item = order.items[i];
+          const prodIdx = products.findIndex(
+            (p) =>
+              p.id === item.productId ||
+              (p.sku && p.sku.toLowerCase() === item.productSku.toLowerCase())
           );
-          if (product) {
+          if (prodIdx >= 0) {
+            let product = products[prodIdx];
             const prevPhysical = product.physicalStock;
             const prevAvail = product.availableStock;
-            const deductible = Math.min(prevAvail, Math.max(0, item.quantity));
-            product.availableStock = Math.max(0, prevAvail - deductible);
+            const cap = getSellableCapacityForMarketplace(product, order.marketplaceId);
+            const deductible = Math.min(cap.sellable, Math.max(0, item.quantity));
+
+            const nextAllocations = { ...(product.platformAllocations || {}) };
+            if (cap.source === 'platform' && nextAllocations[order.marketplaceId] && deductible > 0) {
+              const alloc = nextAllocations[order.marketplaceId];
+              const nextAllocQty = Math.max(alloc.reservedQty, alloc.allocatedQty - deductible);
+              nextAllocations[order.marketplaceId] = {
+                ...alloc,
+                allocatedQty: nextAllocQty,
+                availableQty: Math.max(0, nextAllocQty - alloc.reservedQty),
+                lastUpdated: nowIso,
+              };
+            }
+
+            const nextAvail = Math.max(0, prevAvail - deductible);
             const floor = getLockedCustodyFloor({
               ...product,
-              availableStock: product.availableStock,
+              availableStock: nextAvail,
             });
-            product.physicalStock = Math.max(floor, prevPhysical - deductible);
-            product.updatedAt = nowIso;
+            product = normalizeProductCustody({
+              ...product,
+              availableStock: nextAvail,
+              physicalStock: Math.max(floor, prevPhysical - deductible),
+              platformAllocations: nextAllocations,
+              updatedAt: nowIso,
+            });
+            products[prodIdx] = product;
 
             if (deductible > 0) {
               newMovements.push({
-                id: `mov-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+                id: `mov-${Date.now()}-${i}-${Math.random().toString(36).substring(2, 6)}`,
+                merchantId: order.merchantId || product.merchantId,
                 productId: product.id,
                 productSku: product.sku || product.name,
                 productName: product.name,
                 marketplaceId: order.marketplaceId,
+                platformId: order.marketplaceId,
+                source: cap.source === 'platform' ? 'platform_allocation' : 'central_available',
+                destination: 'customer',
                 type: 'order_delivered',
                 quantityChange: -deductible,
                 previousPhysical: prevPhysical,
@@ -129,6 +228,7 @@ export function saveSmartImportOrdersPure(params: {
                 previousAvailable: prevAvail,
                 newAvailable: product.availableStock,
                 referenceOrderId: order.id,
+                eventKey: `smart_delivered|${product.id}|${order.id}|${i}`,
                 reason: `تسجيل تسليم سابق لطلب تاريخي #${order.id} عبر الاستيراد الذكي`,
                 operator,
                 timestamp: nowIso,
@@ -139,25 +239,51 @@ export function saveSmartImportOrdersPure(params: {
       }
       historicalCount++;
     } else if (order.status === 'with_delivery') {
-      for (const item of order.items) {
-        const product = products.find(
-          (p) => p.id === item.productId || (p.sku && p.sku.toLowerCase() === item.productSku.toLowerCase())
+      for (let i = 0; i < order.items.length; i++) {
+        const item = order.items[i];
+        const prodIdx = products.findIndex(
+          (p) =>
+            p.id === item.productId ||
+            (p.sku && p.sku.toLowerCase() === item.productSku.toLowerCase())
         );
-        if (product) {
+        if (prodIdx >= 0) {
+          let product = products[prodIdx];
           const prevPhysical = product.physicalStock;
           const prevAvail = product.availableStock;
-          const shortfall = Math.max(0, item.quantity - prevAvail);
-          product.availableStock = Math.max(0, prevAvail - item.quantity);
-          product.physicalStock = prevPhysical + shortfall;
-          product.outboundInTransitStock = (product.outboundInTransitStock || 0) + item.quantity;
-          product.updatedAt = nowIso;
+          const cap = getSellableCapacityForMarketplace(product, order.marketplaceId);
+          const nextAllocations = { ...(product.platformAllocations || {}) };
+
+          if (cap.source === 'platform' && nextAllocations[order.marketplaceId]) {
+            const alloc = nextAllocations[order.marketplaceId];
+            const nextAllocQty = Math.max(alloc.reservedQty, alloc.allocatedQty - item.quantity);
+            nextAllocations[order.marketplaceId] = {
+              ...alloc,
+              allocatedQty: nextAllocQty,
+              availableQty: Math.max(0, nextAllocQty - alloc.reservedQty),
+              lastUpdated: nowIso,
+            };
+          }
+
+          item.reservationSource = cap.source;
+          product = normalizeProductCustody({
+            ...product,
+            availableStock: Math.max(0, prevAvail - item.quantity),
+            outboundInTransitStock: (product.outboundInTransitStock || 0) + item.quantity,
+            platformAllocations: nextAllocations,
+            updatedAt: nowIso,
+          });
+          products[prodIdx] = product;
 
           newMovements.push({
-            id: `mov-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+            id: `mov-${Date.now()}-${i}-${Math.random().toString(36).substring(2, 6)}`,
+            merchantId: order.merchantId || product.merchantId,
             productId: product.id,
             productSku: product.sku || product.name,
             productName: product.name,
             marketplaceId: order.marketplaceId,
+            platformId: order.marketplaceId,
+            source: cap.source === 'platform' ? 'platform_allocation' : 'central_available',
+            destination: 'outbound_transit',
             type: 'handover_to_courier',
             quantityChange: -item.quantity,
             previousPhysical: prevPhysical,
@@ -167,6 +293,7 @@ export function saveSmartImportOrdersPure(params: {
             fromCustody: 'متاح بالمستودع',
             toCustody: 'خارج المستودع (مع شركة الشحن)',
             referenceOrderId: order.id,
+            eventKey: `smart_with_delivery|${product.id}|${order.id}|${i}`,
             reason: `استيراد طلب قيد التوصيل #${order.id} (${order.marketplaceId})`,
             operator,
             timestamp: nowIso,
@@ -175,25 +302,51 @@ export function saveSmartImportOrdersPure(params: {
       }
       importedCount++;
     } else if (order.status === 'rejected') {
-      for (const item of order.items) {
-        const product = products.find(
-          (p) => p.id === item.productId || (p.sku && p.sku.toLowerCase() === item.productSku.toLowerCase())
+      for (let i = 0; i < order.items.length; i++) {
+        const item = order.items[i];
+        const prodIdx = products.findIndex(
+          (p) =>
+            p.id === item.productId ||
+            (p.sku && p.sku.toLowerCase() === item.productSku.toLowerCase())
         );
-        if (product) {
+        if (prodIdx >= 0) {
+          let product = products[prodIdx];
           const prevPhysical = product.physicalStock;
           const prevAvail = product.availableStock;
-          const shortfall = Math.max(0, item.quantity - prevAvail);
-          product.availableStock = Math.max(0, prevAvail - item.quantity);
-          product.physicalStock = prevPhysical + shortfall;
-          product.returnInTransitStock = (product.returnInTransitStock || 0) + item.quantity;
-          product.updatedAt = nowIso;
+          const cap = getSellableCapacityForMarketplace(product, order.marketplaceId);
+          const nextAllocations = { ...(product.platformAllocations || {}) };
+
+          if (cap.source === 'platform' && nextAllocations[order.marketplaceId]) {
+            const alloc = nextAllocations[order.marketplaceId];
+            const nextAllocQty = Math.max(alloc.reservedQty, alloc.allocatedQty - item.quantity);
+            nextAllocations[order.marketplaceId] = {
+              ...alloc,
+              allocatedQty: nextAllocQty,
+              availableQty: Math.max(0, nextAllocQty - alloc.reservedQty),
+              lastUpdated: nowIso,
+            };
+          }
+
+          item.reservationSource = cap.source;
+          product = normalizeProductCustody({
+            ...product,
+            availableStock: Math.max(0, prevAvail - item.quantity),
+            returnInTransitStock: (product.returnInTransitStock || 0) + item.quantity,
+            platformAllocations: nextAllocations,
+            updatedAt: nowIso,
+          });
+          products[prodIdx] = product;
 
           newMovements.push({
-            id: `mov-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+            id: `mov-${Date.now()}-${i}-${Math.random().toString(36).substring(2, 6)}`,
+            merchantId: order.merchantId || product.merchantId,
             productId: product.id,
             productSku: product.sku || product.name,
             productName: product.name,
             marketplaceId: order.marketplaceId,
+            platformId: order.marketplaceId,
+            source: cap.source === 'platform' ? 'platform_allocation' : 'central_available',
+            destination: 'return_transit',
             type: 'return_initiated',
             quantityChange: 0,
             previousPhysical: prevPhysical,
@@ -201,6 +354,7 @@ export function saveSmartImportOrdersPure(params: {
             previousAvailable: prevAvail,
             newAvailable: product.availableStock,
             referenceOrderId: order.id,
+            eventKey: `smart_rejected|${product.id}|${order.id}|${i}`,
             reason: `استيراد طلب مرفوض #${order.id} ونقله لمسار المرتجعات`,
             operator,
             timestamp: nowIso,
@@ -213,12 +367,14 @@ export function saveSmartImportOrdersPure(params: {
         existingReturnIds.add(retId);
         returns.unshift({
           id: retId,
+          merchantId: order.merchantId,
           orderId: order.id,
           marketplaceId: order.marketplaceId,
           items: order.items,
           returnReason: 'طلب مستورد بحالة مرتجع / مرفوض',
           returnStatus: 'in_transit_back',
           stockRestored: false,
+          rejectedFromResale: false,
           isCompleted: false,
           createdAt: nowIso,
           updatedAt: nowIso,
@@ -226,26 +382,56 @@ export function saveSmartImportOrdersPure(params: {
       }
       importedCount++;
     } else {
-      // 'preparing' -> reserve stock safely
-      for (const item of order.items) {
-        const product = products.find(
-          (p) => p.id === item.productId || (p.sku && p.sku.toLowerCase() === item.productSku.toLowerCase())
+      // 'preparing' -> reserve stock safely from platform allocation or central available
+      for (let i = 0; i < order.items.length; i++) {
+        const item = order.items[i];
+        const prodIdx = products.findIndex(
+          (p) =>
+            p.id === item.productId ||
+            (p.sku && p.sku.toLowerCase() === item.productSku.toLowerCase())
         );
-        if (product) {
+        if (prodIdx >= 0) {
+          let product = products[prodIdx];
           const prevPhysical = product.physicalStock;
           const prevAvail = product.availableStock;
-          const shortfall = Math.max(0, item.quantity - prevAvail);
-          product.availableStock = Math.max(0, prevAvail - item.quantity);
-          product.physicalStock = prevPhysical + shortfall;
-          product.reservedStock = (product.reservedStock || 0) + item.quantity;
-          product.updatedAt = nowIso;
+          const cap = getSellableCapacityForMarketplace(product, order.marketplaceId);
+          const nextAllocations = { ...(product.platformAllocations || {}) };
+          let nextCentralReserved = product.centralReservedStock ?? 0;
+
+          if (cap.source === 'platform' && nextAllocations[order.marketplaceId]) {
+            const alloc = nextAllocations[order.marketplaceId];
+            const nextRes = alloc.reservedQty + item.quantity;
+            nextAllocations[order.marketplaceId] = {
+              ...alloc,
+              reservedQty: nextRes,
+              availableQty: Math.max(0, alloc.allocatedQty - nextRes),
+              lastUpdated: nowIso,
+            };
+          } else {
+            nextCentralReserved += item.quantity;
+          }
+
+          item.reservationSource = cap.source;
+          product = normalizeProductCustody({
+            ...product,
+            availableStock: Math.max(0, prevAvail - item.quantity),
+            reservedStock: product.reservedStock + item.quantity,
+            centralReservedStock: nextCentralReserved,
+            platformAllocations: nextAllocations,
+            updatedAt: nowIso,
+          });
+          products[prodIdx] = product;
 
           newMovements.push({
-            id: `mov-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+            id: `mov-${Date.now()}-${i}-${Math.random().toString(36).substring(2, 6)}`,
+            merchantId: order.merchantId || product.merchantId,
             productId: product.id,
             productSku: product.sku || product.name,
             productName: product.name,
             marketplaceId: order.marketplaceId,
+            platformId: order.marketplaceId,
+            source: cap.source === 'platform' ? 'platform_allocation' : 'central_available',
+            destination: 'reserved',
             type: 'order_created',
             quantityChange: -item.quantity,
             previousPhysical: prevPhysical,
@@ -253,6 +439,7 @@ export function saveSmartImportOrdersPure(params: {
             previousAvailable: prevAvail,
             newAvailable: product.availableStock,
             referenceOrderId: order.id,
+            eventKey: `smart_preparing|${product.id}|${order.id}|${i}`,
             reason: `حجز مخزون عبر الاستيراد الذكي للطلب #${order.id} (${order.marketplaceId})`,
             operator,
             timestamp: nowIso,
@@ -270,6 +457,8 @@ export function saveSmartImportOrdersPure(params: {
     importedCount,
     historicalCount,
     duplicateCount,
+    rejectedCount: rejectedOrders.length,
+    rejectedOrders,
     orders: existingOrders,
     products,
     returns,

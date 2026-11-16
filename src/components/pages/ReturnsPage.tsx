@@ -17,12 +17,14 @@ import {
   FileText,
   DollarSign,
   ChevronDown,
+  X,
 } from 'lucide-react';
-import { ReturnRecord, ReturnStatus, InspectionOutcome, ShipmentRecord } from '../../types';
+import { ReturnRecord, ReturnStatus, InspectionOutcome, MarketplaceId } from '../../types';
 import { storageService } from '../../services/storage';
 import { translations, Locale } from '../../locales/translations';
 import { Modal } from '../common/Modal';
 import { useToast } from '../common/Toast';
+import { resolveSafeProductImage } from '../../utils/productVisual';
 
 interface ReturnsPageProps {
   locale: Locale;
@@ -38,10 +40,14 @@ export const ReturnsPage: React.FC<ReturnsPageProps> = ({
   const t = translations[locale];
   const { showToast } = useToast();
   const settings = storageService.getSettings();
+  const allMarketplaces = storageService.getAllMarketplaces();
+  const activeMarketplaces = storageService.getActiveMarketplaces();
 
   const [returns, setReturns] = useState<ReturnRecord[]>(() => storageService.getReturns());
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<string>(initialStatusFilter || 'all');
+  const [showCustodyNotice, setShowCustodyNotice] = useState(true);
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
   React.useEffect(() => {
     if (initialStatusFilter) {
@@ -53,6 +59,7 @@ export const ReturnsPage: React.FC<ReturnsPageProps> = ({
   const [inspectingReturn, setInspectingReturn] = useState<ReturnRecord | null>(null);
   const [selectedOutcome, setSelectedOutcome] = useState<InspectionOutcome>('restockable');
   const [condition, setCondition] = useState<'like_new' | 'opened_good' | 'damaged' | 'lost'>('like_new');
+  const [restockTarget, setRestockTarget] = useState<'central' | MarketplaceId>('central');
   const [inspectionNotes, setInspectionNotes] = useState('');
 
   // Warehouse Receipt confirmation modal
@@ -86,6 +93,9 @@ export const ReturnsPage: React.FC<ReturnsPageProps> = ({
 
     if (statusFilter === 'all') return true;
     if (statusFilter === 'in_transit_back') return r.returnStatus === 'in_transit_back' || r.returnStatus === 'pickup_pending' || r.returnStatus === 'return_initiated';
+    if (statusFilter === 'awaiting_inspection') {
+      return !r.isCompleted && (r.returnStatus === 'received_at_warehouse' || r.returnStatus === 'under_inspection');
+    }
     if (statusFilter === 'received_at_warehouse') return r.returnStatus === 'received_at_warehouse';
     if (statusFilter === 'under_inspection') return r.returnStatus === 'under_inspection';
     if (statusFilter === 'restocked') return r.returnStatus === 'restocked' || r.inspectionOutcome === 'restockable';
@@ -100,6 +110,7 @@ export const ReturnsPage: React.FC<ReturnsPageProps> = ({
     in_transit: returns.filter((r) => !r.isCompleted && (r.returnStatus === 'in_transit_back' || r.returnStatus === 'pickup_pending' || r.returnStatus === 'return_initiated')).length,
     received: returns.filter((r) => !r.isCompleted && r.returnStatus === 'received_at_warehouse').length,
     under_inspection: returns.filter((r) => !r.isCompleted && r.returnStatus === 'under_inspection').length,
+    awaiting_inspection: returns.filter((r) => !r.isCompleted && (r.returnStatus === 'received_at_warehouse' || r.returnStatus === 'under_inspection')).length,
     restocked: returns.filter((r) => r.isCompleted && (r.inspectionOutcome === 'restockable' || r.returnStatus === 'restocked')).length,
     damaged: returns.filter((r) => r.isCompleted && (r.inspectionOutcome === 'damaged' || r.returnStatus === 'damaged')).length,
   };
@@ -108,84 +119,106 @@ export const ReturnsPage: React.FC<ReturnsPageProps> = ({
     setInspectingReturn(ret);
     setSelectedOutcome(ret.inspectionOutcome || 'restockable');
     setCondition(ret.physicalCondition || 'like_new');
+    setRestockTarget('central');
     setInspectionNotes(ret.notes || '');
   };
 
   const handleCommitInspection = () => {
-    if (!inspectingReturn) return;
+    if (!inspectingReturn || isSubmitting) return;
+    setIsSubmitting(true);
 
-    const res = storageService.processReturnInspection(
-      inspectingReturn.id,
-      selectedOutcome,
-      condition,
-      inspectionNotes.trim(),
-      settings.sellerName
-    );
+    try {
+      const res = storageService.processReturnInspection(
+        inspectingReturn.id,
+        selectedOutcome,
+        condition,
+        inspectionNotes.trim(),
+        settings.sellerName,
+        selectedOutcome === 'restockable' ? restockTarget : undefined
+      );
 
-    if (res.success) {
-      showToast(res.message, 'success');
-      setInspectingReturn(null);
-      refreshReturns();
-    } else {
-      showToast(res.message, 'error');
+      if (res.success) {
+        showToast(res.message, 'success');
+        setInspectingReturn(null);
+        refreshReturns();
+      } else {
+        showToast(res.message, 'error');
+      }
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
   const handleConfirmWarehouseReceipt = () => {
-    if (!receiptConfirmReturn) return;
+    if (!receiptConfirmReturn || isSubmitting) return;
+    setIsSubmitting(true);
 
-    const res = storageService.advanceReturnStatus(
-      receiptConfirmReturn.id,
-      'received_at_warehouse',
-      settings.sellerName,
-      receiptNotes.trim() || (isRtl ? 'تم الاستلام الفعلي بالمستودع ونقل الحيازة لبانتظار الفحص' : 'Physically received at warehouse')
-    );
-
-    if (res.success) {
-      showToast(
-        isRtl
-          ? 'تم تأكيد استلام الطرد بالمستودع. الوحدات أصبحت في حالة (بانتظار الفحص) ولن تُضاف للمخزون المتاح إلا بعد اعتماد الفحص.'
-          : 'Return marked received at warehouse. Held in awaiting inspection.',
-        'success'
+    try {
+      const res = storageService.advanceReturnStatus(
+        receiptConfirmReturn.id,
+        'received_at_warehouse',
+        settings.sellerName,
+        receiptNotes.trim() || (isRtl ? 'تم الاستلام الفعلي بالمستودع ونقل الحيازة لبانتظار الفحص' : 'Physically received at warehouse')
       );
-      setReceiptConfirmReturn(null);
-      setReceiptNotes('');
-      refreshReturns();
-    } else {
-      showToast(res.error || 'فشل تحديث الحالة', 'error');
+
+      if (res.success) {
+        showToast(
+          isRtl
+            ? 'تم تأكيد استلام الطرد بالمستودع. الوحدات أصبحت في حالة (بانتظار الفحص) ولن تُضاف للمخزون المتاح إلا بعد اعتماد الفحص.'
+            : 'Return marked received at warehouse. Held in awaiting inspection.',
+          'success'
+        );
+        setReceiptConfirmReturn(null);
+        setReceiptNotes('');
+        refreshReturns();
+      } else {
+        showToast(res.error || 'فشل تحديث الحالة', 'error');
+      }
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
   const handleStartInspection = (ret: ReturnRecord) => {
-    const res = storageService.advanceReturnStatus(
-      ret.id,
-      'under_inspection',
-      settings.sellerName,
-      isRtl ? 'بدء الفحص الفني وتقييم حالة المنتج' : 'Started technical inspection'
-    );
-    if (res.success) {
-      showToast(isRtl ? 'تم تحويل المرتجع لحالة (قيد الفحص الفني).' : 'Moved to Under Inspection.', 'success');
-      refreshReturns();
-    } else {
-      showToast(res.error || (isRtl ? 'تعذر بدء الفحص الفني.' : 'Failed to start inspection'), 'error');
+    if (isSubmitting) return;
+    setIsSubmitting(true);
+    try {
+      const res = storageService.advanceReturnStatus(
+        ret.id,
+        'under_inspection',
+        settings.sellerName,
+        isRtl ? 'بدء الفحص الفني وتقييم حالة المنتج' : 'Started technical inspection'
+      );
+      if (res.success) {
+        showToast(isRtl ? 'تم تحويل المرتجع لحالة (قيد الفحص الفني).' : 'Moved to Under Inspection.', 'success');
+        refreshReturns();
+      } else {
+        showToast(res.error || (isRtl ? 'تعذر بدء الفحص الفني.' : 'Failed to start inspection'), 'error');
+      }
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
   const handleAddManualNote = () => {
-    if (!detailReturn || !newNoteInput.trim()) return;
-
-    const res = storageService.addReturnNote(
-      detailReturn.id,
-      newNoteInput.trim(),
-      settings.sellerName
-    );
-    if (res.success && res.returnRecord) {
-      setDetailReturn({ ...res.returnRecord });
-      setNewNoteInput('');
-      refreshReturns();
-      showToast(isRtl ? 'تمت إضافة الملاحظة بنجاح.' : 'Note added.', 'success');
-    } else {
-      showToast(res.error || (isRtl ? 'تعذر حفظ الملاحظة.' : 'Failed to save note.'), 'error');
+    if (!detailReturn || !newNoteInput.trim() || isSubmitting) return;
+    setIsSubmitting(true);
+    try {
+      const res = storageService.addReturnNote(
+        detailReturn.id,
+        newNoteInput.trim(),
+        settings.sellerName
+      );
+      if (res.success && res.returnRecord) {
+        setDetailReturn({ ...res.returnRecord });
+        setNewNoteInput('');
+        refreshReturns();
+        showToast(isRtl ? 'تمت إضافة الملاحظة بنجاح.' : 'Note added.', 'success');
+      } else {
+        showToast(res.error || (isRtl ? 'تعذر حفظ الملاحظة.' : 'Failed to save note.'), 'error');
+      }
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -246,30 +279,40 @@ export const ReturnsPage: React.FC<ReturnsPageProps> = ({
 
   return (
     <div className="space-y-5 animate-in fade-in duration-200">
-      {/* 1. Core Custody & Rules Notice */}
-      <div className="p-4 bg-blue-50/70 border border-blue-200 rounded-2xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs shadow-2xs">
-        <div className="flex items-start gap-3">
-          <div className="w-8 h-8 rounded-xl bg-[#2563EB] text-white flex items-center justify-center shrink-0 mt-0.5 shadow-2xs">
-            <RotateCcw className="w-4 h-4" />
+      {/* 1. Core Custody & Rules Notice (Dismissible) */}
+      {showCustodyNotice && (
+        <div className="p-4 bg-blue-50/70 border border-blue-200 rounded-2xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs shadow-2xs">
+          <div className="flex items-start gap-3">
+            <div className="w-8 h-8 rounded-xl bg-[#2563EB] text-white flex items-center justify-center shrink-0 mt-0.5 shadow-2xs">
+              <RotateCcw className="w-4 h-4" />
+            </div>
+            <div className="space-y-0.5">
+              <h4 className="font-bold text-[#172033]">
+                {isRtl ? 'نظام حيازة المرتجعات ودورة الفحص الفني (7 مراحل)' : '7-Stage Returns Custody Management System'}
+              </h4>
+              <p className="text-[#64748B] leading-relaxed">
+                {isRtl
+                  ? 'قاعدة أمان صارمة: المرتجع في الطريق أو المستلم بانتظار الفحص لا يُضاف أبداً للمخزون المتاح للبيع حتى يتم فحصه واعتماده صراحة.'
+                  : 'Strict rule: In-transit and uninspected returns are strictly excluded from available inventory until explicit approval.'}
+              </p>
+            </div>
           </div>
-          <div className="space-y-0.5">
-            <h4 className="font-bold text-[#172033]">
-              {isRtl ? 'نظام حيازة المرتجعات ودورة الفحص الفني (7 مراحل)' : '7-Stage Returns Custody Management System'}
-            </h4>
-            <p className="text-[#64748B] leading-relaxed">
-              {isRtl
-                ? 'قاعدة أمان صارمة: المرتجع في الطريق أو المستلم بانتظار الفحص لا يُضاف أبداً للمخزون المتاح للبيع حتى يتم فحصه واعتماده صراحة.'
-                : 'Strict rule: In-transit and uninspected returns are strictly excluded from available inventory until explicit approval.'}
-            </p>
-          </div>
-        </div>
 
-        <div className="flex items-center gap-2 shrink-0 self-end sm:self-center">
-          <span className="px-3 py-1 rounded-lg bg-white border border-blue-200 text-[#2563EB] font-bold font-mono-code text-xs">
-            {tabCounts.in_transit + tabCounts.received + tabCounts.under_inspection} {isRtl ? 'نشط خارج المتاح' : 'active outside available'}
-          </span>
+          <div className="flex items-center gap-2 shrink-0 self-end sm:self-center">
+            <span className="px-3 py-1 rounded-lg bg-white border border-blue-200 text-[#2563EB] font-bold font-mono-code text-xs tabular-nums whitespace-nowrap">
+              {tabCounts.in_transit + tabCounts.received + tabCounts.under_inspection} {isRtl ? 'نشط خارج المتاح' : 'active outside available'}
+            </span>
+            <button
+              type="button"
+              onClick={() => setShowCustodyNotice(false)}
+              className="p-1.5 text-[#64748B] hover:text-[#172033] hover:bg-blue-100 rounded-lg transition-colors cursor-pointer"
+              aria-label={isRtl ? 'إخفاء التنبيه' : 'Dismiss notice'}
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
         </div>
-      </div>
+      )}
 
       {/* 2. Operational Filter Tabs */}
       <div className="flex items-center gap-1.5 overflow-x-auto pb-1 scrollbar-none border-b border-[#E8ECF2]">
@@ -305,8 +348,25 @@ export const ReturnsPage: React.FC<ReturnsPageProps> = ({
         </button>
 
         <button
+          onClick={() => setStatusFilter('awaiting_inspection')}
+          className={`flex items-center gap-2 px-3.5 py-2 text-xs font-semibold rounded-t-xl transition-all cursor-pointer whitespace-nowrap shrink-0 ${
+            statusFilter === 'awaiting_inspection'
+              ? 'bg-white text-[#D99A27] border-t-2 border-x border-[#E8ECF2] border-t-[#D99A27] shadow-2xs'
+              : 'text-[#64748B] hover:text-[#172033] hover:bg-slate-100/50'
+          }`}
+        >
+          <Clock className="w-3.5 h-3.5" />
+          <span>{isRtl ? 'بانتظار قرار الفحص' : 'Awaiting Inspection'}</span>
+          {tabCounts.awaiting_inspection > 0 && (
+            <span className="px-1.5 py-0.2 rounded-full text-[10px] bg-amber-100 text-[#D99A27] font-mono-code font-bold">
+              {tabCounts.awaiting_inspection}
+            </span>
+          )}
+        </button>
+
+        <button
           onClick={() => setStatusFilter('received_at_warehouse')}
-          className={`flex items-center gap-2 px-3.5 py-2 text-xs font-semibold rounded-t-xl transition-all cursor-pointer ${
+          className={`flex items-center gap-2 px-3.5 py-2 text-xs font-semibold rounded-t-xl transition-all cursor-pointer whitespace-nowrap shrink-0 ${
             statusFilter === 'received_at_warehouse'
               ? 'bg-white text-[#D99A27] border-t-2 border-x border-[#E8ECF2] border-t-[#D99A27] shadow-2xs'
               : 'text-[#64748B] hover:text-[#172033] hover:bg-slate-100/50'
@@ -323,7 +383,7 @@ export const ReturnsPage: React.FC<ReturnsPageProps> = ({
 
         <button
           onClick={() => setStatusFilter('under_inspection')}
-          className={`flex items-center gap-2 px-3.5 py-2 text-xs font-semibold rounded-t-xl transition-all cursor-pointer ${
+          className={`flex items-center gap-2 px-3.5 py-2 text-xs font-semibold rounded-t-xl transition-all cursor-pointer whitespace-nowrap shrink-0 ${
             statusFilter === 'under_inspection'
               ? 'bg-white text-purple-700 border-t-2 border-x border-[#E8ECF2] border-t-purple-600 shadow-2xs'
               : 'text-[#64748B] hover:text-[#172033] hover:bg-slate-100/50'
@@ -421,7 +481,8 @@ export const ReturnsPage: React.FC<ReturnsPageProps> = ({
               ) : (
                 filteredReturns.map((ret) => {
                   const firstItem = ret.items[0];
-                  const mkt = settings.marketplaces.find((m) => m.id === ret.marketplaceId);
+                  const mkt = allMarketplaces.find((m) => m.id === ret.marketplaceId);
+                  const isMktDisabled = mkt ? mkt.isActive === false : true;
                   const isClosed = ret.isCompleted === true || ret.returnStatus === 'closed';
 
                   return (
@@ -444,14 +505,19 @@ export const ReturnsPage: React.FC<ReturnsPageProps> = ({
                       {/* Marketplace badge */}
                       <td className="py-3.5 px-3">
                         <span
-                          className="px-2 py-0.5 rounded text-[10px] font-semibold border inline-block"
+                          className="px-2 py-0.5 rounded text-[10px] font-semibold border inline-flex items-center gap-1 whitespace-nowrap"
                           style={{
-                            backgroundColor: mkt?.badgeBg || '#FEF9C3',
-                            color: mkt?.badgeText || '#854D0E',
+                            backgroundColor: isMktDisabled ? '#F1F5F9' : mkt?.badgeBg || '#F1F5F9',
+                            color: isMktDisabled ? '#475569' : mkt?.badgeText || '#475569',
                             borderColor: '#E8ECF2',
                           }}
                         >
-                          {isRtl ? mkt?.nameAr || ret.marketplaceId : mkt?.nameEn || ret.marketplaceId}
+                          <span>{isRtl ? mkt?.nameAr || ret.marketplaceId : mkt?.nameEn || ret.marketplaceId}</span>
+                          {isMktDisabled && (
+                            <span className="text-[9px] opacity-80">
+                              {isRtl ? '[معطلة]' : '[Disabled]'}
+                            </span>
+                          )}
                         </span>
                       </td>
 
@@ -460,7 +526,7 @@ export const ReturnsPage: React.FC<ReturnsPageProps> = ({
                         <div className="flex items-center gap-2.5">
                           {firstItem && (
                             <img
-                              src={firstItem.imageUrl}
+                              src={resolveSafeProductImage(firstItem.imageUrl, firstItem.productName)}
                               alt={firstItem.productName}
                               referrerPolicy="no-referrer"
                               className="w-9 h-9 rounded-lg object-cover border border-[#E8ECF2] shrink-0"
@@ -645,15 +711,16 @@ export const ReturnsPage: React.FC<ReturnsPageProps> = ({
               <button
                 type="button"
                 onClick={() => setReceiptConfirmReturn(null)}
-                className="px-4 py-2 text-xs font-semibold text-[#64748B] hover:text-[#172033] bg-[#F7F8FA] rounded-xl transition-colors cursor-pointer"
+                className="px-4 py-2 text-xs font-semibold text-[#64748B] hover:text-[#172033] bg-[#F7F8FA] rounded-xl transition-colors cursor-pointer whitespace-nowrap shrink-0"
               >
                 {t.actions.cancel}
               </button>
 
               <button
                 type="button"
+                disabled={isSubmitting}
                 onClick={handleConfirmWarehouseReceipt}
-                className="px-5 py-2 text-xs font-bold text-white bg-amber-600 hover:bg-amber-700 rounded-xl transition-colors shadow-xs cursor-pointer flex items-center gap-1.5"
+                className="px-5 py-2 text-xs font-bold text-white bg-amber-600 hover:bg-amber-700 disabled:opacity-50 rounded-xl transition-colors shadow-xs cursor-pointer flex items-center gap-1.5 whitespace-nowrap shrink-0"
               >
                 <Check className="w-4 h-4" />
                 <span>{isRtl ? 'تأكيد الاستلام بالمستودع' : 'Confirm Receipt'}</span>
@@ -671,14 +738,16 @@ export const ReturnsPage: React.FC<ReturnsPageProps> = ({
         subtitle={inspectingReturn ? `الطلب #${inspectingReturn.orderId} (المرتجع ${inspectingReturn.id})` : ''}
         maxWidth="lg"
       >
-        {inspectingReturn && (
+        {inspectingReturn && (() => {
+          const totalInspectUnits = inspectingReturn.items.reduce((s, i) => s + i.quantity, 0);
+          return (
           <div className="space-y-4 text-xs">
             {/* Header Product Card */}
             <div className="p-3 bg-[#F8FAFC] rounded-2xl border border-[#E8ECF2] flex items-center justify-between">
               <div className="flex items-center gap-3">
-                {inspectingReturn.items[0]?.imageUrl && (
+                {inspectingReturn.items[0] && (
                   <img
-                    src={inspectingReturn.items[0].imageUrl}
+                    src={resolveSafeProductImage(inspectingReturn.items[0].imageUrl, inspectingReturn.items[0].productName)}
                     alt={inspectingReturn.items[0].productName}
                     referrerPolicy="no-referrer"
                     className="w-10 h-10 rounded-xl object-cover border border-[#E8ECF2]"
@@ -801,6 +870,33 @@ export const ReturnsPage: React.FC<ReturnsPageProps> = ({
               </div>
             </div>
 
+            {/* Restock Target Selector (only when restockable) */}
+            {selectedOutcome === 'restockable' && (
+              <div className="p-3.5 bg-emerald-50/40 rounded-2xl border border-emerald-200 space-y-2">
+                <label className="block font-bold text-[#172033]">
+                  {isRtl ? 'وجهة إعادة المخزون السليم (Central أو قناة بيع نشطة):' : 'Restock Destination:'}
+                </label>
+                <select
+                  value={restockTarget}
+                  onChange={(e) => setRestockTarget(e.target.value as 'central' | MarketplaceId)}
+                  className="w-full px-3 py-2 text-xs bg-white border border-emerald-200 rounded-xl text-[#172033] font-semibold focus:outline-none focus:ring-2 focus:ring-[#16A36A]/20"
+                >
+                  <option value="central">
+                    {isRtl
+                      ? 'المستودع المركزي غير المخصص (Central Pool)'
+                      : 'Central Unallocated Pool'}
+                  </option>
+                  {activeMarketplaces.map((mkt) => (
+                    <option key={mkt.id} value={mkt.id}>
+                      {isRtl
+                        ? `تخصيص مباشر لقناة: ${mkt.nameAr}`
+                        : `Direct Platform Allocation: ${mkt.nameEn}`}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+
             {/* PRE-CONFIRMATION CONSEQUENCE AUDIT BOX */}
             <div className="p-3.5 bg-slate-50 rounded-2xl border border-slate-200 text-xs space-y-1.5">
               <div className="font-bold text-[#172033] flex items-center gap-1.5">
@@ -811,18 +907,22 @@ export const ReturnsPage: React.FC<ReturnsPageProps> = ({
                 <div className="p-2 bg-white rounded-xl border border-slate-200">
                   <span className="text-[#64748B] block text-[10px]">{isRtl ? 'حركة المخزون الفعلي:' : 'Inventory Move:'}</span>
                   {selectedOutcome === 'restockable' && (
-                    <strong className="text-[#16A36A]">
-                      {isRtl ? '+1 إلى المخزون المتاح للبيع فوراً' : '+1 to Available Stock immediately'}
+                    <strong className="text-[#16A36A] tabular-nums">
+                      {isRtl
+                        ? `+${totalInspectUnits} إلى المخزون المتاح للبيع (${restockTarget === 'central' ? 'المستودع المركزي' : allMarketplaces.find((m) => m.id === restockTarget)?.nameAr || restockTarget})`
+                        : `+${totalInspectUnits} to Available Stock (${restockTarget})`}
                     </strong>
                   )}
                   {selectedOutcome === 'damaged' && (
-                    <strong className="text-[#DC5555]">
-                      {isRtl ? '+1 إلى المخزون التالف (0 إلى المتاح)' : '+1 to Damaged Stock (0 to Available)'}
+                    <strong className="text-[#DC5555] tabular-nums">
+                      {isRtl
+                        ? `+${totalInspectUnits} إلى المخزون التالف المستبعد من إعادة البيع (0 إلى المتاح)`
+                        : `+${totalInspectUnits} to Damaged / Rejected from Resale (0 to Available)`}
                     </strong>
                   )}
                   {selectedOutcome === 'missing' && (
                     <strong className="text-slate-700">
-                      {isRtl ? 'شطب القطعة نهائياً من العهدة' : 'Written off from custody'}
+                      {isRtl ? `شطب ${totalInspectUnits} قطعة نهائياً من العهدة` : `Written off ${totalInspectUnits} units from custody`}
                     </strong>
                   )}
                   {selectedOutcome === 'requires_action' && (
@@ -841,7 +941,7 @@ export const ReturnsPage: React.FC<ReturnsPageProps> = ({
                   )}
                   {selectedOutcome === 'damaged' && (
                     <strong className="text-[#DC5555]">
-                      {isRtl ? 'تسجيل خسارة هالك مخزون بسعر التكلفة' : 'Write-off loss recorded at base cost'}
+                      {isRtl ? 'تسجيل خسارة هالك مخزون (مستبعد من البيع) بسعر التكلفة' : 'Write-off loss recorded (excluded from resale)'}
                     </strong>
                   )}
                   {selectedOutcome === 'missing' && (
@@ -905,22 +1005,24 @@ export const ReturnsPage: React.FC<ReturnsPageProps> = ({
               <button
                 type="button"
                 onClick={() => setInspectingReturn(null)}
-                className="px-4 py-2 text-xs font-semibold text-[#64748B] hover:text-[#172033] bg-[#F7F8FA] rounded-xl transition-colors cursor-pointer"
+                className="px-4 py-2 text-xs font-semibold text-[#64748B] hover:text-[#172033] bg-[#F7F8FA] rounded-xl transition-colors cursor-pointer whitespace-nowrap shrink-0"
               >
                 {t.actions.cancel}
               </button>
 
               <button
                 type="button"
+                disabled={isSubmitting}
                 onClick={handleCommitInspection}
-                className="px-6 py-2 text-xs font-bold text-white bg-[#2563EB] hover:bg-blue-700 rounded-xl transition-colors shadow-xs cursor-pointer flex items-center gap-1.5"
+                className="px-6 py-2 text-xs font-bold text-white bg-[#2563EB] hover:bg-blue-700 disabled:opacity-50 rounded-xl transition-colors shadow-xs cursor-pointer flex items-center gap-1.5 whitespace-nowrap shrink-0"
               >
                 <Check className="w-4 h-4" />
                 <span>{isRtl ? 'اعتماد النتيجة وإغلاق دورة الفحص' : 'Commit & Finalize Return'}</span>
               </button>
             </div>
           </div>
-        )}
+          );
+        })()}
       </Modal>
 
       {/* 7. Auditable Return History & Activity Notes Modal */}

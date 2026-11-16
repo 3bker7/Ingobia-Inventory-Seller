@@ -8,11 +8,8 @@ import {
   FileCode,
   ShieldCheck,
   RefreshCw,
-  AlertTriangle,
   Layers,
   Terminal,
-  Hash,
-  Clock,
   Sparkles,
   ExternalLink,
   BookOpen,
@@ -21,6 +18,10 @@ import {
   Trash2,
   FlaskConical,
   Play,
+  Lock,
+  RotateCcw,
+  History,
+  Archive,
 } from 'lucide-react';
 import { DeveloperExportService, ProjectSnapshot, SnapshotSection } from '../../services/developerExport';
 import { storageService } from '../../services/storage';
@@ -28,24 +29,29 @@ import { Locale } from '../../locales/translations';
 import { useToast } from '../common/Toast';
 import { ConfirmDialog } from '../common/ConfirmDialog';
 
-const SHARED_PUBLISH_URL = 'https://ais-pre-jf2fibe2uk3ofofxe2hths-193553168543.europe-west3.run.app';
-
 interface DeveloperCenterPageProps {
   locale: Locale;
   onOpenTestSuite?: () => void;
   onDataChange?: () => void;
+  onLockDeveloperMode?: () => void;
 }
 
 export const DeveloperCenterPage: React.FC<DeveloperCenterPageProps> = ({
   locale,
   onOpenTestSuite,
   onDataChange,
+  onLockDeveloperMode,
 }) => {
   const isRtl = locale === 'ar';
   const { showToast } = useToast();
   const [dataRefreshTick, setDataRefreshTick] = useState(0);
   const [copiedUrl, setCopiedUrl] = useState(false);
-  const [confirmMode, setConfirmMode] = useState<'load_demo' | 'clear_all' | null>(null);
+  const [confirmState, setConfirmState] = useState<{
+    mode: 'load_demo' | 'clear_all' | 'restore_backup';
+    backupId?: string;
+  } | null>(null);
+
+  const isDevAuthorized = storageService.isDeveloperMode();
 
   const liveCounts = {
     products: storageService.getProducts().length,
@@ -53,9 +59,12 @@ export const DeveloperCenterPage: React.FC<DeveloperCenterPageProps> = ({
     returns: storageService.getReturns().length,
     transactions: storageService.getFinancialTransactions().length,
   };
-  const currentBrowserOrigin =
+
+  const backups = storageService.getPreDestructiveBackups();
+  const auditLogs = storageService.getAdminAuditLog();
+
+  const publishUrl =
     typeof window !== 'undefined' && window.location?.origin ? window.location.origin : '';
-  const publishUrl = SHARED_PUBLISH_URL;
   void dataRefreshTick;
 
   const [snapshot, setSnapshot] = useState<ProjectSnapshot>(() =>
@@ -64,6 +73,24 @@ export const DeveloperCenterPage: React.FC<DeveloperCenterPageProps> = ({
   const [currentSectionIndex, setCurrentSectionIndex] = useState(0);
   const [copiedSectionIndex, setCopiedSectionIndex] = useState<number | null>(null);
   const [copiedBatchType, setCopiedBatchType] = useState<string | null>(null);
+
+  if (!isDevAuthorized) {
+    return (
+      <div className="bg-white rounded-2xl border border-[#E8ECF2] p-8 shadow-xs text-center space-y-3 max-w-xl mx-auto">
+        <div className="w-12 h-12 rounded-xl bg-slate-100 text-slate-700 flex items-center justify-center mx-auto">
+          <Lock className="w-6 h-6" />
+        </div>
+        <h2 className="text-base font-bold text-[#172033]">
+          {isRtl ? 'مركز المطورين مقفل حالياً' : 'Developer Center Is Locked'}
+        </h2>
+        <p className="text-xs text-[#64748B] leading-relaxed">
+          {isRtl
+            ? 'للوصول إلى أدوات الفحص والتصدير النصي والبيانات التجريبية، يرجى تفعيل وضع المطور أولاً من صفحة الإعدادات.'
+            : 'Unlock Developer Mode from the Settings page to access diagnostics, backups, sandbox controls, and text exports.'}
+        </p>
+      </div>
+    );
+  }
 
   const currentSection = snapshot.sections[currentSectionIndex] || snapshot.sections[0];
 
@@ -159,12 +186,13 @@ export const DeveloperCenterPage: React.FC<DeveloperCenterPageProps> = ({
   };
 
   const handleCopyPublishUrl = async (urlToCopy: string) => {
+    if (!urlToCopy) return;
     const ok = await DeveloperExportService.copyToClipboard(urlToCopy);
     if (ok) {
       setCopiedUrl(true);
       setTimeout(() => setCopiedUrl(false), 2500);
       showToast(
-        isRtl ? 'تم نسخ رابط النشر والوصول بنجاح.' : 'Publish URL copied to clipboard.',
+        isRtl ? 'تم نسخ رابط الجلسة الحالية بنجاح.' : 'Session URL copied to clipboard.',
         'success'
       );
     } else {
@@ -182,7 +210,7 @@ export const DeveloperCenterPage: React.FC<DeveloperCenterPageProps> = ({
     onDataChange?.();
     showToast(
       isRtl
-        ? 'تم توليد بيانات المنتجات والطلبات التجريبية بنجاح داخل بيئة التجربة.'
+        ? 'تم توليد بيانات المنتجات والطلبات التجريبية بنجاح داخل بيئة التجربة (مع حفظ نسخة احتياطية قبل الاستبدال إن وجدت بيانات).'
         : 'Demo catalog, orders, returns, and ledger generated successfully.',
       'success'
     );
@@ -198,10 +226,39 @@ export const DeveloperCenterPage: React.FC<DeveloperCenterPageProps> = ({
     onDataChange?.();
     showToast(
       isRtl
-        ? 'تم مسح جميع البيانات التجريبية وإعادة المتجر نظيفاً وفارغاً جاهزاً للإنتاج.'
+        ? 'تم تفريغ المتجر والعودة للحالة الفارغة النظيفة (مع حفظ نسخة احتياطية مسبقة).'
         : 'All store operational data cleared cleanly to empty production state.',
       'success'
     );
+  };
+
+  const handleCreateManualBackup = () => {
+    storageService.createPreDestructiveBackup('نسخة يدوية من مركز المطور');
+    setDataRefreshTick((t) => t + 1);
+    showToast(
+      isRtl ? 'تم التقاط نسخة احتياطية فورية في السجل.' : 'Snapshot captured in backup history.',
+      'success'
+    );
+  };
+
+  const handleRestoreBackup = (backupId: string) => {
+    const res = storageService.restorePreDestructiveBackup(backupId);
+    if (!res.success) {
+      showToast(res.error || (isRtl ? 'فشل استعادة النسخة.' : 'Failed to restore backup.'), 'error');
+      return;
+    }
+    setDataRefreshTick((t) => t + 1);
+    onDataChange?.();
+    showToast(
+      isRtl ? 'تمت استعادة النسخة الاحتياطية بنجاح.' : 'Pre-destructive backup restored successfully.',
+      'success'
+    );
+  };
+
+  const handleLockDeveloper = () => {
+    storageService.lockDeveloperMode();
+    onLockDeveloperMode?.();
+    onDataChange?.();
   };
 
   return (
@@ -209,12 +266,12 @@ export const DeveloperCenterPage: React.FC<DeveloperCenterPageProps> = ({
       {/* 1. Header & Identity Bar */}
       <div className="bg-white rounded-3xl border border-[#E8ECF2] p-5 shadow-xs flex flex-wrap items-center justify-between gap-4">
         <div>
-          <div className="flex items-center gap-2 mb-1">
-            <span className="p-1.5 rounded-xl bg-purple-50 text-purple-700 border border-purple-200">
+          <div className="flex items-center gap-2 mb-1 flex-wrap">
+            <span className="p-1.5 rounded-xl bg-slate-100 text-[#172033] border border-[#E8ECF2]">
               <Terminal className="w-5 h-5" />
             </span>
             <h2 className="text-base font-bold text-[#172033]">
-              {isRtl ? 'مركز المطورين – التصدير النصي الشامل للمشروع' : 'Developer Center – Full Text-Based Project Export'}
+              {isRtl ? 'مركز المطورين – الفحص والتشخيص والتصدير النصي' : 'Developer Center – Diagnostics & Text Export'}
             </h2>
             <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-slate-900 text-white font-mono-code">
               TEXT-ONLY INSPECTION
@@ -222,16 +279,16 @@ export const DeveloperCenterPage: React.FC<DeveloperCenterPageProps> = ({
           </div>
           <p className="text-xs text-[#64748B]">
             {isRtl
-              ? 'فحص وتصدير شامل لشيفرة المشروع ومعماريته مقسمة إلى أجزاء مرقمة قابلة للنسخ دون ملفات مضغوطة.'
-              : 'Complete text-based project inspection and export divided into numbered sections without ZIP archives.'}
+              ? 'فحص وتصدير شامل للمشروع، النسخ الاحتياطي قبل التعديل، سجل التدقيق، وبيئة الاختبار المعزولة.'
+              : 'Text-based inspection, pre-destructive backups, admin audit trail, and isolated sandbox controls.'}
           </p>
         </div>
 
-        <div className="flex items-center gap-2.5">
+        <div className="flex items-center gap-2 flex-wrap">
           <button
             type="button"
             onClick={handleGenerateNewSnapshot}
-            className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-[#172033] hover:text-[#2563EB] bg-[#F7F8FA] hover:bg-blue-50 border border-[#E8ECF2] rounded-xl transition-colors cursor-pointer"
+            className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-[#172033] hover:text-[#2563EB] bg-[#F7F8FA] hover:bg-blue-50 border border-[#E8ECF2] rounded-xl transition-colors cursor-pointer whitespace-nowrap shrink-0"
           >
             <RefreshCw className="w-3.5 h-3.5" />
             <span>{isRtl ? 'توليد لقطة جديدة' : 'New Snapshot'}</span>
@@ -240,10 +297,19 @@ export const DeveloperCenterPage: React.FC<DeveloperCenterPageProps> = ({
           <button
             type="button"
             onClick={handleCopyAllSnapshot}
-            className="flex items-center gap-1.5 px-4 py-2 text-xs font-bold text-white bg-[#2563EB] hover:bg-blue-700 rounded-xl transition-colors shadow-xs cursor-pointer"
+            className="flex items-center gap-1.5 px-4 py-2 text-xs font-bold text-white bg-[#2563EB] hover:bg-blue-700 rounded-xl transition-colors shadow-xs cursor-pointer whitespace-nowrap shrink-0"
           >
             {copiedBatchType === 'all' ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
             <span>{isRtl ? 'نسخ كامل لقطة المشروع' : 'Copy Full Snapshot'}</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={handleLockDeveloper}
+            className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-[#172033] bg-[#F7F8FA] hover:bg-slate-200 border border-[#E8ECF2] rounded-xl transition-colors cursor-pointer whitespace-nowrap shrink-0"
+          >
+            <Lock className="w-3.5 h-3.5" />
+            <span>{isRtl ? 'قفل وضع المطور' : 'Lock Developer Mode'}</span>
           </button>
         </div>
       </div>
@@ -264,7 +330,7 @@ export const DeveloperCenterPage: React.FC<DeveloperCenterPageProps> = ({
 
         <div className="bg-white p-3.5 rounded-2xl border border-[#E8ECF2] shadow-xs">
           <span className="text-[10px] font-semibold text-[#64748B] block mb-1">
-            {isRtl ? 'حساب المطور المصرح' : 'Authorized Developer'}
+            {isRtl ? 'دور الجلسة المصرحة' : 'Session Role'}
           </span>
           <div className="flex items-center gap-1.5">
             <span className="w-2 h-2 rounded-full bg-emerald-500 shrink-0" />
@@ -273,7 +339,7 @@ export const DeveloperCenterPage: React.FC<DeveloperCenterPageProps> = ({
             </span>
           </div>
           <span className="text-[10px] text-emerald-700 block mt-1 font-semibold">
-            {isRtl ? 'وصول كامل موثق' : 'Full access granted'}
+            {isRtl ? 'وصول محلي مصرح به' : 'Authorized local session'}
           </span>
         </div>
 
@@ -281,17 +347,17 @@ export const DeveloperCenterPage: React.FC<DeveloperCenterPageProps> = ({
           <span className="text-[10px] font-semibold text-[#64748B] block mb-1">
             {isRtl ? 'الأجزاء المرقمة' : 'Numbered Sections'}
           </span>
-          <span className="text-xl font-bold font-mono-code text-[#2563EB]">
+          <span className="text-xl font-bold font-mono-code text-[#2563EB] tabular-nums">
             {snapshot.manifest.totalSections} {isRtl ? 'أقسام' : 'Parts'}
           </span>
-          <span className="text-[10px] text-[#64748B] block mt-0.5">
+          <span className="text-[10px] text-[#64748B] block mt-0.5 tabular-nums">
             {snapshot.manifest.totalSourceFiles} {isRtl ? 'ملف مصدري' : 'source files'}
           </span>
         </div>
 
         <div className="bg-white p-3.5 rounded-2xl border border-[#E8ECF2] shadow-xs">
           <span className="text-[10px] font-semibold text-[#64748B] block mb-1">
-            {isRtl ? 'حالة الاكتمال' : 'Integrity Status'}
+            {isRtl ? 'توقيع الحزمة الحتمي' : 'Deterministic Hash'}
           </span>
           <div className="flex items-center gap-1.5 text-emerald-600">
             <ShieldCheck className="w-4 h-4 shrink-0" />
@@ -299,7 +365,7 @@ export const DeveloperCenterPage: React.FC<DeveloperCenterPageProps> = ({
               {snapshot.manifest.systemIntegrityHash.slice(0, 14)}
             </span>
           </div>
-          <span className="text-[10px] text-[#64748B] block mt-0.5">
+          <span className="text-[10px] text-[#64748B] block mt-0.5 tabular-nums">
             {new Date(snapshot.manifest.exportTimestamp).toLocaleTimeString(
               isRtl ? 'ar-SA' : 'en-US',
               { hour: '2-digit', minute: '2-digit' }
@@ -308,97 +374,91 @@ export const DeveloperCenterPage: React.FC<DeveloperCenterPageProps> = ({
         </div>
       </div>
 
-      {/* 2.5 Developer Publish Link & Isolated QA/Demo Controls */}
+      {/* 2.5 Runtime Session Link & Isolated QA/Demo Controls */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        {/* Site Publish & Browser Access Link */}
         <div className="bg-white rounded-3xl border border-[#E8ECF2] p-5 shadow-xs space-y-3.5">
-          <div className="flex items-center justify-between gap-2">
-            <div className="flex items-center gap-2">
-              <span className="p-1.5 rounded-xl bg-blue-50 text-[#2563EB] border border-blue-200">
-                <Globe className="w-4 h-4" />
-              </span>
-              <div>
-                <h3 className="text-sm font-bold text-[#172033]">
-                  {isRtl ? 'رابط نشر الموقع والدخول من أي متصفح' : 'Live Site Publish & Browser Access URL'}
-                </h3>
-                <p className="text-[11px] text-[#64748B]">
-                  {isRtl
-                    ? 'رابط النشر العام لفتح المنصة واختبارها من أي جهاز أو متصفح.'
-                    : 'Shareable deployment URL for testing and accessing the live app from any browser.'}
-                </p>
+          <div className="flex items-center gap-2">
+            <span className="p-1.5 rounded-xl bg-blue-50 text-[#2563EB] border border-blue-200">
+              <Globe className="w-4 h-4" />
+            </span>
+            <div>
+              <h3 className="text-sm font-bold text-[#172033]">
+                {isRtl ? 'رابط الجلسة الحية والدخول من المتصفح' : 'Live Session Origin URL'}
+              </h3>
+              <p className="text-[11px] text-[#64748B]">
+                {isRtl
+                  ? 'يتم توليد الرابط ديناميكياً من عنوان النشر الفعلي الحالي دون أي روابط ثابتة.'
+                  : 'Dynamically resolved from window.location.origin with zero hardcoded deployment URLs.'}
+              </p>
+            </div>
+          </div>
+
+          {publishUrl ? (
+            <div className="p-3 bg-[#F7F8FA] rounded-2xl border border-[#E8ECF2] flex flex-wrap items-center justify-between gap-2.5">
+              <code className="text-xs font-mono-code text-[#172033] break-all flex-1 min-w-[200px]" dir="ltr">
+                {publishUrl}
+              </code>
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => handleCopyPublishUrl(publishUrl)}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-[#172033] bg-white hover:bg-slate-100 border border-[#E8ECF2] rounded-xl transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                >
+                  {copiedUrl ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5 text-[#2563EB]" />}
+                  <span>{isRtl ? 'نسخ الرابط' : 'Copy URL'}</span>
+                </button>
+                <a
+                  href={publishUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-white bg-[#2563EB] hover:bg-blue-700 rounded-xl transition-colors whitespace-nowrap shrink-0"
+                >
+                  <ExternalLink className="w-3.5 h-3.5" />
+                  <span>{isRtl ? 'فتح نافذة' : 'Open Tab'}</span>
+                </a>
               </div>
             </div>
-          </div>
-
-          <div className="p-3 bg-[#F7F8FA] rounded-2xl border border-[#E8ECF2] flex flex-wrap items-center justify-between gap-2.5">
-            <code className="text-xs font-mono-code text-[#172033] break-all flex-1 min-w-[200px]" dir="ltr">
-              {publishUrl}
-            </code>
-            <div className="flex items-center gap-2 shrink-0">
-              <button
-                type="button"
-                onClick={() => handleCopyPublishUrl(publishUrl)}
-                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-[#172033] bg-white hover:bg-slate-100 border border-[#E8ECF2] rounded-xl transition-colors cursor-pointer"
-              >
-                {copiedUrl ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5 text-[#2563EB]" />}
-                <span>{isRtl ? 'نسخ الرابط' : 'Copy URL'}</span>
-              </button>
-              <a
-                href={publishUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold text-white bg-[#2563EB] hover:bg-blue-700 rounded-xl transition-colors"
-              >
-                <ExternalLink className="w-3.5 h-3.5" />
-                <span>{isRtl ? 'فتح الموقع' : 'Open App'}</span>
-              </a>
-            </div>
-          </div>
-
-          {currentBrowserOrigin && currentBrowserOrigin !== publishUrl && (
-            <div className="flex items-center justify-between gap-2 text-[11px] text-[#64748B] px-1">
-              <span>{isRtl ? 'رابط الجلسة الحالية:' : 'Current session origin:'}</span>
-              <code className="font-mono-code text-[#172033]" dir="ltr">{currentBrowserOrigin}</code>
+          ) : (
+            <div className="p-3 bg-[#F7F8FA] rounded-2xl border border-[#E8ECF2] text-xs text-[#64748B]">
+              {isRtl ? 'لا يتوفر عنوان متصفح نشط في هذه البيئة.' : 'No active browser origin detected.'}
             </div>
           )}
         </div>
 
         {/* Developer-Only Demo Data & Logic Test Suite */}
         <div className="bg-white rounded-3xl border border-[#E8ECF2] p-5 shadow-xs space-y-3.5">
-          <div className="flex items-center justify-between gap-2">
-            <div className="flex items-center gap-2">
-              <span className="p-1.5 rounded-xl bg-amber-50 text-amber-700 border border-amber-200">
-                <Database className="w-4 h-4" />
-              </span>
-              <div>
-                <h3 className="text-sm font-bold text-[#172033]">
-                  {isRtl ? 'بيئة التجربة والاختبار (للمطور فقط)' : 'Developer QA & Demo Data Sandbox'}
-                </h3>
-                <p className="text-[11px] text-[#64748B]">
-                  {isRtl
-                    ? 'يبدأ المتجر العام فارغاً تماماً بدون أي منتجات وهمية؛ يمكنك توليد بيانات تجريبية أو مسحها هنا فقط.'
-                    : 'Public storefront starts completely empty; generate trial data or run isolated QA tests strictly here.'}
-                </p>
-              </div>
+          <div className="flex items-center gap-2">
+            <span className="p-1.5 rounded-xl bg-amber-50 text-amber-700 border border-amber-200">
+              <Database className="w-4 h-4" />
+            </span>
+            <div>
+              <h3 className="text-sm font-bold text-[#172033]">
+                {isRtl ? 'بيئة التجربة والاختبار (للمطور فقط)' : 'Developer QA & Demo Data Sandbox'}
+              </h3>
+              <p className="text-[11px] text-[#64748B]">
+                {isRtl
+                  ? 'يحفظ النظام نسخة احتياطية قبل أي توليد بيانات تجريبية أو تفريغ للمتجر.'
+                  : 'Automatic pre-destructive backup is captured before seeding demo data or clearing store records.'}
+              </p>
             </div>
           </div>
 
           <div className="grid grid-cols-4 gap-2 text-center text-[11px]">
             <div className="p-2 bg-[#F7F8FA] rounded-xl border border-[#E8ECF2]">
               <span className="text-[#64748B] block">{isRtl ? 'المنتجات' : 'Products'}</span>
-              <strong className="text-sm font-mono-code text-[#172033]">{liveCounts.products}</strong>
+              <strong className="text-sm font-mono-code text-[#172033] tabular-nums">{liveCounts.products}</strong>
             </div>
             <div className="p-2 bg-[#F7F8FA] rounded-xl border border-[#E8ECF2]">
               <span className="text-[#64748B] block">{isRtl ? 'الطلبات' : 'Orders'}</span>
-              <strong className="text-sm font-mono-code text-[#172033]">{liveCounts.orders}</strong>
+              <strong className="text-sm font-mono-code text-[#172033] tabular-nums">{liveCounts.orders}</strong>
             </div>
             <div className="p-2 bg-[#F7F8FA] rounded-xl border border-[#E8ECF2]">
               <span className="text-[#64748B] block">{isRtl ? 'المرتجعات' : 'Returns'}</span>
-              <strong className="text-sm font-mono-code text-[#172033]">{liveCounts.returns}</strong>
+              <strong className="text-sm font-mono-code text-[#172033] tabular-nums">{liveCounts.returns}</strong>
             </div>
             <div className="p-2 bg-[#F7F8FA] rounded-xl border border-[#E8ECF2]">
               <span className="text-[#64748B] block">{isRtl ? 'القيود' : 'Ledger'}</span>
-              <strong className="text-sm font-mono-code text-[#172033]">{liveCounts.transactions}</strong>
+              <strong className="text-sm font-mono-code text-[#172033] tabular-nums">{liveCounts.transactions}</strong>
             </div>
           </div>
 
@@ -407,36 +467,141 @@ export const DeveloperCenterPage: React.FC<DeveloperCenterPageProps> = ({
               type="button"
               onClick={() =>
                 liveCounts.products > 0 || liveCounts.orders > 0
-                  ? setConfirmMode('load_demo')
+                  ? setConfirmState({ mode: 'load_demo' })
                   : handleLoadDemoData()
               }
-              className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded-xl transition-colors cursor-pointer"
+              className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded-xl transition-colors cursor-pointer whitespace-nowrap shrink-0"
             >
               <Sparkles className="w-3.5 h-3.5" />
-              <span>{isRtl ? 'توليد بيانات وهمية للتجربة' : 'Generate Demo Data'}</span>
+              <span>{isRtl ? 'توليد بيانات تجريبية' : 'Generate Demo Data'}</span>
             </button>
 
             <button
               type="button"
-              onClick={() => setConfirmMode('clear_all')}
-              className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold text-[#DC5555] bg-rose-50 hover:bg-rose-100 border border-rose-200 rounded-xl transition-colors cursor-pointer"
+              onClick={() => setConfirmState({ mode: 'clear_all' })}
+              className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold text-[#DC5555] bg-rose-50 hover:bg-rose-100 border border-rose-200 rounded-xl transition-colors cursor-pointer whitespace-nowrap shrink-0"
             >
               <Trash2 className="w-3.5 h-3.5" />
-              <span>{isRtl ? 'تفريغ المتجر للإطلاق (صفر بيانات)' : 'Clear Store to Empty'}</span>
+              <span>{isRtl ? 'تفريغ المتجر (صفر بيانات)' : 'Clear Store'}</span>
             </button>
 
             {onOpenTestSuite && (
               <button
                 type="button"
                 onClick={onOpenTestSuite}
-                className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold text-purple-800 bg-purple-50 hover:bg-purple-100 border border-purple-200 rounded-xl transition-colors cursor-pointer ms-auto"
+                className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-bold text-[#172033] bg-[#F7F8FA] hover:bg-slate-200 border border-[#E8ECF2] rounded-xl transition-colors cursor-pointer ms-auto whitespace-nowrap shrink-0"
               >
-                <FlaskConical className="w-3.5 h-3.5 text-purple-600" />
-                <span>{isRtl ? 'حزمة اختبارات قواعد العمليات' : 'Operations Test Suite'}</span>
+                <FlaskConical className="w-3.5 h-3.5 text-[#2563EB]" />
+                <span>{isRtl ? 'اختبارات قواعد العمليات' : 'Operations Test Suite'}</span>
                 <Play className="w-3 h-3" />
               </button>
             )}
           </div>
+        </div>
+      </div>
+
+      {/* 2.75 Pre-Destructive Backups & Admin Audit Log */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        {/* Backups Viewer */}
+        <div className="bg-white rounded-3xl border border-[#E8ECF2] p-5 shadow-xs space-y-3">
+          <div className="flex items-center justify-between gap-2 pb-2.5 border-b border-[#E8ECF2]">
+            <div className="flex items-center gap-2">
+              <Archive className="w-4 h-4 text-[#2563EB]" />
+              <h3 className="text-sm font-bold text-[#172033]">
+                {isRtl ? 'النسخ الاحتياطية قبل التعديل (Pre-Destructive)' : 'Pre-Destructive Backups'}
+              </h3>
+            </div>
+            <button
+              type="button"
+              onClick={handleCreateManualBackup}
+              className="px-3 py-1 text-[11px] font-semibold text-[#2563EB] bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded-lg cursor-pointer whitespace-nowrap shrink-0"
+            >
+              {isRtl ? 'التقاط نسخة الآن' : 'Capture Snapshot'}
+            </button>
+          </div>
+
+          {backups.length === 0 ? (
+            <div className="text-xs text-[#64748B] py-4 text-center">
+              {isRtl
+                ? 'لا توجد نسخ احتياطية مسبقة مسجلة لهذا المتجر بعد.'
+                : 'No pre-destructive backups captured for this workspace yet.'}
+            </div>
+          ) : (
+            <div className="space-y-2 max-h-56 overflow-y-auto pe-1">
+              {backups.map((bkp) => (
+                <div
+                  key={bkp.id}
+                  className="p-3 bg-[#F7F8FA] rounded-xl border border-[#E8ECF2] flex items-center justify-between gap-2 text-xs"
+                >
+                  <div className="min-w-0">
+                    <div className="font-bold text-[#172033] truncate">{bkp.reason}</div>
+                    <div className="text-[10px] text-[#64748B] font-mono-code mt-0.5">
+                      {new Date(bkp.createdAt).toLocaleString(isRtl ? 'ar-SA' : 'en-US')} ·{' '}
+                      {bkp.data.products.length} SKU / {bkp.data.orders.length} ORD
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setConfirmState({ mode: 'restore_backup', backupId: bkp.id })}
+                    className="flex items-center gap-1 px-2.5 py-1.5 text-[11px] font-bold text-[#2563EB] bg-white hover:bg-blue-50 border border-blue-200 rounded-lg cursor-pointer whitespace-nowrap shrink-0"
+                  >
+                    <RotateCcw className="w-3 h-3" />
+                    <span>{isRtl ? 'استعادة' : 'Restore'}</span>
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Admin Audit Log Viewer */}
+        <div className="bg-white rounded-3xl border border-[#E8ECF2] p-5 shadow-xs space-y-3">
+          <div className="flex items-center justify-between gap-2 pb-2.5 border-b border-[#E8ECF2]">
+            <div className="flex items-center gap-2">
+              <History className="w-4 h-4 text-[#172033]" />
+              <h3 className="text-sm font-bold text-[#172033]">
+                {isRtl ? 'سجل التدقيق الإداري والعمليات الحساسة' : 'Admin & Security Audit Log'}
+              </h3>
+            </div>
+            <span className="text-[11px] font-mono-code text-[#64748B] tabular-nums">
+              {auditLogs.length} {isRtl ? 'قيد' : 'entries'}
+            </span>
+          </div>
+
+          {auditLogs.length === 0 ? (
+            <div className="text-xs text-[#64748B] py-4 text-center">
+              {isRtl ? 'السجل الإداري فارغ حالياً.' : 'No admin audit events recorded yet.'}
+            </div>
+          ) : (
+            <div className="space-y-2 max-h-56 overflow-y-auto pe-1">
+              {auditLogs.slice(0, 20).map((entry) => (
+                <div
+                  key={entry.id}
+                  className="p-2.5 bg-[#F7F8FA] rounded-xl border border-[#E8ECF2] text-[11px] space-y-1"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-mono-code font-bold text-[#172033]">
+                      {entry.action}
+                    </span>
+                    <span
+                      className={`px-1.5 py-0.5 rounded text-[9px] font-bold ${
+                        entry.success
+                          ? 'bg-emerald-100 text-emerald-800'
+                          : 'bg-rose-100 text-rose-800'
+                      }`}
+                    >
+                      {entry.success ? 'OK' : 'DENIED'}
+                    </span>
+                  </div>
+                  <div className="text-[#475569]">{entry.details}</div>
+                  <div className="text-[10px] text-[#64748B] font-mono-code">
+                    {new Date(entry.timestamp).toLocaleString(isRtl ? 'ar-SA' : 'en-US')} ·{' '}
+                    {entry.actorRole} · {entry.merchantId}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       </div>
 
@@ -455,16 +620,16 @@ export const DeveloperCenterPage: React.FC<DeveloperCenterPageProps> = ({
           <button
             type="button"
             onClick={handleCopyAllSourceCode}
-            className="px-3 py-1.5 rounded-lg border border-[#E8ECF2] bg-white hover:bg-slate-50 font-semibold text-[#172033] flex items-center gap-1.5 cursor-pointer"
+            className="px-3 py-1.5 rounded-lg border border-[#E8ECF2] bg-white hover:bg-slate-50 font-semibold text-[#172033] flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0"
           >
-            {copiedBatchType === 'code' ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Code2 className="w-3.5 h-3.5 text-purple-600" />}
+            {copiedBatchType === 'code' ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Code2 className="w-3.5 h-3.5 text-[#2563EB]" />}
             <span>{isRtl ? 'نسخ الأكواد البرمجية فقط' : 'Copy Source Code Only'}</span>
           </button>
 
           <button
             type="button"
             onClick={handleCopyAllDocumentation}
-            className="px-3 py-1.5 rounded-lg border border-[#E8ECF2] bg-white hover:bg-slate-50 font-semibold text-[#172033] flex items-center gap-1.5 cursor-pointer"
+            className="px-3 py-1.5 rounded-lg border border-[#E8ECF2] bg-white hover:bg-slate-50 font-semibold text-[#172033] flex items-center gap-1.5 cursor-pointer whitespace-nowrap shrink-0"
           >
             {copiedBatchType === 'docs' ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <FileCode className="w-3.5 h-3.5 text-blue-600" />}
             <span>{isRtl ? 'نسخ التوثيق والمعمارية فقط' : 'Copy Documentation Only'}</span>
@@ -474,11 +639,10 @@ export const DeveloperCenterPage: React.FC<DeveloperCenterPageProps> = ({
 
       {/* 4. Section Selector & Active Section Viewer */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
-        {/* Sidebar: Numbered Sections List */}
         <div className="lg:col-span-4 space-y-2">
           <div className="text-xs font-bold text-[#172033] px-1 flex items-center justify-between">
             <span>{isRtl ? 'فهرس أقسام المشروع' : 'Section Index'}</span>
-            <span className="text-[11px] text-[#64748B]">
+            <span className="text-[11px] text-[#64748B] tabular-nums">
               {currentSectionIndex + 1} / {snapshot.sections.length}
             </span>
           </div>
@@ -515,7 +679,7 @@ export const DeveloperCenterPage: React.FC<DeveloperCenterPageProps> = ({
                       <span
                         className={`text-[9px] font-bold px-1.5 py-0.2 rounded ${
                           sec.classification === 'ACTUAL_SOURCE_CODE'
-                            ? 'bg-purple-100 text-purple-800'
+                            ? 'bg-blue-100 text-blue-800'
                             : sec.classification === 'VERIFIED_AUDIT'
                             ? 'bg-emerald-100 text-emerald-800'
                             : 'bg-slate-100 text-slate-700'
@@ -534,10 +698,8 @@ export const DeveloperCenterPage: React.FC<DeveloperCenterPageProps> = ({
           </div>
         </div>
 
-        {/* Main Content: Current Section Details & Text Viewer */}
         <div className="lg:col-span-8 space-y-4">
           <div className="bg-white rounded-3xl border border-[#E8ECF2] p-5 shadow-xs space-y-4">
-            {/* Section Header */}
             <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-[#E8ECF2]">
               <div>
                 <div className="flex items-center gap-2">
@@ -547,10 +709,10 @@ export const DeveloperCenterPage: React.FC<DeveloperCenterPageProps> = ({
                   <span
                     className={`text-[10px] font-bold px-2 py-0.5 rounded-md ${
                       currentSection.classification === 'ACTUAL_SOURCE_CODE'
-                        ? 'bg-purple-100 text-purple-800'
+                        ? 'bg-blue-100 text-blue-800'
                         : currentSection.classification === 'VERIFIED_AUDIT'
                         ? 'bg-emerald-100 text-emerald-800'
-                        : 'bg-blue-100 text-blue-800'
+                        : 'bg-slate-100 text-slate-800'
                     }`}
                   >
                     {currentSection.classification}
@@ -561,11 +723,10 @@ export const DeveloperCenterPage: React.FC<DeveloperCenterPageProps> = ({
                 </h3>
               </div>
 
-              {/* Action: Copy this section */}
               <button
                 type="button"
                 onClick={() => handleCopySection(currentSection, currentSectionIndex)}
-                className="flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-bold text-[#172033] hover:text-white bg-[#F7F8FA] hover:bg-[#2563EB] border border-[#E8ECF2] hover:border-[#2563EB] rounded-xl transition-all cursor-pointer shadow-2xs"
+                className="flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-bold text-[#172033] hover:text-white bg-[#F7F8FA] hover:bg-[#2563EB] border border-[#E8ECF2] hover:border-[#2563EB] rounded-xl transition-all cursor-pointer shadow-2xs whitespace-nowrap shrink-0"
               >
                 {copiedSectionIndex === currentSectionIndex ? (
                   <>
@@ -581,7 +742,6 @@ export const DeveloperCenterPage: React.FC<DeveloperCenterPageProps> = ({
               </button>
             </div>
 
-            {/* Source files pills */}
             <div className="flex items-center gap-2 flex-wrap text-[11px]">
               <span className="font-semibold text-[#64748B]">
                 {isRtl ? 'الملفات المرجعية:' : 'Source Files:'}
@@ -596,12 +756,10 @@ export const DeveloperCenterPage: React.FC<DeveloperCenterPageProps> = ({
               ))}
             </div>
 
-            {/* Content text viewer */}
             <div className="relative rounded-2xl bg-slate-950 text-slate-100 p-4 font-mono text-xs overflow-x-auto leading-relaxed max-h-[500px] border border-slate-800 select-text">
               <pre className="whitespace-pre-wrap break-words">{currentSection.content}</pre>
             </div>
 
-            {/* Completion marker if last section */}
             {currentSection.sectionNumber === currentSection.totalSections && (
               <div className="p-3.5 bg-emerald-50 border border-emerald-200 rounded-2xl flex items-center justify-between text-xs text-emerald-800 font-bold">
                 <div className="flex items-center gap-2">
@@ -614,13 +772,12 @@ export const DeveloperCenterPage: React.FC<DeveloperCenterPageProps> = ({
               </div>
             )}
 
-            {/* Stepper Controls: Previous / Next Section */}
             <div className="flex items-center justify-between pt-3 border-t border-[#E8ECF2]">
               <button
                 type="button"
                 disabled={currentSectionIndex === 0}
                 onClick={() => setCurrentSectionIndex((prev) => Math.max(0, prev - 1))}
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold transition-colors cursor-pointer ${
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
                   currentSectionIndex === 0
                     ? 'text-slate-400 bg-slate-100 cursor-not-allowed'
                     : 'text-[#172033] bg-[#F7F8FA] hover:bg-slate-200 border border-[#E8ECF2]'
@@ -630,7 +787,7 @@ export const DeveloperCenterPage: React.FC<DeveloperCenterPageProps> = ({
                 <span>{isRtl ? 'الجزء السابق' : 'Previous Section'}</span>
               </button>
 
-              <span className="text-xs text-[#64748B] font-mono-code">
+              <span className="text-xs text-[#64748B] font-mono-code tabular-nums">
                 {currentSectionIndex + 1} / {snapshot.sections.length}
               </span>
 
@@ -642,7 +799,7 @@ export const DeveloperCenterPage: React.FC<DeveloperCenterPageProps> = ({
                     Math.min(snapshot.sections.length - 1, prev + 1)
                   )
                 }
-                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold transition-colors cursor-pointer ${
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
                   currentSectionIndex === snapshot.sections.length - 1
                     ? 'text-slate-400 bg-slate-100 cursor-not-allowed'
                     : 'text-[#172033] bg-[#F7F8FA] hover:bg-slate-200 border border-[#E8ECF2]'
@@ -657,34 +814,45 @@ export const DeveloperCenterPage: React.FC<DeveloperCenterPageProps> = ({
       </div>
 
       <ConfirmDialog
-        isOpen={confirmMode !== null}
-        onClose={() => setConfirmMode(null)}
+        isOpen={confirmState !== null}
+        onClose={() => setConfirmState(null)}
         onConfirm={() => {
-          if (confirmMode === 'load_demo') handleLoadDemoData();
-          if (confirmMode === 'clear_all') handleClearAllData();
-          setConfirmMode(null);
+          if (confirmState?.mode === 'load_demo') handleLoadDemoData();
+          if (confirmState?.mode === 'clear_all') handleClearAllData();
+          if (confirmState?.mode === 'restore_backup' && confirmState.backupId) {
+            handleRestoreBackup(confirmState.backupId);
+          }
+          setConfirmState(null);
         }}
         title={
-          confirmMode === 'load_demo'
+          confirmState?.mode === 'load_demo'
             ? isRtl
               ? 'توليد بيانات تجريبية داخل بيئة المطور'
               : 'Generate Demo Trial Dataset'
+            : confirmState?.mode === 'restore_backup'
+            ? isRtl
+              ? 'استعادة نسخة احتياطية مسبقة'
+              : 'Restore Pre-Destructive Backup'
             : isRtl
             ? 'تفريغ المتجر والعودة للحالة الفارغة'
             : 'Clear All Operational Store Data'
         }
         description={
-          confirmMode === 'load_demo'
+          confirmState?.mode === 'load_demo'
             ? isRtl
-              ? 'سيتم استبدال السجلات الحالية ببيانات تجريبية متزامنة لاختبار الطلبات والمرتجعات والدفتر المالي قبل الاعتماد.'
-              : 'This replaces current store records with synchronized demo products, orders, returns, and ledger entries for pre-launch QA.'
+              ? 'سيتم حفظ نسخة احتياطية من البيانات الحالية تلقائياً ثم استبدالها ببيانات تجريبية متزامنة للاختبار.'
+              : 'Automatically snapshots current store data first, then replaces it with synchronized demo data for QA.'
+            : confirmState?.mode === 'restore_backup'
+            ? isRtl
+              ? 'سيتم استرجاع جميع المنتجات والطلبات والمرتجعات والقيود المالية من هذه اللقطة.'
+              : 'All products, orders, returns, movements, and financial ledger entries from this snapshot will be restored.'
             : isRtl
-            ? 'سيتم مسح جميع المنتجات والطلبات والمرتجعات والحركات والقيود المالية ليصبح المتجر فارغاً تماماً وجاهزاً للإطلاق الفعلي.'
-            : 'All products, orders, returns, movements, and financial transactions will be cleared to an empty production state.'
+            ? 'سيتم حفظ نسخة احتياطية مسبقة ثم مسح جميع المنتجات والطلبات والمرتجعات والحركات والقيود المالية ليصبح المتجر فارغاً.'
+            : 'Automatically snapshots current records first, then clears operational entities back to an empty production state.'
         }
         confirmText={isRtl ? 'تأكيد التنفيذ' : 'Confirm'}
         cancelText={isRtl ? 'إلغاء' : 'Cancel'}
-        isDestructive={confirmMode === 'clear_all'}
+        isDestructive={confirmState?.mode === 'clear_all'}
       />
     </div>
   );

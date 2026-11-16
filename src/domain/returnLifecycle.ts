@@ -1,13 +1,16 @@
 /**
  * Pure Return & Technical Inspection State Machine.
  * Enforces strict custody isolation across return stages, blocks stage skipping/reversals,
- * and handles both pre-delivery and post-delivery returns consistently.
+ * supports partial returns bounded by ordered quantity, supports explicit restock target
+ * (central warehouse or active platform), and handles pre/post delivery returns consistently.
  */
 
 import {
   FinancialTransaction,
   InspectionOutcome,
+  MarketplaceId,
   Order,
+  OrderItem,
   Product,
   ReturnRecord,
   ReturnStatus,
@@ -37,6 +40,43 @@ export function isValidReturnTransition(from: ReturnStatus, to: ReturnStatus): b
   return ALLOWED_RETURN_TRANSITIONS[from]?.includes(to) ?? false;
 }
 
+/**
+ * Computes per-item remaining eligible return quantities for an order,
+ * accounting for prior partial or full returns.
+ */
+export function getOrderReturnableItems(
+  order: Order,
+  returns: ReturnRecord[]
+): Array<{
+  item: OrderItem;
+  orderedQty: number;
+  alreadyReturnedQty: number;
+  remainingQty: number;
+}> {
+  const orderReturns = returns.filter((r) => r.orderId === order.id);
+
+  return order.items.map((item) => {
+    let returned = 0;
+    for (const r of orderReturns) {
+      for (const rItem of r.items) {
+        if (
+          rItem.productId === item.productId ||
+          (item.productSku && rItem.productSku === item.productSku)
+        ) {
+          returned += rItem.quantity;
+        }
+      }
+    }
+    const remainingQty = Math.max(0, item.quantity - returned);
+    return {
+      item,
+      orderedQty: item.quantity,
+      alreadyReturnedQty: returned,
+      remainingQty,
+    };
+  });
+}
+
 export function advanceReturnStatusPure(params: {
   returnId: string;
   targetStatus: ReturnStatus;
@@ -44,6 +84,7 @@ export function advanceReturnStatusPure(params: {
   products: Product[];
   orders: Order[];
   operator?: string;
+  merchantId?: string;
   notes?: string;
   shipment?: Partial<ShipmentRecord>;
   nowIso?: string;
@@ -61,6 +102,7 @@ export function advanceReturnStatusPure(params: {
     products: rawProducts,
     orders = [],
     operator = 'مدير العمليات',
+    merchantId,
     notes,
     shipment,
     nowIso = new Date().toISOString(),
@@ -120,40 +162,52 @@ export function advanceReturnStatusPure(params: {
     ret.isPostDeliveryReturn === true || Boolean(associatedOrder && associatedOrder.deliveredProcessed);
 
   if (targetStatus === 'received_at_warehouse') {
-    for (const item of ret.items) {
-      const product = products.find(
+    for (let i = 0; i < ret.items.length; i++) {
+      const item = ret.items[i];
+      const prodIdx = products.findIndex(
         (p) => p.id === item.productId || (item.productSku && p.sku === item.productSku)
       );
-      if (product) {
+      if (prodIdx >= 0) {
+        let product = products[prodIdx];
         const prevAvail = product.availableStock;
         const prevPhys = product.physicalStock;
+        const prevAwait = product.awaitingInspectionStock || 0;
 
-        product.returnInTransitStock = Math.max(0, (product.returnInTransitStock || 0) - item.quantity);
-        product.awaitingInspectionStock = (product.awaitingInspectionStock || 0) + item.quantity;
-
-        // Post-delivery items had previously left physicalStock on delivery; restore warehouse physical count on dock receipt.
-        if (isPostDelivery && !ret.physicalRestoredAtReceipt) {
-          product.physicalStock += item.quantity;
-        }
-
-        product.updatedAt = nowIso;
+        product = normalizeProductCustody({
+          ...product,
+          returnInTransitStock: Math.max(0, (product.returnInTransitStock || 0) - item.quantity),
+          awaitingInspectionStock: prevAwait + item.quantity,
+          physicalStock:
+            isPostDelivery && !ret.physicalRestoredAtReceipt
+              ? prevPhys + item.quantity
+              : prevPhys,
+          updatedAt: nowIso,
+        });
+        products[prodIdx] = product;
 
         newMovements.push({
-          id: `mov-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+          id: `mov-${Date.now()}-${i}-${Math.random().toString(36).substring(2, 6)}`,
+          merchantId: ret.merchantId || product.merchantId,
           productId: product.id,
           productSku: product.sku || product.name,
           productName: product.name,
           marketplaceId: ret.marketplaceId,
+          platformId: ret.marketplaceId,
+          source: 'return_transit',
+          destination: 'awaiting_inspection',
           type: 'return_received_warehouse',
           quantityChange: isPostDelivery && !ret.physicalRestoredAtReceipt ? item.quantity : 0,
           previousPhysical: prevPhys,
           newPhysical: product.physicalStock,
           previousAvailable: prevAvail,
           newAvailable: product.availableStock,
+          beforeQty: prevAwait,
+          afterQty: product.awaitingInspectionStock,
           fromCustody: 'مرتجع في طريق العودة',
           toCustody: 'بانتظار الفحص بالمستودع (غير متاح للبيع)',
           referenceOrderId: ret.orderId,
           referenceReturnId: ret.id,
+          eventKey: `return_received_warehouse|${product.id}|${ret.id}|${i}`,
           reason: `استلام الطرد المرتجع بالمستودع #${ret.id} - بانتظار الفحص الفني قبل تحديد الصلاحية`,
           operator,
           timestamp: nowIso,
@@ -220,7 +274,10 @@ export function processReturnInspectionPure(params: {
   products: Product[];
   orders: Order[];
   currency: string;
+  restockTarget?: 'central' | MarketplaceId;
+  activeMarketplaceIds?: string[];
   operator?: string;
+  merchantId?: string;
   nowIso?: string;
 }): {
   success: boolean;
@@ -240,7 +297,10 @@ export function processReturnInspectionPure(params: {
     products: rawProducts,
     orders: rawOrders = [],
     currency,
+    restockTarget = 'central',
+    activeMarketplaceIds,
     operator = 'مدير العمليات',
+    merchantId,
     nowIso = new Date().toISOString(),
   } = params;
 
@@ -270,7 +330,6 @@ export function processReturnInspectionPure(params: {
     };
   }
 
-  // Must have physically arrived at warehouse before technical inspection
   if (
     existingRet.returnStatus !== 'received_at_warehouse' &&
     existingRet.returnStatus !== 'under_inspection' &&
@@ -299,6 +358,14 @@ export function processReturnInspectionPure(params: {
     };
   }
 
+  // Validate explicit platform restock target: cannot restock into a disabled platform
+  const resolvedTarget: 'central' | MarketplaceId =
+    restockTarget !== 'central' &&
+    activeMarketplaceIds &&
+    !activeMarketplaceIds.includes(restockTarget)
+      ? 'central'
+      : restockTarget;
+
   const returns = [...rawReturns];
   const ret: ReturnRecord = {
     ...existingRet,
@@ -316,43 +383,84 @@ export function processReturnInspectionPure(params: {
     ret.isPostDeliveryReturn === true || Boolean(order && order.deliveredProcessed === true);
 
   if (outcome === 'restockable') {
-    for (const item of ret.items) {
-      const product = products.find(
+    for (let i = 0; i < ret.items.length; i++) {
+      const item = ret.items[i];
+      const prodIdx = products.findIndex(
         (p) => p.id === item.productId || (item.productSku && p.sku === item.productSku)
       );
-      if (product) {
+      if (prodIdx >= 0) {
+        let product = products[prodIdx];
         const prevPhysical = product.physicalStock;
         const prevAvail = product.availableStock;
 
-        product.awaitingInspectionStock = Math.max(
-          0,
-          (product.awaitingInspectionStock || 0) - item.quantity
-        );
+        const nextPhysical =
+          isPostDelivery && !ret.physicalRestoredAtReceipt
+            ? prevPhysical + item.quantity
+            : prevPhysical;
 
-        // Only add physicalStock if not already added at dock receipt
-        if (isPostDelivery && !ret.physicalRestoredAtReceipt) {
-          product.physicalStock += item.quantity;
+        const nextAllocations = { ...(product.platformAllocations || {}) };
+        let nextCentralAvail = product.centralAvailableStock ?? 0;
+
+        if (resolvedTarget !== 'central') {
+          const prevAlloc = nextAllocations[resolvedTarget] || {
+            marketplaceId: resolvedTarget,
+            allocatedQty: 0,
+            reservedQty: 0,
+            availableQty: 0,
+            lastUpdated: nowIso,
+          };
+          const nextAllocQty = prevAlloc.allocatedQty + item.quantity;
+          nextAllocations[resolvedTarget] = {
+            ...prevAlloc,
+            allocatedQty: nextAllocQty,
+            availableQty: Math.max(0, nextAllocQty - prevAlloc.reservedQty),
+            lastUpdated: nowIso,
+          };
+        } else {
+          nextCentralAvail += item.quantity;
         }
-        product.availableStock += item.quantity;
-        product.updatedAt = nowIso;
+
+        product = normalizeProductCustody({
+          ...product,
+          awaitingInspectionStock: Math.max(
+            0,
+            (product.awaitingInspectionStock || 0) - item.quantity
+          ),
+          physicalStock: nextPhysical,
+          availableStock: prevAvail + item.quantity,
+          centralAvailableStock: nextCentralAvail,
+          platformAllocations: nextAllocations,
+          updatedAt: nowIso,
+        });
+        products[prodIdx] = product;
 
         newMovements.push({
-          id: `mov-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+          id: `mov-${Date.now()}-${i}-${Math.random().toString(36).substring(2, 6)}`,
+          merchantId: ret.merchantId || product.merchantId,
           productId: product.id,
           productSku: product.sku || product.name,
           productName: product.name,
-          marketplaceId: ret.marketplaceId,
+          marketplaceId: resolvedTarget === 'central' ? ret.marketplaceId : resolvedTarget,
+          platformId: resolvedTarget === 'central' ? undefined : resolvedTarget,
+          source: 'awaiting_inspection',
+          destination: resolvedTarget === 'central' ? 'central_available' : 'platform_allocation',
           type: 'return_restocked',
           quantityChange: item.quantity,
           previousPhysical: prevPhysical,
           newPhysical: product.physicalStock,
           previousAvailable: prevAvail,
           newAvailable: product.availableStock,
+          beforeQty: prevAvail,
+          afterQty: product.availableStock,
           fromCustody: 'بانتظار الفحص بالمستودع',
-          toCustody: 'المخزون المتاح للبيع بالمستودع',
+          toCustody:
+            resolvedTarget === 'central'
+              ? 'المخزون المتاح بالمستودع المركزي'
+              : `مخزون منصة ${resolvedTarget} المتاح`,
           referenceOrderId: ret.orderId,
           referenceReturnId: ret.id,
-          reason: `اعتماد المرتجع وإعادته للمخزون المتاح بعد الفحص (${condition})`,
+          eventKey: `return_restocked|${product.id}|${ret.id}|${i}`,
+          reason: `اعتماد المرتجع وإعادته إلى ${resolvedTarget === 'central' ? 'المستودع المركزي' : `منصة ${resolvedTarget}`} بعد الفحص (${condition})`,
           operator,
           timestamp: nowIso,
         });
@@ -362,6 +470,8 @@ export function processReturnInspectionPure(params: {
     ret.returnStatus = 'closed';
     ret.inspectionOutcome = 'restockable';
     ret.stockRestored = true;
+    ret.rejectedFromResale = false;
+    ret.restockTarget = resolvedTarget;
     ret.isCompleted = true;
 
     ret.activities!.push({
@@ -369,47 +479,61 @@ export function processReturnInspectionPure(params: {
       timestamp: nowIso,
       type: 'system',
       action: 'inspection_restocked',
-      actionAr: 'تم اعتماد المنتج كصالح للبيع وإعادته رسمياً للمخزون المتاح وإغلاق المرتجع',
+      actionAr: `تم اعتماد المنتج كصالح للبيع وإعادته رسمياً إلى (${resolvedTarget === 'central' ? 'المستودع المركزي' : resolvedTarget}) وإغلاق المرتجع`,
       operator,
       notes,
     });
   } else if (outcome === 'damaged') {
-    for (const item of ret.items) {
-      const product = products.find(
+    for (let i = 0; i < ret.items.length; i++) {
+      const item = ret.items[i];
+      const prodIdx = products.findIndex(
         (p) => p.id === item.productId || (item.productSku && p.sku === item.productSku)
       );
-      if (product) {
+      if (prodIdx >= 0) {
+        let product = products[prodIdx];
         const prevPhysical = product.physicalStock;
         const prevAvail = product.availableStock;
+        const prevDmg = product.damagedStock || 0;
 
-        product.awaitingInspectionStock = Math.max(
-          0,
-          (product.awaitingInspectionStock || 0) - item.quantity
-        );
-        product.damagedStock = (product.damagedStock || 0) + item.quantity;
-
-        if (isPostDelivery && !ret.physicalRestoredAtReceipt) {
-          product.physicalStock += item.quantity;
-        }
-        // Available stock NEVER increases on damaged outcome
-        product.updatedAt = nowIso;
+        product = normalizeProductCustody({
+          ...product,
+          awaitingInspectionStock: Math.max(
+            0,
+            (product.awaitingInspectionStock || 0) - item.quantity
+          ),
+          damagedStock: prevDmg + item.quantity,
+          rejectedResaleStock: (product.rejectedResaleStock || prevDmg) + item.quantity,
+          physicalStock:
+            isPostDelivery && !ret.physicalRestoredAtReceipt
+              ? prevPhysical + item.quantity
+              : prevPhysical,
+          updatedAt: nowIso,
+        });
+        products[prodIdx] = product;
 
         newMovements.push({
-          id: `mov-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+          id: `mov-${Date.now()}-${i}-${Math.random().toString(36).substring(2, 6)}`,
+          merchantId: ret.merchantId || product.merchantId,
           productId: product.id,
           productSku: product.sku || product.name,
           productName: product.name,
           marketplaceId: ret.marketplaceId,
+          platformId: ret.marketplaceId,
+          source: 'awaiting_inspection',
+          destination: 'damaged',
           type: 'return_damaged',
           quantityChange: 0,
           previousPhysical: prevPhysical,
           newPhysical: product.physicalStock,
           previousAvailable: prevAvail,
           newAvailable: product.availableStock,
+          beforeQty: prevDmg,
+          afterQty: product.damagedStock,
           fromCustody: 'بانتظار الفحص بالمستودع',
-          toCustody: 'المخزون التالف بالمستودع (غير صالح للبيع)',
+          toCustody: 'المخزون التالف بالمستودع (مرفوض من إعادة البيع)',
           referenceOrderId: ret.orderId,
           referenceReturnId: ret.id,
+          eventKey: `return_damaged|${product.id}|${ret.id}|${i}`,
           reason: `تسجيل مرتجع تالف (${condition}) - عزل في المخزون التالف دون زيادة المتاح للبيع`,
           operator,
           timestamp: nowIso,
@@ -418,6 +542,8 @@ export function processReturnInspectionPure(params: {
         const { unitCost } = resolveOrderItemUnitCost(item, products);
         if (unitCost !== null && unitCost > 0) {
           newTransactions.push({
+            merchantId: ret.merchantId,
+            eventRef: `return_damaged|damage_writeoff|${ret.id}|${product.id}|${i}`,
             orderId: ret.orderId,
             returnId: ret.id,
             marketplaceId: ret.marketplaceId,
@@ -436,6 +562,7 @@ export function processReturnInspectionPure(params: {
     ret.returnStatus = 'closed';
     ret.inspectionOutcome = 'damaged';
     ret.stockRestored = false;
+    ret.rejectedFromResale = true;
     ret.isCompleted = true;
 
     ret.activities!.push({
@@ -443,42 +570,58 @@ export function processReturnInspectionPure(params: {
       timestamp: nowIso,
       type: 'system',
       action: 'inspection_damaged',
-      actionAr: 'تم تصنيف المرتجع كتالف وعزله في المخزون التالف مع قيد خسارة الهالك',
+      actionAr: 'تم تصنيف المرتجع كتالف ومرفوض من إعادة البيع وعزله في المخزون التالف',
       operator,
       notes,
     });
   } else if (outcome === 'missing') {
-    for (const item of ret.items) {
-      const product = products.find(
+    for (let i = 0; i < ret.items.length; i++) {
+      const item = ret.items[i];
+      const prodIdx = products.findIndex(
         (p) => p.id === item.productId || (item.productSku && p.sku === item.productSku)
       );
-      if (product) {
+      if (prodIdx >= 0) {
+        let product = products[prodIdx];
         const prevPhysical = product.physicalStock;
-        product.awaitingInspectionStock = Math.max(
-          0,
-          (product.awaitingInspectionStock || 0) - item.quantity
-        );
-        if (!isPostDelivery || ret.physicalRestoredAtReceipt) {
-          product.physicalStock = Math.max(0, product.physicalStock - item.quantity);
-        }
-        product.updatedAt = nowIso;
+        const nextPhys =
+          !isPostDelivery || ret.physicalRestoredAtReceipt
+            ? Math.max(0, prevPhysical - item.quantity)
+            : prevPhysical;
+
+        product = normalizeProductCustody({
+          ...product,
+          awaitingInspectionStock: Math.max(
+            0,
+            (product.awaitingInspectionStock || 0) - item.quantity
+          ),
+          physicalStock: nextPhys,
+          updatedAt: nowIso,
+        });
+        products[prodIdx] = product;
 
         newMovements.push({
-          id: `mov-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+          id: `mov-${Date.now()}-${i}-${Math.random().toString(36).substring(2, 6)}`,
+          merchantId: ret.merchantId || product.merchantId,
           productId: product.id,
           productSku: product.sku || product.name,
           productName: product.name,
           marketplaceId: ret.marketplaceId,
+          platformId: ret.marketplaceId,
+          source: 'awaiting_inspection',
+          destination: 'external',
           type: 'return_missing',
           quantityChange: -item.quantity,
           previousPhysical: prevPhysical,
           newPhysical: product.physicalStock,
           previousAvailable: product.availableStock,
           newAvailable: product.availableStock,
+          beforeQty: prevPhysical,
+          afterQty: product.physicalStock,
           fromCustody: 'بانتظار الفحص بالمستودع',
           toCustody: 'شطب (طرد مفقود من شركة الشحن)',
           referenceOrderId: ret.orderId,
           referenceReturnId: ret.id,
+          eventKey: `return_missing|${product.id}|${ret.id}|${i}`,
           reason: 'شطب طرد مرتجع مفقود أو غير مستلم',
           operator,
           timestamp: nowIso,
@@ -489,6 +632,7 @@ export function processReturnInspectionPure(params: {
     ret.returnStatus = 'closed';
     ret.inspectionOutcome = 'missing';
     ret.stockRestored = false;
+    ret.rejectedFromResale = true;
     ret.isCompleted = true;
 
     ret.activities!.push({
@@ -552,11 +696,13 @@ export function registerPostDeliveryReturnPure(params: {
   orderId: string;
   reason: string;
   notes?: string;
+  selectedItems?: Array<{ productId: string; productSku?: string; quantity: number }>;
   orders: Order[];
   returns: ReturnRecord[];
   products: Product[];
   currency: string;
   operator?: string;
+  merchantId?: string;
   nowIso?: string;
 }): {
   success: boolean;
@@ -572,11 +718,13 @@ export function registerPostDeliveryReturnPure(params: {
     orderId,
     reason,
     notes,
+    selectedItems,
     orders: rawOrders,
     returns: rawReturns,
     products: rawProducts,
     currency,
     operator = 'مدير العمليات',
+    merchantId,
     nowIso = new Date().toISOString(),
   } = params;
 
@@ -606,10 +754,87 @@ export function registerPostDeliveryReturnPure(params: {
     };
   }
 
-  if (existingOrder.hasPostDeliveryReturn || rawReturns.some((r) => r.orderId === orderId)) {
+  const eligibleSummary = getOrderReturnableItems(existingOrder, rawReturns);
+  const totalRemaining = eligibleSummary.reduce((sum, e) => sum + e.remainingQty, 0);
+
+  if (totalRemaining <= 0) {
     return {
       success: false,
-      error: 'يوجد سجل مرتجع مسجل مسبقاً لهذا الطلب.',
+      error: 'تم إرجاع كامل كميات هذا الطلب مسبقاً ولا توجد وحدات مؤهلة لإرجاع جديد.',
+      orders: rawOrders,
+      returns: rawReturns,
+      products: rawProducts,
+      newMovements: [],
+      newTransactions: [],
+    };
+  }
+
+  const returnItems: OrderItem[] = [];
+
+  if (selectedItems && selectedItems.length > 0) {
+    for (const sel of selectedItems) {
+      if (!Number.isFinite(sel.quantity) || !Number.isInteger(sel.quantity) || sel.quantity <= 0) {
+        return {
+          success: false,
+          error: 'يجب أن تكون كمية الإرجاع لكل صنف عدداً صحيحاً موجباً.',
+          orders: rawOrders,
+          returns: rawReturns,
+          products: rawProducts,
+          newMovements: [],
+          newTransactions: [],
+        };
+      }
+
+      const match = eligibleSummary.find(
+        (e) =>
+          e.item.productId === sel.productId ||
+          (sel.productSku && e.item.productSku === sel.productSku)
+      );
+      if (!match) {
+        return {
+          success: false,
+          error: 'تم تحديد صنف لا ينتمي إلى عناصر الطلب الأصلي.',
+          orders: rawOrders,
+          returns: rawReturns,
+          products: rawProducts,
+          newMovements: [],
+          newTransactions: [],
+        };
+      }
+
+      if (sel.quantity > match.remainingQty) {
+        return {
+          success: false,
+          error: `الكمية المطلوبة لإرجاع (${match.item.productName}) (${sel.quantity}) تتجاوز الكمية المؤهلة المتبقية (${match.remainingQty}).`,
+          orders: rawOrders,
+          returns: rawReturns,
+          products: rawProducts,
+          newMovements: [],
+          newTransactions: [],
+        };
+      }
+
+      returnItems.push({
+        ...match.item,
+        quantity: sel.quantity,
+      });
+    }
+  } else {
+    // Full remaining items return (backward-compatible default)
+    for (const e of eligibleSummary) {
+      if (e.remainingQty > 0) {
+        returnItems.push({
+          ...e.item,
+          quantity: e.remainingQty,
+        });
+      }
+    }
+  }
+
+  if (returnItems.length === 0) {
+    return {
+      success: false,
+      error: 'يجب اختيار وحدة واحدة على الأقل للإرجاع.',
       orders: rawOrders,
       returns: rawReturns,
       products: rawProducts,
@@ -623,30 +848,44 @@ export function registerPostDeliveryReturnPure(params: {
   const products = rawProducts.map(normalizeProductCustody);
   const newMovements: StockMovement[] = [];
 
-  for (const item of existingOrder.items) {
-    const product = products.find(
-      (prod) => prod.id === item.productId || prod.sku === item.productSku
+  for (let i = 0; i < returnItems.length; i++) {
+    const item = returnItems[i];
+    const prodIdx = products.findIndex(
+      (prod) => prod.id === item.productId || (item.productSku && prod.sku === item.productSku)
     );
-    if (product) {
-      product.returnInTransitStock = (product.returnInTransitStock || 0) + item.quantity;
-      product.updatedAt = nowIso;
+    if (prodIdx >= 0) {
+      let product = products[prodIdx];
+      const prevRetTransit = product.returnInTransitStock || 0;
+      product = normalizeProductCustody({
+        ...product,
+        returnInTransitStock: prevRetTransit + item.quantity,
+        updatedAt: nowIso,
+      });
+      products[prodIdx] = product;
 
       newMovements.push({
-        id: `mov-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+        id: `mov-${Date.now()}-${i}-${Math.random().toString(36).substring(2, 6)}`,
+        merchantId: existingOrder.merchantId || product.merchantId,
         productId: product.id,
         productSku: product.sku || product.name,
         productName: product.name,
         marketplaceId: existingOrder.marketplaceId,
+        platformId: existingOrder.marketplaceId,
+        source: 'customer',
+        destination: 'return_transit',
         type: 'return_initiated',
         quantityChange: 0,
         previousPhysical: product.physicalStock,
         newPhysical: product.physicalStock,
         previousAvailable: product.availableStock,
         newAvailable: product.availableStock,
+        beforeQty: prevRetTransit,
+        afterQty: product.returnInTransitStock,
         fromCustody: 'بحوزة العميل (طلب مسلم)',
         toCustody: 'مرتجع في طريق العودة للمستودع',
         referenceOrderId: existingOrder.id,
         referenceReturnId: returnId,
+        eventKey: `post_delivery_return|${product.id}|${returnId}|${i}`,
         reason: `فتح طلب مرتجع لاحق بعد التسليم للطلب #${existingOrder.id}`,
         operator,
         timestamp: nowIso,
@@ -656,13 +895,15 @@ export function registerPostDeliveryReturnPure(params: {
 
   const newReturn: ReturnRecord = {
     id: returnId,
+    merchantId: existingOrder.merchantId,
     orderId: existingOrder.id,
     marketplaceId: existingOrder.marketplaceId,
-    items: existingOrder.items,
+    items: returnItems,
     returnReason: reason.trim() || 'طلب استرجاع بعد استلام الشحنة من العميل',
     returnStatus: 'in_transit_back',
     physicalCondition: undefined,
     stockRestored: false,
+    rejectedFromResale: false,
     isCompleted: false,
     isPostDeliveryReturn: true,
     physicalRestoredAtReceipt: false,
@@ -696,6 +937,8 @@ export function registerPostDeliveryReturnPure(params: {
 
   const newTransactions: Array<Omit<FinancialTransaction, 'id' | 'date'> & { date?: string }> = [
     {
+      merchantId: existingOrder.merchantId,
+      eventRef: `post_delivery_return|return_shipping|${returnId}`,
       orderId: existingOrder.id,
       returnId,
       marketplaceId: existingOrder.marketplaceId,

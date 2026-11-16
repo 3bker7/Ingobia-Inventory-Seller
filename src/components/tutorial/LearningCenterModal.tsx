@@ -34,7 +34,7 @@ const guideIcons: Record<string, React.ComponentType<{ className?: string }>> = 
   orders: ShoppingCart,
   inventory: Boxes,
   returns: ReturnIcon,
-  excel: FileSpreadsheet,
+  excelImport: FileSpreadsheet,
 };
 
 const guideTabMapping: Record<string, ActiveTab> = {
@@ -43,7 +43,7 @@ const guideTabMapping: Record<string, ActiveTab> = {
   orders: 'orders',
   inventory: 'inventory',
   returns: 'returns',
-  excel: 'excelImport',
+  excelImport: 'excelImport',
 };
 
 export const LearningCenterModal: React.FC<LearningCenterModalProps> = ({
@@ -70,21 +70,23 @@ export const LearningCenterModal: React.FC<LearningCenterModalProps> = ({
     >
       <div className="space-y-6">
         {/* Top Banner with 3D Assistant */}
-        <div className="bg-gradient-to-r from-[#172033] to-[#1E3A8A] text-white p-5 rounded-2xl flex items-center justify-between gap-4 overflow-hidden relative">
-          <div className="relative z-10 space-y-1">
+        <div className="bg-[#F8FAFC] border border-[#E8ECF2] text-[#172033] p-5 rounded-2xl flex items-center justify-between gap-4 overflow-hidden">
+          <div className="space-y-1.5">
             <div className="flex items-center gap-2">
-              <Sparkles className="w-4 h-4 text-amber-400" />
-              <span className="text-xs font-bold text-amber-400 uppercase tracking-wider">
+              <Sparkles className="w-4 h-4 text-[#2563EB]" />
+              <span className="text-xs font-bold text-[#2563EB] uppercase tracking-wider">
                 {isRtl ? 'نظام الإرشاد التفاعلي' : 'Interactive Guidance'}
               </span>
             </div>
-            <h3 className="text-base font-bold">
-              {isRtl ? `أهلاً بك يا ${profile.merchantName || profile.name}` : `Welcome, ${profile.merchantName || profile.name}`}
-            </h3>
-            <p className="text-xs text-slate-300 max-w-md leading-relaxed">
+            <h3 className="text-base font-bold text-[#172033]">
               {isRtl
-                ? 'مرشد العمليات الثلاثي الأبعاد يرافقك في كل قسم من أقسام المنصة ليشرح لك طريقة مراقبة الطلبات والمخزون وحساب الأرباح والخسائر بدقة.'
-                : 'Our 3D Operations Advisor guides you across each platform module to monitor inventory, orders, and financial loss.'}
+                ? `أهلاً بك ${profile.merchantName || profile.name || 'في مركز التدريب'}`
+                : `Welcome, ${profile.merchantName || profile.name || 'Merchant'}`}
+            </h3>
+            <p className="text-xs text-[#64748B] max-w-md leading-relaxed">
+              {isRtl
+                ? 'مرشد العمليات يرافقك في كل قسم من أقسام المنصة ليشرح لك طريقة مراقبة الطلبات والمخزون وحساب الأرباح والخسائر بدقة.'
+                : 'Our Operations Advisor guides you across each platform module to monitor inventory, orders, and verified financial ledger accuracy.'}
             </p>
           </div>
 

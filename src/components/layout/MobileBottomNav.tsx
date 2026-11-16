@@ -21,13 +21,18 @@ interface MobileBottomNavProps {
   currentTab: string;
   onSelectTab: (tab: string) => void;
   locale: Locale;
+  isDeveloperMode?: boolean;
+  storeRevision?: number;
 }
 
 export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
   currentTab,
   onSelectTab,
   locale,
+  isDeveloperMode = false,
+  storeRevision = 0,
 }) => {
+  void storeRevision;
   const [isMoreOpen, setIsMoreOpen] = useState(false);
   const isRtl = locale === 'ar';
 
@@ -117,13 +122,17 @@ export const MobileBottomNav: React.FC<MobileBottomNavProps> = ({
       icon: Settings,
       color: 'text-[#64748B]',
     },
-    {
-      id: 'developerCenter',
-      labelAr: 'مركز المطورين (تصدير نصي)',
-      labelEn: 'Developer Center (Export)',
-      icon: Terminal,
-      color: 'text-purple-600',
-    },
+    ...(isDeveloperMode
+      ? [
+          {
+            id: 'developerCenter',
+            labelAr: 'مركز المطورين (تصدير نصي)',
+            labelEn: 'Developer Center (Export)',
+            icon: Terminal,
+            color: 'text-purple-600',
+          },
+        ]
+      : []),
   ];
 
   return (

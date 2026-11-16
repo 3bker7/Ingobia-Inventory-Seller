@@ -22,6 +22,7 @@ import { createOrderPure, updateOrderStatusPure } from '../../domain/orderLifecy
 import { advanceReturnStatusPure, processReturnInspectionPure } from '../../domain/returnLifecycle';
 import { computeOrderFinancialBreakdown } from '../../domain/financialLedger';
 import { DEFAULT_MERCHANT_PROFILE } from '../../services/seedData';
+import { generateProductSvgDataUri } from '../../utils/productVisual';
 
 interface TestSuiteModalProps {
   isOpen: boolean;
@@ -45,7 +46,7 @@ const makeTestProduct = (overrides: Partial<Product> = {}): Product => ({
   id: 'mock-p1',
   sku: 'TEST-SKU-1',
   name: 'منتج تجريبي 1',
-  imageUrl: 'https://images.unsplash.com/photo-1546868871-7041f2a55e12?w=300',
+  imageUrl: generateProductSvgDataUri('منتج تجريبي 1', 'Electronics'),
   currentPrice: 150,
   category: 'Electronics',
   baseCost: 100,
@@ -565,15 +566,15 @@ export const TestSuiteModal: React.FC<TestSuiteModalProps> = ({ isOpen, onClose,
     >
       <div className="space-y-5">
         {/* Header notice */}
-        <div className="p-4 bg-slate-900 text-white rounded-2xl flex items-center justify-between gap-4">
+        <div className="p-4 bg-[#F7F8FA] border border-[#E8ECF2] text-[#172033] rounded-2xl flex items-center justify-between gap-4">
           <div className="space-y-1">
             <div className="flex items-center gap-2">
-              <ShieldCheck className="w-5 h-5 text-emerald-400" />
-              <h3 className="font-bold text-sm">
+              <ShieldCheck className="w-5 h-5 text-[#16A36A]" />
+              <h3 className="font-bold text-sm text-[#172033]">
                 {isRtl ? 'بيئة التحقق المعزولة للعمليات (In-Memory Isolation)' : 'Isolated In-Memory Operations Verification'}
               </h3>
             </div>
-            <p className="text-xs text-slate-300">
+            <p className="text-xs text-[#64748B]">
               {isRtl
                 ? 'تنفذ هذه الحزمة سيناريوهات دورة حياة الطلبات والمرتجعات والقيود المحاسبية دون التأثير على بيانات متجرك الفعلية.'
                 : 'Runs rigorous lifecycle, custody, and ledger tests on isolated memory without mutating actual store data.'}
@@ -584,10 +585,10 @@ export const TestSuiteModal: React.FC<TestSuiteModalProps> = ({ isOpen, onClose,
             type="button"
             disabled={isRunning}
             onClick={runAllTests}
-            className={`px-4 py-2.5 rounded-xl text-xs font-bold flex items-center gap-2 transition-all cursor-pointer shrink-0 ${
+            className={`px-4 py-2.5 rounded-xl text-xs font-bold flex items-center gap-2 transition-all cursor-pointer shrink-0 whitespace-nowrap ${
               isRunning
-                ? 'bg-slate-700 text-slate-400 cursor-not-allowed'
-                : 'bg-[#2563EB] hover:bg-blue-700 text-white shadow-md'
+                ? 'bg-slate-200 text-slate-500 cursor-not-allowed'
+                : 'bg-[#2563EB] hover:bg-blue-700 text-white shadow-xs'
             }`}
           >
             {isRunning ? (
@@ -639,7 +640,7 @@ export const TestSuiteModal: React.FC<TestSuiteModalProps> = ({ isOpen, onClose,
                   : test.status === 'failed'
                   ? 'bg-rose-50/50 border-rose-200'
                   : test.status === 'running'
-                  ? 'bg-blue-50/40 border-blue-200 animate-pulse'
+                  ? 'bg-blue-50/40 border-blue-200'
                   : 'bg-white border-[#E8ECF2]'
               }`}
             >

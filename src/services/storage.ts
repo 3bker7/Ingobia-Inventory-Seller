@@ -32,9 +32,15 @@ import {
   RecommendationStatus,
   ShipmentRecord,
   StorageWriteResult,
+  AuthSession,
+  MerchantAccount,
+  AdminAuditLogEntry,
+  PreDestructiveBackup,
 } from '../types';
 import {
   STORAGE_KEYS,
+  SYSTEM_STORAGE_KEYS,
+  DEFAULT_MERCHANT_ID,
   DEFAULT_MERCHANT_PROFILE,
   DEFAULT_MARKETPLACES,
   DEFAULT_SETTINGS,
@@ -46,9 +52,11 @@ import {
   DEFAULT_FINANCIAL_TRANSACTIONS,
 } from './seedData';
 import {
+  allocateStockToPlatformPure,
   applyManualStockAdjustmentPure,
   computePriceChangeMetrics,
   normalizeProductCustody,
+  releasePlatformAllocationPure,
 } from '../domain/inventoryCustody';
 import {
   createOrderPure,
@@ -66,7 +74,9 @@ import {
   FinancialSummaryResult,
   resolveOrderItemUnitCost,
 } from '../domain/financialLedger';
-import { saveSmartImportOrdersPure } from '../domain/smartImportCustody';
+import { saveSmartImportOrdersPure, SmartImportRejectedOrder } from '../domain/smartImportCustody';
+
+const DEVELOPER_PASSCODE = 'INGOBIA-DEV-2026';
 
 export {
   STORAGE_KEYS,
@@ -122,6 +132,103 @@ class StorageService {
 
   private hasStorage(): boolean {
     return typeof globalThis !== 'undefined' && typeof globalThis.localStorage !== 'undefined';
+  }
+
+  private getScopedKey(baseKey: string, merchantId?: string): string {
+    const mId = merchantId || this.getActiveMerchantId();
+    if (!mId || mId === DEFAULT_MERCHANT_ID) {
+      return baseKey;
+    }
+    return `ingobia_m_${mId}_${baseKey}`;
+  }
+
+  private filterOwned<T extends { merchantId?: string }>(items: T[]): T[] {
+    const activeMerchantId = this.getActiveMerchantId();
+    return items.filter((item) => !item.merchantId || item.merchantId === activeMerchantId);
+  }
+
+  private stampOwned<T extends { merchantId?: string }>(items: T[], merchantId?: string): T[] {
+    const mId = merchantId || this.getActiveMerchantId();
+    return items.map((item) => (item.merchantId ? item : { ...item, merchantId: mId }));
+  }
+
+  public getAuthSession(): AuthSession {
+    return this.get<AuthSession>(SYSTEM_STORAGE_KEYS.AUTH_SESSION, {
+      activeMerchantId: DEFAULT_MERCHANT_ID,
+      role: 'merchant',
+    });
+  }
+
+  public getActiveMerchantId(): string {
+    return this.getAuthSession().activeMerchantId || DEFAULT_MERCHANT_ID;
+  }
+
+  public isDeveloperMode(): boolean {
+    return this.getAuthSession().role === 'developer';
+  }
+
+  public unlockDeveloperMode(passcode: string): { success: boolean; error?: string } {
+    const normalized = String(passcode || '').trim();
+    if (normalized !== DEVELOPER_PASSCODE) {
+      this.appendAdminAuditLog(
+        'developer_unlock_failed',
+        'محاولة فاشلة لفتح وضع المطور برمز غير مطابق.',
+        false
+      );
+      return { success: false, error: 'رمز المطور غير صحيح.' };
+    }
+
+    const session = this.getAuthSession();
+    const nextSession: AuthSession = {
+      ...session,
+      role: 'developer',
+      developerUnlockedAt: new Date().toISOString(),
+    };
+    const writeRes = this.set(SYSTEM_STORAGE_KEYS.AUTH_SESSION, nextSession);
+    if (!writeRes.success) {
+      return { success: false, error: writeRes.error || 'تعذر حفظ جلسة المطور.' };
+    }
+    this.appendAdminAuditLog('developer_mode_unlocked', 'تم تفعيل وضع المطور المصرح به في الجلسة.');
+    return { success: true };
+  }
+
+  public lockDeveloperMode(): StorageWriteResult {
+    const session = this.getAuthSession();
+    const nextSession: AuthSession = {
+      ...session,
+      role: 'merchant',
+      developerUnlockedAt: undefined,
+    };
+    const res = this.set(SYSTEM_STORAGE_KEYS.AUTH_SESSION, nextSession);
+    if (res.success) {
+      this.appendAdminAuditLog('developer_mode_locked', 'تم إغلاق وضع المطور والعودة لصلاحيات التاجر.');
+    }
+    return res;
+  }
+
+  public getAdminAuditLog(): AdminAuditLogEntry[] {
+    return this.get<AdminAuditLogEntry[]>(SYSTEM_STORAGE_KEYS.ADMIN_AUDIT_LOG, []);
+  }
+
+  public appendAdminAuditLog(
+    action: AdminAuditLogEntry['action'],
+    details: string,
+    success: boolean = true
+  ): void {
+    if (!this.hasStorage()) return;
+    const existing = this.getAdminAuditLog();
+    const profile = this.getMerchantProfile();
+    const entry: AdminAuditLogEntry = {
+      id: `audit-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+      timestamp: new Date().toISOString(),
+      actorRole: this.getAuthSession().role,
+      actorName: profile.merchantName || profile.name || 'Merchant Session',
+      merchantId: this.getActiveMerchantId(),
+      action,
+      details,
+      success,
+    };
+    this.set(SYSTEM_STORAGE_KEYS.ADMIN_AUDIT_LOG, [entry, ...existing.slice(0, 199)]);
   }
 
   public getCorruptedKeys(): string[] {
@@ -284,45 +391,377 @@ class StorageService {
 
   /**
    * Initializes missing keys to an EMPTY production store ([]).
-   * Preserves existing stored records and NEVER auto-seeds demo/fake products on general startup.
+   * Safely snapshots legacy pre-migration records once without erasing existing browser stores,
+   * and NEVER auto-seeds demo/fake products on general startup.
    */
   public init(): StorageWriteResult {
     if (!this.hasStorage()) return { success: true };
+
+    // One-time reversible migration snapshot for legacy unscoped browser stores
+    try {
+      if (globalThis.localStorage.getItem(SYSTEM_STORAGE_KEYS.MIGRATION_BACKUP) === null) {
+        const legacySnapshot: Record<string, string | null> = {};
+        let hasLegacy = false;
+        for (const key of Object.values(STORAGE_KEYS)) {
+          const val = globalThis.localStorage.getItem(key);
+          if (val !== null) {
+            legacySnapshot[key] = val;
+            hasLegacy = true;
+          }
+        }
+        if (hasLegacy) {
+          globalThis.localStorage.setItem(
+            SYSTEM_STORAGE_KEYS.MIGRATION_BACKUP,
+            JSON.stringify({
+              capturedAt: new Date().toISOString(),
+              keys: legacySnapshot,
+            })
+          );
+        }
+      }
+    } catch {
+      // Ignore snapshot errors on quota-constrained devices
+    }
+
+    const activeMerchantId = this.getActiveMerchantId();
     const entries: Array<{ key: string; value: unknown }> = [];
     const queueIfMissing = (key: string, emptyValue: unknown) => {
       if (globalThis.localStorage.getItem(key) === null) {
         entries.push({ key, value: emptyValue });
       }
     };
-    queueIfMissing(STORAGE_KEYS.PRODUCTS, []);
-    queueIfMissing(STORAGE_KEYS.ORDERS, []);
-    queueIfMissing(STORAGE_KEYS.MOVEMENTS, []);
-    queueIfMissing(STORAGE_KEYS.RETURNS, []);
-    queueIfMissing(STORAGE_KEYS.PRICE_HISTORY, []);
-    queueIfMissing(STORAGE_KEYS.SETTINGS, DEFAULT_SETTINGS);
-    queueIfMissing(STORAGE_KEYS.FINANCIAL_TRANSACTIONS, []);
+
+    queueIfMissing(this.getScopedKey(STORAGE_KEYS.PRODUCTS, activeMerchantId), []);
+    queueIfMissing(this.getScopedKey(STORAGE_KEYS.ORDERS, activeMerchantId), []);
+    queueIfMissing(this.getScopedKey(STORAGE_KEYS.MOVEMENTS, activeMerchantId), []);
+    queueIfMissing(this.getScopedKey(STORAGE_KEYS.RETURNS, activeMerchantId), []);
+    queueIfMissing(this.getScopedKey(STORAGE_KEYS.PRICE_HISTORY, activeMerchantId), []);
+    queueIfMissing(this.getScopedKey(STORAGE_KEYS.SETTINGS, activeMerchantId), DEFAULT_SETTINGS);
+    queueIfMissing(this.getScopedKey(STORAGE_KEYS.FINANCIAL_TRANSACTIONS, activeMerchantId), []);
+
+    // Ensure merchant accounts registry contains active account
+    const accounts = this.get<MerchantAccount[]>(SYSTEM_STORAGE_KEYS.MERCHANT_ACCOUNTS, []);
+    if (accounts.length === 0) {
+      const profile = this.getMerchantProfile();
+      const settings = this.getSettings();
+      entries.push({
+        key: SYSTEM_STORAGE_KEYS.MERCHANT_ACCOUNTS,
+        value: [
+          {
+            id: activeMerchantId,
+            storeName: profile.storeName || settings.storeName || '',
+            merchantName: profile.merchantName || profile.name || settings.sellerName || '',
+            email: profile.email || '',
+            role: this.getAuthSession().role,
+            createdAt: new Date().toISOString(),
+            lastAccessedAt: new Date().toISOString(),
+          } satisfies MerchantAccount,
+        ],
+      });
+    }
 
     if (entries.length === 0) return { success: true };
     return this.commitMultiKeyWrites(entries);
   }
 
-  /**
-   * Developer-only action: populates the realistic demo catalog, orders, returns, and ledger
-   * exclusively for pre-launch testing from Developer Center.
-   */
-  public loadDemoSampleData(): StorageWriteResult {
-    return this.commitMultiKeyWrites(
+  // --- Multi-Merchant Account Isolation & Switching ---
+  public getMerchantAccounts(): MerchantAccount[] {
+    return this.get<MerchantAccount[]>(SYSTEM_STORAGE_KEYS.MERCHANT_ACCOUNTS, []);
+  }
+
+  public createMerchantAccount(params: {
+    storeName: string;
+    merchantName: string;
+    email?: string;
+    language?: 'ar' | 'en';
+    currency?: string;
+    switchTo?: boolean;
+  }): StorageWriteResult & { account?: MerchantAccount } {
+    const storeName = String(params.storeName || '').trim();
+    const merchantName = String(params.merchantName || '').trim();
+    if (!storeName || !merchantName) {
+      return { success: false, error: 'يجب إدخال اسم المتجر واسم التاجر لإنشاء حساب مستقل.' };
+    }
+
+    const nowIso = new Date().toISOString();
+    const accountId = `merch-${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 6)}`;
+    const account: MerchantAccount = {
+      id: accountId,
+      storeName,
+      merchantName,
+      email: params.email?.trim() || '',
+      role: 'merchant',
+      createdAt: nowIso,
+      lastAccessedAt: nowIso,
+    };
+
+    const existingAccounts = this.getMerchantAccounts();
+    const nextAccounts = [...existingAccounts, account];
+
+    const newProfile: MerchantProfile = {
+      ...DEFAULT_MERCHANT_PROFILE,
+      merchantId: accountId,
+      role: 'merchant',
+      name: merchantName,
+      merchantName,
+      email: account.email || '',
+      storeName,
+      isOnboarded: true,
+      onboardedAt: nowIso,
+      selectedMarketplaceIds: DEFAULT_MARKETPLACES.map((m) => m.id),
+    };
+
+    const newSettings: AppSettings = {
+      ...DEFAULT_SETTINGS,
+      language: params.language || this.getSettings().language || 'ar',
+      currency: params.currency || this.getSettings().currency || 'SAR',
+      sellerName: merchantName,
+      storeName,
+      marketplaces: DEFAULT_MARKETPLACES.map((m) => ({ ...m, isActive: true })),
+    };
+
+    const writes: Array<{ key: string; value: unknown }> = [
+      { key: SYSTEM_STORAGE_KEYS.MERCHANT_ACCOUNTS, value: nextAccounts },
+      { key: this.getScopedKey(STORAGE_KEYS.PRODUCTS, accountId), value: [] },
+      { key: this.getScopedKey(STORAGE_KEYS.ORDERS, accountId), value: [] },
+      { key: this.getScopedKey(STORAGE_KEYS.MOVEMENTS, accountId), value: [] },
+      { key: this.getScopedKey(STORAGE_KEYS.RETURNS, accountId), value: [] },
+      { key: this.getScopedKey(STORAGE_KEYS.PRICE_HISTORY, accountId), value: [] },
+      { key: this.getScopedKey(STORAGE_KEYS.FINANCIAL_TRANSACTIONS, accountId), value: [] },
+      { key: this.getScopedKey(STORAGE_KEYS.SMART_IMPORT_HISTORY, accountId), value: [] },
+      { key: this.getScopedKey(STORAGE_KEYS.RECOMMENDATIONS, accountId), value: [] },
+      { key: this.getScopedKey(STORAGE_KEYS.SETTINGS, accountId), value: newSettings },
+      { key: this.getScopedKey(STORAGE_KEYS.MERCHANT_PROFILE, accountId), value: newProfile },
+    ];
+
+    if (params.switchTo !== false) {
+      writes.push({
+        key: SYSTEM_STORAGE_KEYS.AUTH_SESSION,
+        value: {
+          ...this.getAuthSession(),
+          activeMerchantId: accountId,
+        } satisfies AuthSession,
+      });
+    }
+
+    const res = this.commitMultiKeyWrites(writes);
+    if (!res.success) return res;
+
+    this.appendAdminAuditLog('merchant_switched', `إنشاء وعزل حساب متجر جديد (${storeName}) [${accountId}].`);
+    return { ...res, account };
+  }
+
+  public switchMerchantAccount(merchantId: string): StorageWriteResult {
+    const accounts = this.getMerchantAccounts();
+    if (merchantId !== DEFAULT_MERCHANT_ID && !accounts.some((a) => a.id === merchantId)) {
+      return { success: false, error: 'حساب التاجر المطلوب غير موجود.' };
+    }
+
+    const nowIso = new Date().toISOString();
+    const updatedAccounts = accounts.map((a) =>
+      a.id === merchantId ? { ...a, lastAccessedAt: nowIso } : a
+    );
+    const currentSession = this.getAuthSession();
+    const writeRes = this.commitMultiKeyWrites([
+      {
+        key: SYSTEM_STORAGE_KEYS.AUTH_SESSION,
+        value: {
+          ...currentSession,
+          activeMerchantId: merchantId,
+        } satisfies AuthSession,
+      },
+      { key: SYSTEM_STORAGE_KEYS.MERCHANT_ACCOUNTS, value: updatedAccounts },
+    ]);
+
+    if (!writeRes.success) return writeRes;
+    this.init();
+    this.appendAdminAuditLog('merchant_switched', `التبديل إلى مساحة التاجر المعزولة (${merchantId}).`);
+    return { success: true };
+  }
+
+  // --- Backups & Safe Restore ---
+  public createPreDestructiveBackup(reason: string): PreDestructiveBackup {
+    const merchantId = this.getActiveMerchantId();
+    const backup: PreDestructiveBackup = {
+      id: `bkp-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+      createdAt: new Date().toISOString(),
+      merchantId,
+      reason,
+      data: {
+        products: this.getProducts(),
+        orders: this.getOrders(),
+        returns: this.getReturns(),
+        movements: this.getMovements(),
+        priceHistory: this.getPriceHistory(),
+        financialTransactions: this.getFinancialTransactions(),
+        settings: this.getSettings(),
+        merchantProfile: this.getMerchantProfile(),
+      },
+    };
+
+    if (this.hasStorage()) {
+      const existing = this.get<PreDestructiveBackup[]>(SYSTEM_STORAGE_KEYS.PRE_DESTRUCTIVE_BACKUPS, []);
+      this.set(SYSTEM_STORAGE_KEYS.PRE_DESTRUCTIVE_BACKUPS, [backup, ...existing.slice(0, 4)]);
+      this.appendAdminAuditLog('backup_created', `إنشاء نسخة احتياطية قبل تنفيذ (${reason}) لمتجر ${merchantId}.`);
+    }
+    return backup;
+  }
+
+  public getPreDestructiveBackups(): PreDestructiveBackup[] {
+    const all = this.get<PreDestructiveBackup[]>(SYSTEM_STORAGE_KEYS.PRE_DESTRUCTIVE_BACKUPS, []);
+    const activeId = this.getActiveMerchantId();
+    return all.filter((b) => b.merchantId === activeId);
+  }
+
+  public restorePreDestructiveBackup(backupId: string): StorageWriteResult {
+    const all = this.get<PreDestructiveBackup[]>(SYSTEM_STORAGE_KEYS.PRE_DESTRUCTIVE_BACKUPS, []);
+    const backup = all.find((b) => b.id === backupId);
+    if (!backup) {
+      return { success: false, error: 'النسخة الاحتياطية المطلوبة غير موجودة.' };
+    }
+    const targetMerchantId = backup.merchantId || this.getActiveMerchantId();
+    const writeRes = this.commitMultiKeyWrites(
       [
-        { key: STORAGE_KEYS.PRODUCTS, value: DEFAULT_PRODUCTS },
-        { key: STORAGE_KEYS.ORDERS, value: DEFAULT_ORDERS },
-        { key: STORAGE_KEYS.MOVEMENTS, value: DEFAULT_MOVEMENTS },
-        { key: STORAGE_KEYS.RETURNS, value: DEFAULT_RETURNS },
-        { key: STORAGE_KEYS.PRICE_HISTORY, value: DEFAULT_PRICE_HISTORY },
-        { key: STORAGE_KEYS.SETTINGS, value: DEFAULT_SETTINGS },
-        { key: STORAGE_KEYS.FINANCIAL_TRANSACTIONS, value: DEFAULT_FINANCIAL_TRANSACTIONS },
+        { key: this.getScopedKey(STORAGE_KEYS.PRODUCTS, targetMerchantId), value: backup.data.products || [] },
+        { key: this.getScopedKey(STORAGE_KEYS.ORDERS, targetMerchantId), value: backup.data.orders || [] },
+        { key: this.getScopedKey(STORAGE_KEYS.RETURNS, targetMerchantId), value: backup.data.returns || [] },
+        { key: this.getScopedKey(STORAGE_KEYS.MOVEMENTS, targetMerchantId), value: backup.data.movements || [] },
+        { key: this.getScopedKey(STORAGE_KEYS.PRICE_HISTORY, targetMerchantId), value: backup.data.priceHistory || [] },
+        {
+          key: this.getScopedKey(STORAGE_KEYS.FINANCIAL_TRANSACTIONS, targetMerchantId),
+          value: backup.data.financialTransactions || [],
+        },
+        { key: this.getScopedKey(STORAGE_KEYS.SETTINGS, targetMerchantId), value: backup.data.settings || DEFAULT_SETTINGS },
+        {
+          key: this.getScopedKey(STORAGE_KEYS.MERCHANT_PROFILE, targetMerchantId),
+          value: backup.data.merchantProfile || DEFAULT_MERCHANT_PROFILE,
+        },
       ],
       { allowOverwriteCorrupted: true }
     );
+    if (writeRes.success) {
+      this.appendAdminAuditLog('backup_restored', `استعادة النسخة الاحتياطية (${backupId}) لمتجر ${targetMerchantId}.`);
+    }
+    return writeRes;
+  }
+
+  public exportMerchantBackupJson(): string {
+    const payload = {
+      schemaVersion: 'ingobia_backup_v1',
+      exportedAt: new Date().toISOString(),
+      merchantId: this.getActiveMerchantId(),
+      data: {
+        products: this.getProducts(),
+        orders: this.getOrders(),
+        returns: this.getReturns(),
+        movements: this.getMovements(),
+        priceHistory: this.getPriceHistory(),
+        financialTransactions: this.getFinancialTransactions(),
+        settings: this.getSettings(),
+        merchantProfile: this.getMerchantProfile(),
+      },
+    };
+    return JSON.stringify(payload, null, 2);
+  }
+
+  public importMerchantBackupJson(rawJson: string): StorageWriteResult {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(rawJson);
+    } catch {
+      return { success: false, error: 'صيغة ملف النسخة الاحتياطية JSON غير صالحة.' };
+    }
+
+    if (!parsed || typeof parsed !== 'object') {
+      return { success: false, error: 'بنية النسخة الاحتياطية غير صالحة.' };
+    }
+    const obj = parsed as { schemaVersion?: string; data?: PreDestructiveBackup['data'] };
+    if (obj.schemaVersion !== 'ingobia_backup_v1' || !obj.data || typeof obj.data !== 'object') {
+      return { success: false, error: 'ملف النسخة الاحتياطية لا يطابق مخطط Ingobia المعتمد (ingobia_backup_v1).' };
+    }
+
+    const d = obj.data;
+    if (
+      !Array.isArray(d.products) ||
+      !Array.isArray(d.orders) ||
+      !Array.isArray(d.returns) ||
+      !Array.isArray(d.movements) ||
+      !Array.isArray(d.financialTransactions)
+    ) {
+      return { success: false, error: 'النسخة الاحتياطية ناقصة الحقول الأساسية؛ تم إلغاء الاستيراد دون مساس بالبيانات الحالية.' };
+    }
+
+    this.createPreDestructiveBackup('قبل استيراد نسخة احتياطية JSON');
+    const activeId = this.getActiveMerchantId();
+    const res = this.commitMultiKeyWrites(
+      [
+        { key: this.getScopedKey(STORAGE_KEYS.PRODUCTS, activeId), value: this.stampOwned(d.products, activeId) },
+        { key: this.getScopedKey(STORAGE_KEYS.ORDERS, activeId), value: this.stampOwned(d.orders, activeId) },
+        { key: this.getScopedKey(STORAGE_KEYS.RETURNS, activeId), value: this.stampOwned(d.returns, activeId) },
+        { key: this.getScopedKey(STORAGE_KEYS.MOVEMENTS, activeId), value: this.stampOwned(d.movements, activeId) },
+        {
+          key: this.getScopedKey(STORAGE_KEYS.PRICE_HISTORY, activeId),
+          value: this.stampOwned(Array.isArray(d.priceHistory) ? d.priceHistory : [], activeId),
+        },
+        {
+          key: this.getScopedKey(STORAGE_KEYS.FINANCIAL_TRANSACTIONS, activeId),
+          value: this.stampOwned(d.financialTransactions, activeId),
+        },
+        ...(d.settings ? [{ key: this.getScopedKey(STORAGE_KEYS.SETTINGS, activeId), value: d.settings }] : []),
+        ...(d.merchantProfile
+          ? [
+              {
+                key: this.getScopedKey(STORAGE_KEYS.MERCHANT_PROFILE, activeId),
+                value: { ...d.merchantProfile, merchantId: activeId },
+              },
+            ]
+          : []),
+      ],
+      { allowOverwriteCorrupted: true }
+    );
+    if (res.success) {
+      this.appendAdminAuditLog('backup_restored', `استيراد نسخة احتياطية JSON بنجاح لمتجر ${activeId}.`);
+    }
+    return res;
+  }
+
+  /**
+   * Developer-only action: creates a pre-destructive backup first (if data exists),
+   * then populates the realistic demo catalog, orders, returns, and ledger for sandbox testing.
+   */
+  public loadDemoSampleData(): StorageWriteResult {
+    const activeId = this.getActiveMerchantId();
+    if (this.getProducts().length > 0 || this.getOrders().length > 0) {
+      this.createPreDestructiveBackup('قبل تحميل بيانات التجربة الافتراضية');
+    }
+
+    const demoSettings: AppSettings = {
+      ...DEFAULT_SETTINGS,
+      marketplaces: DEFAULT_MARKETPLACES.map((m) => ({ ...m, isActive: true })),
+    };
+
+    const res = this.commitMultiKeyWrites(
+      [
+        { key: this.getScopedKey(STORAGE_KEYS.PRODUCTS, activeId), value: this.stampOwned(DEFAULT_PRODUCTS, activeId) },
+        { key: this.getScopedKey(STORAGE_KEYS.ORDERS, activeId), value: this.stampOwned(DEFAULT_ORDERS, activeId) },
+        { key: this.getScopedKey(STORAGE_KEYS.MOVEMENTS, activeId), value: this.stampOwned(DEFAULT_MOVEMENTS, activeId) },
+        { key: this.getScopedKey(STORAGE_KEYS.RETURNS, activeId), value: this.stampOwned(DEFAULT_RETURNS, activeId) },
+        {
+          key: this.getScopedKey(STORAGE_KEYS.PRICE_HISTORY, activeId),
+          value: this.stampOwned(DEFAULT_PRICE_HISTORY, activeId),
+        },
+        { key: this.getScopedKey(STORAGE_KEYS.SETTINGS, activeId), value: demoSettings },
+        {
+          key: this.getScopedKey(STORAGE_KEYS.FINANCIAL_TRANSACTIONS, activeId),
+          value: this.stampOwned(DEFAULT_FINANCIAL_TRANSACTIONS, activeId),
+        },
+      ],
+      { allowOverwriteCorrupted: true }
+    );
+    if (res.success) {
+      this.appendAdminAuditLog('demo_data_seeded', `تهيئة بيانات التجربة الافتراضية في مساحة التاجر (${activeId}).`);
+    }
+    return res;
   }
 
   /**
@@ -334,23 +773,32 @@ class StorageService {
   }
 
   /**
-   * Developer-only action: wipes all demo/operational entities back to clean empty arrays ([])
-   * while keeping storefront settings intact.
+   * Developer-only / destructive action: captures pre-destructive backup (if data exists),
+   * then wipes operational entities back to clean empty arrays ([]) while preserving storefront settings.
    */
   public clearAllStoreData(): StorageWriteResult {
-    return this.commitMultiKeyWrites(
+    const activeId = this.getActiveMerchantId();
+    if (this.getProducts().length > 0 || this.getOrders().length > 0) {
+      this.createPreDestructiveBackup('قبل مسح بيانات المتجر');
+    }
+
+    const res = this.commitMultiKeyWrites(
       [
-        { key: STORAGE_KEYS.PRODUCTS, value: [] },
-        { key: STORAGE_KEYS.ORDERS, value: [] },
-        { key: STORAGE_KEYS.MOVEMENTS, value: [] },
-        { key: STORAGE_KEYS.RETURNS, value: [] },
-        { key: STORAGE_KEYS.PRICE_HISTORY, value: [] },
-        { key: STORAGE_KEYS.FINANCIAL_TRANSACTIONS, value: [] },
-        { key: STORAGE_KEYS.SMART_IMPORT_HISTORY, value: [] },
-        { key: STORAGE_KEYS.RECOMMENDATIONS, value: [] },
+        { key: this.getScopedKey(STORAGE_KEYS.PRODUCTS, activeId), value: [] },
+        { key: this.getScopedKey(STORAGE_KEYS.ORDERS, activeId), value: [] },
+        { key: this.getScopedKey(STORAGE_KEYS.MOVEMENTS, activeId), value: [] },
+        { key: this.getScopedKey(STORAGE_KEYS.RETURNS, activeId), value: [] },
+        { key: this.getScopedKey(STORAGE_KEYS.PRICE_HISTORY, activeId), value: [] },
+        { key: this.getScopedKey(STORAGE_KEYS.FINANCIAL_TRANSACTIONS, activeId), value: [] },
+        { key: this.getScopedKey(STORAGE_KEYS.SMART_IMPORT_HISTORY, activeId), value: [] },
+        { key: this.getScopedKey(STORAGE_KEYS.RECOMMENDATIONS, activeId), value: [] },
       ],
       { allowOverwriteCorrupted: true }
     );
+    if (res.success) {
+      this.appendAdminAuditLog('store_data_cleared', `مسح بيانات المتجر في المساحة (${activeId}).`);
+    }
+    return res;
   }
 
   // --- Internal Deduplication Helpers ---
@@ -359,22 +807,28 @@ class StorageService {
     incoming: StockMovement[]
   ): StockMovement[] {
     if (!incoming || incoming.length === 0) return existing;
+    const activeId = this.getActiveMerchantId();
     const existingIds = new Set(existing.map((m) => m.id));
+    const existingEventKeys = new Set(existing.filter((m) => m.eventKey).map((m) => m.eventKey!));
     const existingLifecycleKeys = new Set(
       existing
-        .filter((m) => LIFECYCLE_DEDUP_MOVEMENT_TYPES.has(m.type))
+        .filter((m) => !m.eventKey && LIFECYCLE_DEDUP_MOVEMENT_TYPES.has(m.type))
         .map((m) => `${m.type}|${m.productId}|${m.referenceOrderId || ''}|${m.referenceReturnId || ''}`)
     );
 
     const uniqueToAdd: StockMovement[] = [];
     for (const m of incoming) {
       if (m.id && existingIds.has(m.id)) continue;
-      if (LIFECYCLE_DEDUP_MOVEMENT_TYPES.has(m.type)) {
+      if (m.eventKey) {
+        if (existingEventKeys.has(m.eventKey)) continue;
+        existingEventKeys.add(m.eventKey);
+      } else if (LIFECYCLE_DEDUP_MOVEMENT_TYPES.has(m.type)) {
         const sig = `${m.type}|${m.productId}|${m.referenceOrderId || ''}|${m.referenceReturnId || ''}`;
         if (existingLifecycleKeys.has(sig)) continue;
+        existingLifecycleKeys.add(sig);
       }
       if (m.id) existingIds.add(m.id);
-      uniqueToAdd.push(m);
+      uniqueToAdd.push(m.merchantId ? m : { ...m, merchantId: activeId });
     }
 
     if (uniqueToAdd.length === 0) return existing;
@@ -386,10 +840,16 @@ class StorageService {
     incoming: Array<Omit<FinancialTransaction, 'id' | 'date'> & { id?: string; date?: string }>
   ): { list: FinancialTransaction[]; added: FinancialTransaction[] } {
     if (!incoming || incoming.length === 0) return { list: existing, added: [] };
+    const activeId = this.getActiveMerchantId();
     const existingIds = new Set(existing.map((t) => t.id));
+    const existingEventRefs = new Set(
+      existing
+        .filter((t) => t.status !== 'cancelled' && t.eventRef)
+        .map((t) => t.eventRef!)
+    );
     const existingAutoSignatures = new Set(
       existing
-        .filter((t) => t.status !== 'cancelled' && t.source === 'automatic' && t.type !== 'adjustment')
+        .filter((t) => t.status !== 'cancelled' && !t.eventRef && t.source === 'automatic' && t.type !== 'adjustment')
         .map((t) =>
           t.type === 'damage_writeoff'
             ? `auto|${t.orderId}|${t.returnId || ''}|${t.type}|${t.status}|${t.amount}|${t.notes || ''}`
@@ -401,18 +861,24 @@ class StorageService {
     for (let i = 0; i < incoming.length; i++) {
       const tx = incoming[i];
       if (tx.id && existingIds.has(tx.id)) continue;
-      if (tx.status !== 'cancelled' && tx.source === 'automatic' && tx.type !== 'adjustment') {
-        const sig =
-          tx.type === 'damage_writeoff'
-            ? `auto|${tx.orderId}|${tx.returnId || ''}|${tx.type}|${tx.status}|${tx.amount}|${tx.notes || ''}`
-            : `auto|${tx.orderId}|${tx.returnId || ''}|${tx.type}|${tx.status}`;
-        if (existingAutoSignatures.has(sig)) continue;
-        existingAutoSignatures.add(sig);
+      if (tx.status !== 'cancelled') {
+        if (tx.eventRef) {
+          if (existingEventRefs.has(tx.eventRef)) continue;
+          existingEventRefs.add(tx.eventRef);
+        } else if (tx.source === 'automatic' && tx.type !== 'adjustment') {
+          const sig =
+            tx.type === 'damage_writeoff'
+              ? `auto|${tx.orderId}|${tx.returnId || ''}|${tx.type}|${tx.status}|${tx.amount}|${tx.notes || ''}`
+              : `auto|${tx.orderId}|${tx.returnId || ''}|${tx.type}|${tx.status}`;
+          if (existingAutoSignatures.has(sig)) continue;
+          existingAutoSignatures.add(sig);
+        }
       }
 
       const fullTx: FinancialTransaction = {
         id: tx.id || `tx-${Date.now()}-${i}-${Math.random().toString(36).substring(2, 6)}`,
         date: tx.date || new Date().toISOString(),
+        merchantId: tx.merchantId || activeId,
         ...tx,
       };
       existingIds.add(fullTx.id);
@@ -425,7 +891,8 @@ class StorageService {
 
   // --- Products ---
   public getProducts(): Product[] {
-    const raw = this.get<Product[]>(STORAGE_KEYS.PRODUCTS, []);
+    const key = this.getScopedKey(STORAGE_KEYS.PRODUCTS);
+    const raw = this.filterOwned(this.get<Product[]>(key, []));
     return raw.map(normalizeProductCustody);
   }
 
@@ -449,15 +916,17 @@ class StorageService {
   }
 
   public saveProduct(product: Product): StorageWriteResult {
+    const key = this.getScopedKey(STORAGE_KEYS.PRODUCTS);
     const products = this.getProducts();
-    if (this.corruptedKeys.has(STORAGE_KEYS.PRODUCTS)) {
+    if (this.corruptedKeys.has(key)) {
       return {
         success: false,
         error: 'بيانات المنتجات المخزنة تالفة ولا يمكن الكتابة فوقها تلقائياً.',
       };
     }
 
-    const normalized = normalizeProductCustody(product);
+    const activeId = this.getActiveMerchantId();
+    const normalized = normalizeProductCustody({ ...product, merchantId: product.merchantId || activeId });
     const index = products.findIndex((p) => p.id === normalized.id);
     const nowIso = new Date().toISOString();
 
@@ -470,20 +939,22 @@ class StorageService {
         updatedAt: nowIso,
       });
     }
-    return this.set(STORAGE_KEYS.PRODUCTS, products);
+    return this.set(key, products);
   }
 
   public saveProductsBatch(
     nextProducts: Product[],
     newMovements: StockMovement[] = []
   ): StorageWriteResult {
+    const prodKey = this.getScopedKey(STORAGE_KEYS.PRODUCTS);
+    const movKey = this.getScopedKey(STORAGE_KEYS.MOVEMENTS);
     const existingMovements = this.getMovements();
     const writes: Array<{ key: string; value: unknown }> = [
-      { key: STORAGE_KEYS.PRODUCTS, value: nextProducts.map(normalizeProductCustody) },
+      { key: prodKey, value: this.stampOwned(nextProducts.map(normalizeProductCustody)) },
     ];
     if (newMovements.length > 0) {
       writes.push({
-        key: STORAGE_KEYS.MOVEMENTS,
+        key: movKey,
         value: this.prepareMovementsAppend(existingMovements, newMovements),
       });
     }
@@ -491,15 +962,76 @@ class StorageService {
   }
 
   public deleteProduct(id: string): StorageWriteResult {
+    const key = this.getScopedKey(STORAGE_KEYS.PRODUCTS);
     const current = this.getProducts();
-    if (this.corruptedKeys.has(STORAGE_KEYS.PRODUCTS)) {
+    if (this.corruptedKeys.has(key)) {
       return {
         success: false,
         error: 'بيانات المنتجات المخزنة تالفة ولا يمكن تعديلها تلقائياً.',
       };
     }
     const products = current.filter((p) => p.id !== id);
-    return this.set(STORAGE_KEYS.PRODUCTS, products);
+    return this.set(key, products);
+  }
+
+  public allocateStockToPlatform(
+    productId: string,
+    marketplaceId: MarketplaceId,
+    quantity: number,
+    operator: string = 'مدير العمليات'
+  ): StorageWriteResult {
+    const isMarketplaceActive = this.getActiveMarketplaces().some((m) => m.id === marketplaceId);
+    const res = allocateStockToPlatformPure({
+      products: this.getProducts(),
+      productId,
+      marketplaceId,
+      quantity,
+      isMarketplaceActive,
+      operator,
+      merchantId: this.getActiveMerchantId(),
+    });
+    if (!res.success) {
+      return { success: false, error: res.error };
+    }
+    const writes: Array<{ key: string; value: unknown }> = [
+      { key: this.getScopedKey(STORAGE_KEYS.PRODUCTS), value: res.products },
+    ];
+    if (res.movement) {
+      writes.push({
+        key: this.getScopedKey(STORAGE_KEYS.MOVEMENTS),
+        value: this.prepareMovementsAppend(this.getMovements(), [res.movement]),
+      });
+    }
+    return this.commitMultiKeyWrites(writes);
+  }
+
+  public releasePlatformAllocation(
+    productId: string,
+    marketplaceId: MarketplaceId,
+    quantity: number,
+    operator: string = 'مدير العمليات'
+  ): StorageWriteResult {
+    const res = releasePlatformAllocationPure({
+      products: this.getProducts(),
+      productId,
+      marketplaceId,
+      quantity,
+      operator,
+      merchantId: this.getActiveMerchantId(),
+    });
+    if (!res.success) {
+      return { success: false, error: res.error };
+    }
+    const writes: Array<{ key: string; value: unknown }> = [
+      { key: this.getScopedKey(STORAGE_KEYS.PRODUCTS), value: res.products },
+    ];
+    if (res.movement) {
+      writes.push({
+        key: this.getScopedKey(STORAGE_KEYS.MOVEMENTS),
+        value: this.prepareMovementsAppend(this.getMovements(), [res.movement]),
+      });
+    }
+    return this.commitMultiKeyWrites(writes);
   }
 
   public updateProductPriceWithResult(
@@ -544,6 +1076,7 @@ class StorageService {
 
     const historyRecord: PriceHistoryRecord = {
       id: `ph-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+      merchantId: this.getActiveMerchantId(),
       productId: product.id,
       productSku: product.sku || product.name,
       productName: product.name,
@@ -559,8 +1092,8 @@ class StorageService {
 
     const nextHistory = [historyRecord, ...history];
     const writeRes = this.commitMultiKeyWrites([
-      { key: STORAGE_KEYS.PRODUCTS, value: products },
-      { key: STORAGE_KEYS.PRICE_HISTORY, value: nextHistory },
+      { key: this.getScopedKey(STORAGE_KEYS.PRODUCTS), value: products },
+      { key: this.getScopedKey(STORAGE_KEYS.PRICE_HISTORY), value: nextHistory },
     ]);
 
     if (!writeRes.success) {
@@ -589,7 +1122,7 @@ class StorageService {
 
   // --- Orders & Strict Inventory Logic ---
   public getOrders(): Order[] {
-    return this.get<Order[]>(STORAGE_KEYS.ORDERS, []);
+    return this.filterOwned(this.get<Order[]>(this.getScopedKey(STORAGE_KEYS.ORDERS), []));
   }
 
   public getActiveOrders(): Order[] {
@@ -614,11 +1147,15 @@ class StorageService {
     const existingProducts = this.getProducts();
     const existingOrders = this.getOrders();
     const existingMovements = this.getMovements();
+    const activeMarketplaceIds = this.getActiveMarketplaces().map((m) => m.id);
+    const activeMerchantId = this.getActiveMerchantId();
 
     const res = createOrderPure({
       orderData,
       products: existingProducts,
       existingOrders,
+      activeMarketplaceIds,
+      merchantId: activeMerchantId,
       customId,
       operator,
     });
@@ -628,12 +1165,12 @@ class StorageService {
     }
 
     const writes: Array<{ key: string; value: unknown }> = [
-      { key: STORAGE_KEYS.PRODUCTS, value: res.products },
-      { key: STORAGE_KEYS.ORDERS, value: res.orders },
+      { key: this.getScopedKey(STORAGE_KEYS.PRODUCTS), value: res.products },
+      { key: this.getScopedKey(STORAGE_KEYS.ORDERS), value: res.orders },
     ];
     if (res.movements.length > 0) {
       writes.push({
-        key: STORAGE_KEYS.MOVEMENTS,
+        key: this.getScopedKey(STORAGE_KEYS.MOVEMENTS),
         value: this.prepareMovementsAppend(existingMovements, res.movements),
       });
     }
@@ -672,6 +1209,7 @@ class StorageService {
       returns: existingReturns,
       currency: settings.currency || 'SAR',
       operator,
+      merchantId: this.getActiveMerchantId(),
       shipmentDetails,
     });
 
@@ -680,14 +1218,14 @@ class StorageService {
     }
 
     const writes: Array<{ key: string; value: unknown }> = [
-      { key: STORAGE_KEYS.ORDERS, value: res.orders },
-      { key: STORAGE_KEYS.PRODUCTS, value: res.products },
-      { key: STORAGE_KEYS.RETURNS, value: res.returns },
+      { key: this.getScopedKey(STORAGE_KEYS.ORDERS), value: res.orders },
+      { key: this.getScopedKey(STORAGE_KEYS.PRODUCTS), value: res.products },
+      { key: this.getScopedKey(STORAGE_KEYS.RETURNS), value: res.returns },
     ];
 
     if (res.newMovements.length > 0) {
       writes.push({
-        key: STORAGE_KEYS.MOVEMENTS,
+        key: this.getScopedKey(STORAGE_KEYS.MOVEMENTS),
         value: this.prepareMovementsAppend(existingMovements, res.newMovements),
       });
     }
@@ -696,7 +1234,7 @@ class StorageService {
       const txPrep = this.prepareTransactionsAppend(existingTransactions, res.newTransactions);
       if (txPrep.added.length > 0) {
         writes.push({
-          key: STORAGE_KEYS.FINANCIAL_TRANSACTIONS,
+          key: this.getScopedKey(STORAGE_KEYS.FINANCIAL_TRANSACTIONS),
           value: txPrep.list,
         });
       }
@@ -707,7 +1245,9 @@ class StorageService {
 
   // --- Returns Management ---
   public getReturns(): ReturnRecord[] {
-    const raw = this.get<ReturnRecord[]>(STORAGE_KEYS.RETURNS, []);
+    const raw = this.filterOwned(
+      this.get<ReturnRecord[]>(this.getScopedKey(STORAGE_KEYS.RETURNS), [])
+    );
     return raw.map((r) => {
       let status: ReturnStatus = r.returnStatus;
       let isCompleted = r.isCompleted;
@@ -759,6 +1299,7 @@ class StorageService {
       products: existingProducts,
       orders: existingOrders,
       operator,
+      merchantId: this.getActiveMerchantId(),
       notes,
       shipment,
     });
@@ -768,12 +1309,12 @@ class StorageService {
     }
 
     const writes: Array<{ key: string; value: unknown }> = [
-      { key: STORAGE_KEYS.RETURNS, value: res.returns },
-      { key: STORAGE_KEYS.PRODUCTS, value: res.products },
+      { key: this.getScopedKey(STORAGE_KEYS.RETURNS), value: res.returns },
+      { key: this.getScopedKey(STORAGE_KEYS.PRODUCTS), value: res.products },
     ];
     if (res.newMovements.length > 0) {
       writes.push({
-        key: STORAGE_KEYS.MOVEMENTS,
+        key: this.getScopedKey(STORAGE_KEYS.MOVEMENTS),
         value: this.prepareMovementsAppend(existingMovements, res.newMovements),
       });
     }
@@ -786,7 +1327,8 @@ class StorageService {
     outcome: InspectionOutcome,
     condition: 'like_new' | 'opened_good' | 'damaged' | 'lost',
     notes: string,
-    operator: string = 'مدير العمليات'
+    operator: string = 'مدير العمليات',
+    restockTarget?: 'central' | MarketplaceId
   ): {
     success: boolean;
     message: string;
@@ -805,11 +1347,14 @@ class StorageService {
       outcome,
       condition,
       notes,
+      restockTarget,
+      activeMarketplaceIds: this.getActiveMarketplaces().map((m) => m.id),
       returns: existingReturns,
       products: existingProducts,
       orders: existingOrders,
       currency: settings.currency || 'SAR',
       operator,
+      merchantId: this.getActiveMerchantId(),
     });
 
     if (!res.success) {
@@ -817,14 +1362,14 @@ class StorageService {
     }
 
     const writes: Array<{ key: string; value: unknown }> = [
-      { key: STORAGE_KEYS.RETURNS, value: res.returns },
-      { key: STORAGE_KEYS.PRODUCTS, value: res.products },
-      { key: STORAGE_KEYS.ORDERS, value: res.orders },
+      { key: this.getScopedKey(STORAGE_KEYS.RETURNS), value: res.returns },
+      { key: this.getScopedKey(STORAGE_KEYS.PRODUCTS), value: res.products },
+      { key: this.getScopedKey(STORAGE_KEYS.ORDERS), value: res.orders },
     ];
 
     if (res.newMovements.length > 0) {
       writes.push({
-        key: STORAGE_KEYS.MOVEMENTS,
+        key: this.getScopedKey(STORAGE_KEYS.MOVEMENTS),
         value: this.prepareMovementsAppend(existingMovements, res.newMovements),
       });
     }
@@ -833,7 +1378,7 @@ class StorageService {
       const txPrep = this.prepareTransactionsAppend(existingTransactions, res.newTransactions);
       if (txPrep.added.length > 0) {
         writes.push({
-          key: STORAGE_KEYS.FINANCIAL_TRANSACTIONS,
+          key: this.getScopedKey(STORAGE_KEYS.FINANCIAL_TRANSACTIONS),
           value: txPrep.list,
         });
       }
@@ -855,7 +1400,8 @@ class StorageService {
   public registerPostDeliveryReturn(
     orderId: string,
     reason: string,
-    notes?: string
+    notes?: string,
+    selectedItems?: Array<{ productId: string; productSku?: string; quantity: number }>
   ): {
     success: boolean;
     returnRecord?: ReturnRecord;
@@ -874,11 +1420,13 @@ class StorageService {
       orderId,
       reason,
       notes,
+      selectedItems,
       orders: existingOrders,
       returns: existingReturns,
       products: existingProducts,
       currency: settings.currency || 'SAR',
       operator: settings.sellerName || 'مدير العمليات',
+      merchantId: this.getActiveMerchantId(),
     });
 
     if (!res.success) {
@@ -886,14 +1434,14 @@ class StorageService {
     }
 
     const writes: Array<{ key: string; value: unknown }> = [
-      { key: STORAGE_KEYS.PRODUCTS, value: res.products },
-      { key: STORAGE_KEYS.RETURNS, value: res.returns },
-      { key: STORAGE_KEYS.ORDERS, value: res.orders },
+      { key: this.getScopedKey(STORAGE_KEYS.PRODUCTS), value: res.products },
+      { key: this.getScopedKey(STORAGE_KEYS.RETURNS), value: res.returns },
+      { key: this.getScopedKey(STORAGE_KEYS.ORDERS), value: res.orders },
     ];
 
     if (res.newMovements.length > 0) {
       writes.push({
-        key: STORAGE_KEYS.MOVEMENTS,
+        key: this.getScopedKey(STORAGE_KEYS.MOVEMENTS),
         value: this.prepareMovementsAppend(existingMovements, res.newMovements),
       });
     }
@@ -902,7 +1450,7 @@ class StorageService {
       const txPrep = this.prepareTransactionsAppend(existingTransactions, res.newTransactions);
       if (txPrep.added.length > 0) {
         writes.push({
-          key: STORAGE_KEYS.FINANCIAL_TRANSACTIONS,
+          key: this.getScopedKey(STORAGE_KEYS.FINANCIAL_TRANSACTIONS),
           value: txPrep.list,
         });
       }
@@ -937,7 +1485,7 @@ class StorageService {
       return { success: false, error: res.error };
     }
 
-    const writeRes = this.set(STORAGE_KEYS.RETURNS, res.returns);
+    const writeRes = this.set(this.getScopedKey(STORAGE_KEYS.RETURNS), res.returns);
     if (!writeRes.success) {
       return {
         success: false,
@@ -950,7 +1498,12 @@ class StorageService {
 
   // --- Financial Transaction Ledger & Auditable Accounting ---
   public getFinancialTransactions(): FinancialTransaction[] {
-    return this.get<FinancialTransaction[]>(STORAGE_KEYS.FINANCIAL_TRANSACTIONS, []);
+    return this.filterOwned(
+      this.get<FinancialTransaction[]>(
+        this.getScopedKey(STORAGE_KEYS.FINANCIAL_TRANSACTIONS),
+        []
+      )
+    );
   }
 
   public recordFinancialTransactionWithResult(
@@ -962,7 +1515,9 @@ class StorageService {
       const existingMatch = list.find(
         (existing) =>
           (tx.id && existing.id === tx.id) ||
-          (existing.source === 'automatic' &&
+          (tx.eventRef && existing.eventRef === tx.eventRef) ||
+          (!tx.eventRef &&
+            existing.source === 'automatic' &&
             tx.source === 'automatic' &&
             existing.orderId === tx.orderId &&
             (existing.returnId || '') === (tx.returnId || '') &&
@@ -972,7 +1527,10 @@ class StorageService {
       return { success: true, transaction: existingMatch, deduplicated: true };
     }
 
-    const writeRes = this.set(STORAGE_KEYS.FINANCIAL_TRANSACTIONS, prep.list);
+    const writeRes = this.set(
+      this.getScopedKey(STORAGE_KEYS.FINANCIAL_TRANSACTIONS),
+      prep.list
+    );
     if (!writeRes.success) {
       return writeRes;
     }
@@ -983,12 +1541,10 @@ class StorageService {
     tx: Omit<FinancialTransaction, 'id' | 'date'> & { id?: string; date?: string }
   ): FinancialTransaction {
     const res = this.recordFinancialTransactionWithResult(tx);
-    if (res.transaction) return res.transaction;
-    return {
-      id: tx.id || `tx-unsaved-${Date.now()}`,
-      date: tx.date || new Date().toISOString(),
-      ...tx,
-    };
+    if (!res.success || !res.transaction) {
+      throw new Error(res.error || 'تعذر حفظ المعاملة المالية في التخزين المحلي.');
+    }
+    return res.transaction;
   }
 
   public getOrderFinancialBreakdown(orderId: string): OrderFinancialBreakdown | null {
@@ -1162,7 +1718,10 @@ class StorageService {
       }
     }
 
-    const savedRecs = this.get<MerchantRecommendation[]>(STORAGE_KEYS.RECOMMENDATIONS, []);
+    const savedRecs = this.get<MerchantRecommendation[]>(
+      this.getScopedKey(STORAGE_KEYS.RECOMMENDATIONS),
+      []
+    );
     const savedMap = new Map(savedRecs.map((r) => [r.id, r]));
 
     return recs.map((r) => {
@@ -1179,7 +1738,8 @@ class StorageService {
   }
 
   public updateRecommendationStatus(id: string, status: RecommendationStatus): boolean {
-    const list = this.get<MerchantRecommendation[]>(STORAGE_KEYS.RECOMMENDATIONS, []);
+    const key = this.getScopedKey(STORAGE_KEYS.RECOMMENDATIONS);
+    const list = this.get<MerchantRecommendation[]>(key, []);
     const existingIdx = list.findIndex((r) => r.id === id);
     if (existingIdx !== -1) {
       list[existingIdx].status = status;
@@ -1191,7 +1751,7 @@ class StorageService {
         updatedAt: new Date().toISOString(),
       } as MerchantRecommendation);
     }
-    return this.set(STORAGE_KEYS.RECOMMENDATIONS, list).success;
+    return this.set(key, list).success;
   }
 
   // --- Storefront Product Quality Audit ---
@@ -1255,7 +1815,9 @@ class StorageService {
 
   // --- Movements Log ---
   public getMovements(): StockMovement[] {
-    return this.get<StockMovement[]>(STORAGE_KEYS.MOVEMENTS, []);
+    return this.filterOwned(
+      this.get<StockMovement[]>(this.getScopedKey(STORAGE_KEYS.MOVEMENTS), [])
+    );
   }
 
   public recordStockMovements(newMovements: StockMovement[]): StorageWriteResult {
@@ -1263,7 +1825,7 @@ class StorageService {
     const existing = this.getMovements();
     const merged = this.prepareMovementsAppend(existing, newMovements);
     if (merged === existing) return { success: true };
-    return this.set(STORAGE_KEYS.MOVEMENTS, merged);
+    return this.set(this.getScopedKey(STORAGE_KEYS.MOVEMENTS), merged);
   }
 
   public manualStockAdjustmentWithResult(
@@ -1277,7 +1839,9 @@ class StorageService {
       productId,
       newPhysicalStock,
       reason,
-      operator
+      operator,
+      new Date().toISOString(),
+      this.getActiveMerchantId()
     );
 
     if (!res.success) {
@@ -1285,11 +1849,11 @@ class StorageService {
     }
 
     const writes: Array<{ key: string; value: unknown }> = [
-      { key: STORAGE_KEYS.PRODUCTS, value: res.products },
+      { key: this.getScopedKey(STORAGE_KEYS.PRODUCTS), value: res.products },
     ];
     if (res.movement) {
       writes.push({
-        key: STORAGE_KEYS.MOVEMENTS,
+        key: this.getScopedKey(STORAGE_KEYS.MOVEMENTS),
         value: this.prepareMovementsAppend(this.getMovements(), [res.movement]),
       });
     }
@@ -1308,25 +1872,73 @@ class StorageService {
 
   // --- Price History ---
   public getPriceHistory(): PriceHistoryRecord[] {
-    return this.get<PriceHistoryRecord[]>(STORAGE_KEYS.PRICE_HISTORY, []);
+    return this.filterOwned(
+      this.get<PriceHistoryRecord[]>(this.getScopedKey(STORAGE_KEYS.PRICE_HISTORY), [])
+    );
   }
 
   // --- Settings ---
   public getSettings(): AppSettings {
-    return this.get<AppSettings>(STORAGE_KEYS.SETTINGS, DEFAULT_SETTINGS);
+    const settings = this.get<AppSettings>(this.getScopedKey(STORAGE_KEYS.SETTINGS), DEFAULT_SETTINGS);
+    return {
+      ...DEFAULT_SETTINGS,
+      ...settings,
+      marketplaces: (settings.marketplaces || []).map((m) => ({
+        ...m,
+        isActive: m.isActive !== false,
+      })),
+    };
   }
 
   public saveSettings(settings: AppSettings): StorageWriteResult {
-    return this.set(STORAGE_KEYS.SETTINGS, settings);
+    const writeRes = this.set(this.getScopedKey(STORAGE_KEYS.SETTINGS), settings);
+    if (writeRes.success) {
+      this.syncActiveAccountMetadata(settings.storeName, settings.sellerName);
+    }
+    return writeRes;
+  }
+
+  private syncActiveAccountMetadata(storeName?: string, merchantName?: string, email?: string): void {
+    const activeId = this.getActiveMerchantId();
+    const accounts = this.getMerchantAccounts();
+    const idx = accounts.findIndex((a) => a.id === activeId);
+    if (idx !== -1) {
+      accounts[idx] = {
+        ...accounts[idx],
+        storeName: storeName ?? accounts[idx].storeName,
+        merchantName: merchantName ?? accounts[idx].merchantName,
+        email: email ?? accounts[idx].email,
+      };
+      this.set(SYSTEM_STORAGE_KEYS.MERCHANT_ACCOUNTS, accounts);
+    }
   }
 
   public addMarketplace(marketplace: MarketplaceConfig): StorageWriteResult {
     const settings = this.getSettings();
-    if (!settings.marketplaces.some((m) => m.id === marketplace.id)) {
-      settings.marketplaces.push(marketplace);
-      return this.saveSettings(settings);
+    const normalized: MarketplaceConfig = { ...marketplace, isActive: marketplace.isActive !== false };
+    const existingIdx = settings.marketplaces.findIndex((m) => m.id === normalized.id);
+    if (existingIdx === -1) {
+      settings.marketplaces.push(normalized);
+    } else {
+      settings.marketplaces[existingIdx] = {
+        ...settings.marketplaces[existingIdx],
+        ...normalized,
+        isActive: true,
+      };
     }
-    return { success: true };
+
+    const profile = this.getMerchantProfile();
+    const nextSelected = normalized.isActive
+      ? Array.from(new Set([...(profile.selectedMarketplaceIds || []), normalized.id]))
+      : profile.selectedMarketplaceIds;
+
+    return this.commitMultiKeyWrites([
+      { key: this.getScopedKey(STORAGE_KEYS.SETTINGS), value: settings },
+      {
+        key: this.getScopedKey(STORAGE_KEYS.MERCHANT_PROFILE),
+        value: { ...profile, selectedMarketplaceIds: nextSelected },
+      },
+    ]);
   }
 
   // --- Filtered Analytics Helpers ---
@@ -1370,13 +1982,16 @@ class StorageService {
 
   // --- Smart Import (Beta) ---
   public getSmartImportHistory(): SmartImportHistory[] {
-    return this.get<SmartImportHistory[]>(STORAGE_KEYS.SMART_IMPORT_HISTORY, []);
+    return this.filterOwned(
+      this.get<SmartImportHistory[]>(this.getScopedKey(STORAGE_KEYS.SMART_IMPORT_HISTORY), [])
+    );
   }
 
   public saveSmartImportHistory(record: SmartImportHistory): StorageWriteResult {
+    const key = this.getScopedKey(STORAGE_KEYS.SMART_IMPORT_HISTORY);
     const history = this.getSmartImportHistory();
-    history.unshift(record);
-    return this.set(STORAGE_KEYS.SMART_IMPORT_HISTORY, history);
+    history.unshift({ ...record, merchantId: record.merchantId || this.getActiveMerchantId() });
+    return this.set(key, history);
   }
 
   public saveSmartImportOrders(
@@ -1392,12 +2007,16 @@ class StorageService {
     importedCount: number;
     historicalCount: number;
     duplicateCount: number;
+    rejectedCount?: number;
+    rejectedOrders?: SmartImportRejectedOrder[];
   } {
     const existingOrders = this.getOrders();
     const existingProducts = this.getProducts();
     const existingReturns = this.getReturns();
     const existingMovements = this.getMovements();
     const existingHistory = this.getSmartImportHistory();
+    const activeMarketplaceIds = this.getActiveMarketplaces().map((m) => m.id);
+    const activeMerchantId = this.getActiveMerchantId();
 
     const res = saveSmartImportOrdersPure({
       ordersToImport,
@@ -1405,12 +2024,15 @@ class StorageService {
       existingOrders,
       products: existingProducts,
       returns: existingReturns,
+      activeMarketplaceIds,
+      merchantId: activeMerchantId,
       operator,
     });
 
     const historyRecord: SmartImportHistory = {
       id: `smi-${Date.now()}`,
-      marketplaceId: ordersToImport[0]?.marketplaceId || 'noon',
+      merchantId: activeMerchantId,
+      marketplaceId: ordersToImport[0]?.marketplaceId || activeMarketplaceIds[0] || 'custom',
       fileName,
       importedAt: new Date().toISOString(),
       totalImported: res.importedCount + res.historicalCount,
@@ -1419,15 +2041,15 @@ class StorageService {
     };
 
     const writes: Array<{ key: string; value: unknown }> = [
-      { key: STORAGE_KEYS.ORDERS, value: res.orders },
-      { key: STORAGE_KEYS.PRODUCTS, value: res.products },
-      { key: STORAGE_KEYS.RETURNS, value: res.returns },
-      { key: STORAGE_KEYS.SMART_IMPORT_HISTORY, value: [historyRecord, ...existingHistory] },
+      { key: this.getScopedKey(STORAGE_KEYS.ORDERS), value: res.orders },
+      { key: this.getScopedKey(STORAGE_KEYS.PRODUCTS), value: res.products },
+      { key: this.getScopedKey(STORAGE_KEYS.RETURNS), value: res.returns },
+      { key: this.getScopedKey(STORAGE_KEYS.SMART_IMPORT_HISTORY), value: [historyRecord, ...existingHistory] },
     ];
 
     if (res.newMovements.length > 0) {
       writes.push({
-        key: STORAGE_KEYS.MOVEMENTS,
+        key: this.getScopedKey(STORAGE_KEYS.MOVEMENTS),
         value: this.prepareMovementsAppend(existingMovements, res.newMovements),
       });
     }
@@ -1442,6 +2064,8 @@ class StorageService {
         importedCount: 0,
         historicalCount: 0,
         duplicateCount: res.duplicateCount,
+        rejectedCount: res.rejectedCount,
+        rejectedOrders: res.rejectedOrders,
       };
     }
 
@@ -1450,20 +2074,34 @@ class StorageService {
       importedCount: res.importedCount,
       historicalCount: res.historicalCount,
       duplicateCount: res.duplicateCount,
+      rejectedCount: res.rejectedCount,
+      rejectedOrders: res.rejectedOrders,
     };
   }
 
   // --- Merchant Profile & Onboarding ---
   public getMerchantProfile(): MerchantProfile {
-    const profile = this.get<MerchantProfile>(STORAGE_KEYS.MERCHANT_PROFILE, DEFAULT_MERCHANT_PROFILE);
-    if (!profile.merchantName) {
+    const activeId = this.getActiveMerchantId();
+    const profile = this.get<MerchantProfile>(
+      this.getScopedKey(STORAGE_KEYS.MERCHANT_PROFILE, activeId),
+      { ...DEFAULT_MERCHANT_PROFILE, merchantId: activeId }
+    );
+    if (!profile.merchantName && profile.name) {
       profile.merchantName = profile.name;
     }
-    return profile;
+    return {
+      ...profile,
+      merchantId: profile.merchantId || activeId,
+      role: this.getAuthSession().role,
+    };
   }
 
   public saveMerchantProfile(profile: MerchantProfile): StorageWriteResult {
-    const nextProfile = { ...profile };
+    const activeId = this.getActiveMerchantId();
+    const nextProfile: MerchantProfile = {
+      ...profile,
+      merchantId: activeId,
+    };
     if (nextProfile.merchantName && !nextProfile.name) {
       nextProfile.name = nextProfile.merchantName;
     }
@@ -1471,10 +2109,18 @@ class StorageService {
     settings.storeName = nextProfile.storeName;
     settings.sellerName = nextProfile.merchantName || nextProfile.name;
 
-    return this.commitMultiKeyWrites([
-      { key: STORAGE_KEYS.MERCHANT_PROFILE, value: nextProfile },
-      { key: STORAGE_KEYS.SETTINGS, value: settings },
+    const writeRes = this.commitMultiKeyWrites([
+      { key: this.getScopedKey(STORAGE_KEYS.MERCHANT_PROFILE, activeId), value: nextProfile },
+      { key: this.getScopedKey(STORAGE_KEYS.SETTINGS, activeId), value: settings },
     ]);
+    if (writeRes.success) {
+      this.syncActiveAccountMetadata(
+        nextProfile.storeName,
+        nextProfile.merchantName || nextProfile.name,
+        nextProfile.email
+      );
+    }
+    return writeRes;
   }
 
   public completeOnboarding(
@@ -1482,39 +2128,51 @@ class StorageService {
     param2: string,
     param3?: string | string[] | MarketplaceConfig[]
   ): StorageWriteResult {
-    let merchantName = 'أحمد بكر';
-    let storeName = 'متجر الأناقة الحديثة';
-    let marketplaces: MarketplaceConfig[] = this.getMarketplaces();
+    const profile = this.getMerchantProfile();
+    const settings = this.getSettings();
+
+    let merchantName = profile.merchantName || profile.name || settings.sellerName || '';
+    let storeName = profile.storeName || settings.storeName || '';
+    let marketplaces: MarketplaceConfig[] = this.getAllMarketplaces();
 
     if (Array.isArray(param1)) {
-      marketplaces = param1 as MarketplaceConfig[];
-      merchantName = typeof param2 === 'string' ? param2 : merchantName;
-      storeName = typeof param3 === 'string' ? param3 : storeName;
+      marketplaces = (param1 as MarketplaceConfig[]).map((m) => ({
+        ...m,
+        isActive: m.isActive !== false,
+      }));
+      merchantName = typeof param2 === 'string' && param2.trim() ? param2.trim() : merchantName;
+      storeName = typeof param3 === 'string' && param3.trim() ? param3.trim() : storeName;
     } else if (typeof param1 === 'string') {
-      merchantName = param1;
-      storeName = param2;
+      if (param1.trim()) merchantName = param1.trim();
+      if (typeof param2 === 'string' && param2.trim()) storeName = param2.trim();
       if (Array.isArray(param3) && param3.length > 0 && typeof param3[0] === 'object') {
-        marketplaces = param3 as MarketplaceConfig[];
+        marketplaces = (param3 as MarketplaceConfig[]).map((m) => ({
+          ...m,
+          isActive: m.isActive !== false,
+        }));
       }
     }
 
-    const settings = this.getSettings();
     settings.marketplaces = marketplaces;
     settings.storeName = storeName;
     settings.sellerName = merchantName;
 
-    const profile = this.getMerchantProfile();
     profile.name = merchantName;
     profile.merchantName = merchantName;
     profile.storeName = storeName;
     profile.isOnboarded = true;
-    profile.selectedMarketplaceIds = marketplaces.map((m) => m.id);
+    profile.selectedMarketplaceIds = marketplaces.filter((m) => m.isActive !== false).map((m) => m.id);
     profile.onboardedAt = new Date().toISOString();
 
-    return this.commitMultiKeyWrites([
-      { key: STORAGE_KEYS.SETTINGS, value: settings },
-      { key: STORAGE_KEYS.MERCHANT_PROFILE, value: profile },
+    const activeId = this.getActiveMerchantId();
+    const writeRes = this.commitMultiKeyWrites([
+      { key: this.getScopedKey(STORAGE_KEYS.SETTINGS, activeId), value: settings },
+      { key: this.getScopedKey(STORAGE_KEYS.MERCHANT_PROFILE, activeId), value: profile },
     ]);
+    if (writeRes.success) {
+      this.syncActiveAccountMetadata(storeName, merchantName, profile.email);
+    }
+    return writeRes;
   }
 
   // --- Tutorial & Interactive Learning Progress ---
@@ -1554,10 +2212,24 @@ class StorageService {
     return profile.exploredFeatures.includes(featureId);
   }
 
-  // --- Dynamic Marketplace Management ---
+  // --- Dynamic Marketplace Management (Single Source of Truth) ---
+  public getAllMarketplaces(): MarketplaceConfig[] {
+    return this.getSettings().marketplaces.map((m) => ({
+      ...m,
+      isActive: m.isActive !== false,
+    }));
+  }
+
+  public getActiveMarketplaces(): MarketplaceConfig[] {
+    return this.getAllMarketplaces().filter((m) => m.isActive !== false);
+  }
+
   public getMarketplaces(): MarketplaceConfig[] {
-    const settings = this.getSettings();
-    return settings.marketplaces;
+    return this.getAllMarketplaces();
+  }
+
+  public getMarketplaceById(id: string): MarketplaceConfig | undefined {
+    return this.getAllMarketplaces().find((m) => m.id === id);
   }
 
   public updateMarketplace(id: string, updates: Partial<MarketplaceConfig>): boolean {
@@ -1572,19 +2244,55 @@ class StorageService {
     return this.saveSettings(settings).success;
   }
 
-  public removeMarketplace(id: string): StorageWriteResult {
+  public setMarketplaceActive(id: string, isActive: boolean): StorageWriteResult {
     const settings = this.getSettings();
-    if (settings.marketplaces.length <= 1) {
-      return { success: false, error: 'يجب الإبقاء على منصة بيع واحدة على الأقل.' };
+    const idx = settings.marketplaces.findIndex((m) => m.id === id);
+    if (idx === -1) {
+      return { success: false, error: 'المنصة المطلوبة غير موجودة.' };
     }
+    settings.marketplaces[idx] = {
+      ...settings.marketplaces[idx],
+      isActive,
+    };
 
-    settings.marketplaces = settings.marketplaces.filter((m) => m.id !== id);
     const profile = this.getMerchantProfile();
-    profile.selectedMarketplaceIds = profile.selectedMarketplaceIds.filter((mId) => mId !== id);
+    const nextSelected = settings.marketplaces
+      .filter((m) => m.isActive !== false)
+      .map((m) => m.id);
 
     return this.commitMultiKeyWrites([
-      { key: STORAGE_KEYS.SETTINGS, value: settings },
-      { key: STORAGE_KEYS.MERCHANT_PROFILE, value: profile },
+      { key: this.getScopedKey(STORAGE_KEYS.SETTINGS), value: settings },
+      {
+        key: this.getScopedKey(STORAGE_KEYS.MERCHANT_PROFILE),
+        value: { ...profile, selectedMarketplaceIds: nextSelected },
+      },
+    ]);
+  }
+
+  public removeMarketplace(id: string): StorageWriteResult {
+    const hasOrders = this.getOrders().some((o) => o.marketplaceId === id);
+    const hasReturns = this.getReturns().some((r) => r.marketplaceId === id);
+    const hasPriceHistory = this.getPriceHistory().some((ph) => ph.marketplaceId === id);
+    const hasActiveAlloc = this.getProducts().some(
+      (p) => (p.platformAllocations?.[id]?.allocatedQty || 0) > 0
+    );
+
+    if (hasOrders || hasReturns || hasPriceHistory || hasActiveAlloc) {
+      return {
+        success: false,
+        error:
+          'لا يمكن حذف منصة مرتبطة بطلبات أو مرتجعات أو تخصيص مخزون تاريخي حفاظاً على السجلات؛ يمكنك تعطيلها (إيقاف التفعيل) بدلاً من الحذف.',
+      };
+    }
+
+    const settings = this.getSettings();
+    settings.marketplaces = settings.marketplaces.filter((m) => m.id !== id);
+    const profile = this.getMerchantProfile();
+    profile.selectedMarketplaceIds = (profile.selectedMarketplaceIds || []).filter((mId) => mId !== id);
+
+    return this.commitMultiKeyWrites([
+      { key: this.getScopedKey(STORAGE_KEYS.SETTINGS), value: settings },
+      { key: this.getScopedKey(STORAGE_KEYS.MERCHANT_PROFILE), value: profile },
     ]);
   }
 }

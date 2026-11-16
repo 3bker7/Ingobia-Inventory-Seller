@@ -10,6 +10,8 @@ import {
 } from 'lucide-react';
 import { Order } from '../../types';
 import { storageService } from '../../services/storage';
+import { getOrderReturnableItems } from '../../domain/returnLifecycle';
+import { resolveSafeProductImage } from '../../utils/productVisual';
 import { translations, Locale } from '../../locales/translations';
 import { Modal } from '../common/Modal';
 import { useToast } from '../common/Toast';
@@ -28,19 +30,25 @@ export const CompletedOrdersPage: React.FC<CompletedOrdersPageProps> = ({
   const t = translations[locale];
   const { showToast } = useToast();
   const settings = storageService.getSettings();
+  const isRtl = locale === 'ar';
+  const allMarketplaces = storageService.getAllMarketplaces();
 
   const [orders, setOrders] = useState<Order[]>(() => storageService.getCompletedOrders());
+  const [allReturns, setAllReturns] = useState(() => storageService.getReturns());
   const [searchQuery, setSearchQuery] = useState('');
   const [workflowFilter, setWorkflowFilter] = useState<'all' | 'delivered' | 'return_completed'>('all');
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
   // Modals state
   const [viewOrder, setViewOrder] = useState<Order | null>(null);
   const [orderForReturn, setOrderForReturn] = useState<Order | null>(null);
   const [returnReason, setReturnReason] = useState('');
   const [returnNotes, setReturnNotes] = useState('');
+  const [selectedReturnQtys, setSelectedReturnQtys] = useState<Record<string, number>>({});
 
   const refreshOrders = () => {
     setOrders(storageService.getCompletedOrders());
+    setAllReturns(storageService.getReturns());
   };
 
   const filteredOrders = useMemo(() => {
@@ -61,33 +69,68 @@ export const CompletedOrdersPage: React.FC<CompletedOrdersPageProps> = ({
     });
   }, [orders, searchQuery, workflowFilter]);
 
-  // Handle post-delivery return registration
+  const handleOpenPostDeliveryReturn = (order: Order) => {
+    const eligible = getOrderReturnableItems(order, allReturns);
+    const initialQtys: Record<string, number> = {};
+    eligible.forEach((entry) => {
+      if (entry.remainingQty > 0) {
+        initialQtys[entry.item.productId] = entry.remainingQty;
+      }
+    });
+    setSelectedReturnQtys(initialQtys);
+    setReturnReason('');
+    setReturnNotes('');
+    setOrderForReturn(order);
+  };
+
+  // Handle post-delivery return registration (supports partial or full returns)
   const handleRegisterPostDeliveryReturn = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!orderForReturn) return;
+    if (!orderForReturn || isSubmitting) return;
     if (!returnReason.trim()) {
-      showToast(locale === 'ar' ? 'يرجى كتابة سبب الإرجاع.' : 'Return reason is required.', 'warning');
+      showToast(isRtl ? 'يرجى كتابة سبب الإرجاع.' : 'Return reason is required.', 'warning');
       return;
     }
 
-    const res = storageService.registerPostDeliveryReturn(
-      orderForReturn.id,
-      returnReason.trim(),
-      returnNotes.trim()
-    );
+    const eligible = getOrderReturnableItems(orderForReturn, allReturns);
+    const selectedItems = eligible
+      .filter((entry) => (selectedReturnQtys[entry.item.productId] || 0) > 0)
+      .map((entry) => ({
+        productId: entry.item.productId,
+        productSku: entry.item.productSku,
+        quantity: Math.min(entry.remainingQty, selectedReturnQtys[entry.item.productId] || 0),
+      }))
+      .filter((item) => item.quantity > 0);
 
-    if (res.success) {
-      showToast(t.toasts.postDeliveryReturnRegistered, 'success');
-      setOrderForReturn(null);
-      setReturnReason('');
-      setReturnNotes('');
-      refreshOrders();
-      onDataChange?.();
-      if (onNavigateToReturns) {
-        // Optionally notify user they can track in Returns page
+    if (selectedItems.length === 0) {
+      showToast(isRtl ? 'يرجى تحديد منتج واحد وكمية صالحة على الأقل للإرجاع.' : 'Select at least one unit to return.', 'warning');
+      return;
+    }
+
+    setIsSubmitting(true);
+    try {
+      const res = storageService.registerPostDeliveryReturn(
+        orderForReturn.id,
+        returnReason.trim(),
+        returnNotes.trim(),
+        selectedItems
+      );
+
+      if (res.success) {
+        showToast(t.toasts.postDeliveryReturnRegistered, 'success');
+        setOrderForReturn(null);
+        setReturnReason('');
+        setReturnNotes('');
+        refreshOrders();
+        onDataChange?.();
+        if (onNavigateToReturns) {
+          // User can navigate via Returns tab when ready
+        }
+      } else {
+        showToast(res.error || t.toasts.error, 'error');
       }
-    } else {
-      showToast(res.error || t.toasts.error, 'error');
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -181,9 +224,12 @@ export const CompletedOrdersPage: React.FC<CompletedOrdersPageProps> = ({
                 </tr>
               ) : (
                 filteredOrders.map((order) => {
-                  const mkt = settings.marketplaces.find((m) => m.id === order.marketplaceId);
+                  const mkt = allMarketplaces.find((m) => m.id === order.marketplaceId);
+                  const isDisabledMkt = mkt ? !mkt.isActive : true;
                   const firstItem = order.items[0];
                   const isDelivered = order.closedReason === 'delivered';
+                  const returnableSummary = isDelivered ? getOrderReturnableItems(order, allReturns) : [];
+                  const totalRemaining = returnableSummary.reduce((sum, entry) => sum + entry.remainingQty, 0);
 
                   return (
                     <tr key={order.id} className="hover:bg-[#F7F8FA]/60 transition-colors">
@@ -192,7 +238,7 @@ export const CompletedOrdersPage: React.FC<CompletedOrdersPageProps> = ({
                         {order.id}
                         {order.hasPostDeliveryReturn && (
                           <span className="block text-[10px] text-purple-700 font-sans font-semibold">
-                            {locale === 'ar' ? 'مرتجع لاحق مسجل' : 'Post-return filed'}
+                            {isRtl ? 'مرتجع لاحق مسجل' : 'Post-return filed'}
                           </span>
                         )}
                       </td>
@@ -200,14 +246,15 @@ export const CompletedOrdersPage: React.FC<CompletedOrdersPageProps> = ({
                       {/* Marketplace */}
                       <td className="py-3 px-3">
                         <span
-                          className="px-2 py-0.5 rounded text-[10px] font-semibold border"
+                          className="px-2 py-0.5 rounded text-[10px] font-semibold border whitespace-nowrap inline-block"
                           style={{
-                            backgroundColor: mkt?.badgeBg || '#FEF9C3',
-                            color: mkt?.badgeText || '#854D0E',
-                            borderColor: '#E8ECF2',
+                            backgroundColor: isDisabledMkt ? '#F1F5F9' : mkt?.badgeBg || '#F1F5F9',
+                            color: isDisabledMkt ? '#475569' : mkt?.badgeText || '#475569',
+                            borderColor: '#E2E8F0',
                           }}
                         >
-                          {locale === 'ar' ? mkt?.nameAr || order.marketplaceId : mkt?.nameEn || order.marketplaceId}
+                          {isRtl ? mkt?.nameAr || order.marketplaceId : mkt?.nameEn || order.marketplaceId}
+                          {isDisabledMkt ? (isRtl ? ' [معطلة]' : ' [Disabled]') : ''}
                         </span>
                       </td>
 
@@ -216,7 +263,7 @@ export const CompletedOrdersPage: React.FC<CompletedOrdersPageProps> = ({
                         <div className="flex items-center gap-2">
                           {firstItem && (
                             <img
-                              src={firstItem.imageUrl}
+                              src={resolveSafeProductImage(firstItem.imageUrl, firstItem.productName)}
                               alt={firstItem.productName}
                               referrerPolicy="no-referrer"
                               className="w-8 h-8 rounded object-cover border border-[#E8ECF2] shrink-0"
@@ -261,7 +308,7 @@ export const CompletedOrdersPage: React.FC<CompletedOrdersPageProps> = ({
                       {/* Date */}
                       <td className="py-3 px-3 text-[#64748B] text-[11px] tabular-nums whitespace-nowrap">
                         {new Date(order.closedAt || order.updatedAt).toLocaleDateString(
-                          locale === 'ar' ? 'ar-SA' : 'en-US',
+                          isRtl ? 'ar-SA' : 'en-US',
                           { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' }
                         )}
                       </td>
@@ -271,25 +318,27 @@ export const CompletedOrdersPage: React.FC<CompletedOrdersPageProps> = ({
                         <div className="flex items-center justify-center gap-1.5">
                           <button
                             onClick={() => setViewOrder(order)}
-                            className="p-1.5 text-[#64748B] hover:text-[#172033] hover:bg-[#F7F8FA] rounded transition-colors"
+                            className="p-1.5 text-[#64748B] hover:text-[#172033] hover:bg-[#F7F8FA] rounded transition-colors cursor-pointer"
                             title={t.actions.viewDetails}
                           >
                             <Eye className="w-3.5 h-3.5" />
                           </button>
 
-                          {/* Specific Action: Register New Return (for delivered orders) */}
+                          {/* Specific Action: Register New Return (bounded by remaining returnable units) */}
                           {isDelivered && (
-                            <button
-                              onClick={() => {
-                                setOrderForReturn(order);
-                                setReturnReason('');
-                                setReturnNotes('');
-                              }}
-                              className="px-2.5 py-1 text-[11px] font-semibold text-[#2563EB] hover:bg-blue-50 border border-blue-200 rounded-md transition-colors"
-                              title={t.completedOrders.registerReturnBtn}
-                            >
-                              {t.completedOrders.registerReturnBtn}
-                            </button>
+                            totalRemaining > 0 ? (
+                              <button
+                                onClick={() => handleOpenPostDeliveryReturn(order)}
+                                className="px-2.5 py-1 text-[11px] font-semibold text-[#2563EB] hover:bg-blue-50 border border-blue-200 rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                                title={t.completedOrders.registerReturnBtn}
+                              >
+                                {t.completedOrders.registerReturnBtn}
+                              </button>
+                            ) : (
+                              <span className="px-2 py-0.5 text-[10px] font-semibold text-[#64748B] bg-slate-100 rounded border border-slate-200 whitespace-nowrap">
+                                {isRtl ? 'تم الإرجاع بالكامل' : 'Fully Returned'}
+                              </span>
+                            )
                           )}
                         </div>
                       </td>
@@ -377,7 +426,7 @@ export const CompletedOrdersPage: React.FC<CompletedOrdersPageProps> = ({
         )}
       </Modal>
 
-      {/* Register New Return Modal (Exclusive to Completed Orders) */}
+      {/* Register New Return Modal (Supports Partial or Full Post-Delivery Return) */}
       <Modal
         isOpen={orderForReturn !== null}
         onClose={() => setOrderForReturn(null)}
@@ -391,6 +440,73 @@ export const CompletedOrdersPage: React.FC<CompletedOrdersPageProps> = ({
               {t.completedOrders.registerReturnDesc}
             </div>
 
+            {/* Per-item partial return selection bounded by remaining quantity */}
+            <div className="space-y-2">
+              <label className="block font-semibold text-[#172033]">
+                {isRtl ? 'اختر الأصناف والكميات المراد إرجاعها:' : 'Select Items & Quantities to Return:'}
+              </label>
+              <div className="divide-y divide-[#E8ECF2] border border-[#E8ECF2] rounded-lg overflow-hidden bg-white">
+                {getOrderReturnableItems(orderForReturn, allReturns).map((entry) => {
+                  const qty = selectedReturnQtys[entry.item.productId] || 0;
+                  const isChecked = qty > 0 && entry.remainingQty > 0;
+                  return (
+                    <div
+                      key={entry.item.productId}
+                      className="flex items-center justify-between gap-3 p-2.5"
+                    >
+                      <label className="flex items-center gap-2.5 min-w-0 flex-1 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          disabled={entry.remainingQty <= 0}
+                          checked={isChecked}
+                          onChange={(e) => {
+                            const checked = e.target.checked;
+                            setSelectedReturnQtys((prev) => ({
+                              ...prev,
+                              [entry.item.productId]: checked ? entry.remainingQty : 0,
+                            }));
+                          }}
+                          className="rounded border-slate-300 text-[#2563EB]"
+                        />
+                        <div className="min-w-0">
+                          <div className="font-semibold text-[#172033] truncate">
+                            {entry.item.productName}
+                          </div>
+                          <div className="text-[10px] text-[#64748B] font-mono-code">
+                            SKU: {entry.item.productSku} ·{' '}
+                            {isRtl
+                              ? `مطلوب ${entry.orderedQty} | مُرجع ${entry.alreadyReturnedQty} | متبقي ${entry.remainingQty}`
+                              : `Ordered ${entry.orderedQty} | Returned ${entry.alreadyReturnedQty} | Eligible ${entry.remainingQty}`}
+                          </div>
+                        </div>
+                      </label>
+
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        <input
+                          type="number"
+                          min={0}
+                          max={entry.remainingQty}
+                          disabled={entry.remainingQty <= 0 || !isChecked}
+                          value={qty}
+                          onChange={(e) => {
+                            const parsed = Math.max(
+                              0,
+                              Math.min(entry.remainingQty, parseInt(e.target.value, 10) || 0)
+                            );
+                            setSelectedReturnQtys((prev) => ({
+                              ...prev,
+                              [entry.item.productId]: parsed,
+                            }));
+                          }}
+                          className="w-16 px-2 py-1 text-center font-mono-code font-bold bg-[#F7F8FA] border border-[#E8ECF2] rounded-md tabular-nums disabled:opacity-50"
+                        />
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
             <div>
               <label className="block font-semibold text-[#172033] mb-1">
                 {t.completedOrders.returnReasonLabel}
@@ -400,14 +516,14 @@ export const CompletedOrdersPage: React.FC<CompletedOrdersPageProps> = ({
                 required
                 value={returnReason}
                 onChange={(e) => setReturnReason(e.target.value)}
-                placeholder={locale === 'ar' ? 'مثال: مقاس غير مناسب، رغبة في الاستبدال، منتج معيب...' : 'e.g. Size mismatch, defective unit, customer change of mind...'}
+                placeholder={isRtl ? 'مثال: مقاس غير مناسب، رغبة في الاستبدال، منتج معيب...' : 'e.g. Size mismatch, defective unit, customer change of mind...'}
                 className="w-full px-3 py-2 bg-[#F7F8FA] border border-[#E8ECF2] rounded-lg text-[#172033] focus:outline-none focus:ring-1 focus:ring-[#2563EB]"
               />
             </div>
 
             <div>
               <label className="block font-semibold text-[#172033] mb-1">
-                {locale === 'ar' ? 'ملاحظات إضافية أو رقم بوليصة الإرجاع' : 'Additional Notes / Return AWB'}
+                {isRtl ? 'ملاحظات إضافية أو رقم بوليصة الإرجاع' : 'Additional Notes / Return AWB'}
               </label>
               <textarea
                 rows={2}
@@ -422,15 +538,16 @@ export const CompletedOrdersPage: React.FC<CompletedOrdersPageProps> = ({
               <button
                 type="button"
                 onClick={() => setOrderForReturn(null)}
-                className="px-3.5 py-1.5 text-xs font-medium text-[#64748B] hover:text-[#172033] bg-[#F7F8FA] rounded-lg transition-colors"
+                className="px-3.5 py-1.5 text-xs font-medium text-[#64748B] hover:text-[#172033] bg-[#F7F8FA] rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
               >
                 {t.actions.cancel}
               </button>
               <button
                 type="submit"
-                className="px-4 py-1.5 text-xs font-semibold text-white bg-[#2563EB] hover:bg-blue-700 rounded-lg transition-colors shadow-sm"
+                disabled={isSubmitting}
+                className="px-4 py-1.5 text-xs font-semibold text-white bg-[#2563EB] hover:bg-blue-700 disabled:opacity-50 rounded-lg transition-colors shadow-sm whitespace-nowrap shrink-0 cursor-pointer"
               >
-                {locale === 'ar' ? 'بدء دورة المرتجع' : 'Initiate Return Cycle'}
+                {isRtl ? 'بدء دورة المرتجع' : 'Initiate Return Cycle'}
               </button>
             </div>
           </form>

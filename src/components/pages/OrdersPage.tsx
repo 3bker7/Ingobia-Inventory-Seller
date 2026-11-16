@@ -30,6 +30,8 @@ import {
   OrderFinancialAdjustment,
 } from '../../types';
 import { storageService } from '../../services/storage';
+import { getSellableCapacityForMarketplace } from '../../domain/inventoryCustody';
+import { resolveSafeProductImage } from '../../utils/productVisual';
 import { translations, Locale } from '../../locales/translations';
 import { Modal } from '../common/Modal';
 import { useToast } from '../common/Toast';
@@ -62,11 +64,15 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
   const settings = storageService.getSettings();
   const isRtl = locale === 'ar';
 
+  const activeMarketplaces = storageService.getActiveMarketplaces();
+  const allMarketplaces = storageService.getAllMarketplaces();
+
   // Active orders only
   const [orders, setOrders] = useState<Order[]>(() => storageService.getActiveOrders());
   const [searchOrderId, setSearchOrderId] = useState('');
   const [selectedMarketplace, setSelectedMarketplace] = useState<string>('all');
   const [selectedStatus, setSelectedStatus] = useState<string>(initialStatusFilter || 'all');
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
   React.useEffect(() => {
     if (initialStatusFilter) {
@@ -83,7 +89,9 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
 
   // SKU-First Add Order Form State
   const [formOrderId, setFormOrderId] = useState(`ORD-${Math.floor(1000 + Math.random() * 9000)}`);
-  const [formMarketplace, setFormMarketplace] = useState<MarketplaceId>('noon');
+  const [formMarketplace, setFormMarketplace] = useState<MarketplaceId>(
+    () => activeMarketplaces[0]?.id || ''
+  );
   const [formCustomerName, setFormCustomerName] = useState('');
   const [formCustomerPhone, setFormCustomerPhone] = useState('');
   const [formShippingAddress, setFormShippingAddress] = useState('');
@@ -93,11 +101,11 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
   const [formPackagingCost, setFormPackagingCost] = useState<number>(3);
   const [formNotes, setFormNotes] = useState('');
 
-  // Sku line items
+  // Sku line items (no hardcoded product SKU)
   const [skuItems, setSkuItems] = useState<SkuLineItem[]>([
     {
-      skuInput: 'ELEC-WATCH-01',
-      matchedProduct: storageService.getProductBySku('ELEC-WATCH-01') || null,
+      skuInput: '',
+      matchedProduct: null,
       quantity: 1,
     },
   ]);
@@ -140,7 +148,7 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
     const firstInStock = products.find((p) => p.availableStock > 0) || products[0];
 
     setFormOrderId(`ORD-${Math.floor(1000 + Math.random() * 9000)}`);
-    setFormMarketplace(settings.marketplaces[0]?.id || 'noon');
+    setFormMarketplace(activeMarketplaces[0]?.id || '');
     setFormCustomerName('');
     setFormCustomerPhone('');
     setFormShippingAddress('');
@@ -216,8 +224,17 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
 
   const handleCreateOrderSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSubmitting) return;
 
-    // 1. Validation: every line must match a product
+    if (!formMarketplace) {
+      showToast(
+        isRtl ? 'يرجى تفعيل منصة بيع واحدة على الأقل من الإعدادات أولاً.' : 'Please enable at least one marketplace in Settings.',
+        'warning'
+      );
+      return;
+    }
+
+    // 1. Validation: every line must match a product & respect channel sellable capacity
     for (let i = 0; i < skuItems.length; i++) {
       const it = skuItems[i];
       if (!it.matchedProduct) {
@@ -235,124 +252,135 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
         return;
       }
 
-      if (it.matchedProduct.availableStock < it.quantity) {
+      const capacity = getSellableCapacityForMarketplace(it.matchedProduct, formMarketplace);
+      if (capacity.sellable < it.quantity) {
         showToast(
           isRtl
-            ? `الكمية المطلوبة (${it.quantity}) للمنتج ${it.matchedProduct.name} تتجاوز المخزون المتاح للبيع (${it.matchedProduct.availableStock})!`
-            : `Quantity exceeds available stock (${it.matchedProduct.availableStock})!`,
+            ? `الكمية المطلوبة (${it.quantity}) للمنتج ${it.matchedProduct.name} تتجاوز الرصيد المتاح (${capacity.sellable}) ${capacity.source === 'platform' ? 'المخصص لهذه المنصة' : 'في المستودع المركزي'}!`
+            : `Quantity exceeds ${capacity.source} available capacity (${capacity.sellable})!`,
           'error'
         );
         return;
       }
     }
 
-    const orderItems: OrderItem[] = skuItems.map((it) => {
-      const prod = it.matchedProduct!;
-      const listingPrice =
-        prod.marketplaceListings[formMarketplace]?.price || prod.currentPrice;
+    setIsSubmitting(true);
+    try {
+      const orderItems: OrderItem[] = skuItems.map((it) => {
+        const prod = it.matchedProduct!;
+        const listingPrice =
+          prod.marketplaceListings[formMarketplace]?.price || prod.currentPrice;
 
-      return {
-        productId: prod.id,
-        productSku: prod.sku || prod.name,
-        productName: isRtl && prod.nameAr ? prod.nameAr : prod.name,
-        imageUrl: prod.imageUrl,
-        unitPrice: listingPrice,
-        unitCostSnapshot:
-          typeof prod.baseCost === 'number' && prod.baseCost > 0 ? prod.baseCost : undefined,
-        quantity: it.quantity,
-      };
-    });
-
-    const adjustments: OrderFinancialAdjustment[] = [];
-    if (extraShipping > 0) {
-      adjustments.push({
-        id: `adj-ship-${Date.now()}`,
-        description: isRtl ? 'رسوم شحن إضافية' : 'Extra shipping fee',
-        amount: extraShipping,
-        type: 'extra_shipping',
-        payer: 'customer',
+        return {
+          productId: prod.id,
+          productSku: prod.sku || prod.name,
+          productName: isRtl && prod.nameAr ? prod.nameAr : prod.name,
+          imageUrl: resolveSafeProductImage(prod.imageUrl, prod.name, prod.category),
+          unitPrice: listingPrice,
+          unitCostSnapshot:
+            typeof prod.baseCost === 'number' && prod.baseCost > 0 ? prod.baseCost : undefined,
+          quantity: it.quantity,
+        };
       });
-    }
-    if (discountAmount > 0) {
-      adjustments.push({
-        id: `adj-disc-${Date.now()}`,
-        description: isRtl ? 'خصم ترويجي' : 'Promotional discount',
-        amount: discountAmount,
-        type: 'discount',
-        payer: 'seller',
-      });
-    }
 
-    const totalAmount = calculateOrderTotal();
+      const adjustments: OrderFinancialAdjustment[] = [];
+      if (extraShipping > 0) {
+        adjustments.push({
+          id: `adj-ship-${Date.now()}`,
+          description: isRtl ? 'رسوم شحن إضافية' : 'Extra shipping fee',
+          amount: extraShipping,
+          type: 'extra_shipping',
+          payer: 'customer',
+        });
+      }
+      if (discountAmount > 0) {
+        adjustments.push({
+          id: `adj-disc-${Date.now()}`,
+          description: isRtl ? 'خصم ترويجي' : 'Promotional discount',
+          amount: discountAmount,
+          type: 'discount',
+          payer: 'seller',
+        });
+      }
 
-    const shipmentRecord: ShipmentRecord = {
-      courierName: formCourierName.trim() || 'شركة الشحن',
-      trackingNumber: formTrackingNumber.trim() || `TRK-${Math.floor(100000 + Math.random() * 900000)}`,
-      shippingCost: formShippingCost,
-      costPayer: 'seller',
-      notes: formNotes.trim() || undefined,
-    };
+      const totalAmount = calculateOrderTotal();
 
-    const result = storageService.createOrder(
-      {
-        marketplaceId: formMarketplace,
-        items: orderItems,
-        totalAmount,
-        status: 'preparing',
-        customerName: formCustomerName.trim() || undefined,
-        customerPhone: formCustomerPhone.trim() || undefined,
-        shippingAddress: formShippingAddress.trim() || undefined,
-        notes: formNotes.trim() || undefined,
-        orderDate: new Date().toISOString(),
-        shipment: shipmentRecord,
-        courierName: shipmentRecord.courierName,
-        trackingNumber: shipmentRecord.trackingNumber,
+      const shipmentRecord: ShipmentRecord = {
+        courierName: formCourierName.trim() || 'شركة الشحن',
+        trackingNumber: formTrackingNumber.trim() || `TRK-${Math.floor(100000 + Math.random() * 900000)}`,
         shippingCost: formShippingCost,
-        packagingCost: formPackagingCost,
-        adjustments,
-      },
-      formOrderId,
-      settings.sellerName
-    );
+        costPayer: 'seller',
+        notes: formNotes.trim() || undefined,
+      };
 
-    if (result.success) {
-      showToast(t.toasts.orderCreated, 'success');
-      setIsAddModalOpen(false);
-      if (onCloseInitialAddModal) onCloseInitialAddModal();
-      refreshOrders();
-    } else {
-      showToast(result.error || t.toasts.error, 'error');
+      const result = storageService.createOrder(
+        {
+          marketplaceId: formMarketplace,
+          items: orderItems,
+          totalAmount,
+          status: 'preparing',
+          customerName: formCustomerName.trim() || undefined,
+          customerPhone: formCustomerPhone.trim() || undefined,
+          shippingAddress: formShippingAddress.trim() || undefined,
+          notes: formNotes.trim() || undefined,
+          orderDate: new Date().toISOString(),
+          shipment: shipmentRecord,
+          courierName: shipmentRecord.courierName,
+          trackingNumber: shipmentRecord.trackingNumber,
+          shippingCost: formShippingCost,
+          packagingCost: formPackagingCost,
+          adjustments,
+        },
+        formOrderId,
+        settings.sellerName
+      );
+
+      if (result.success) {
+        showToast(t.toasts.orderCreated, 'success');
+        setIsAddModalOpen(false);
+        if (onCloseInitialAddModal) onCloseInitialAddModal();
+        refreshOrders();
+      } else {
+        showToast(result.error || t.toasts.error, 'error');
+      }
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
   const handleConfirmHandoverToCourier = () => {
-    if (!handoverModalOrder) return;
-
-    const res = storageService.updateOrderStatus(
-      handoverModalOrder.id,
-      'with_delivery',
-      settings.sellerName,
-      {
-        courierName: handoverCourier.trim() || 'شركة الشحن',
-        trackingNumber: handoverTracking.trim() || handoverModalOrder.trackingNumber || 'TRK-EXP',
-      }
-    );
-
-    if (res.success) {
-      showToast(
-        isRtl
-          ? 'تم تسليم الشحنة لشركة التوصيل ونقل الحيازة من (محجوز) إلى (في الطريق مع المندوب).'
-          : 'Handed to courier. Custody moved to In Transit.',
-        'success'
+    if (!handoverModalOrder || isSubmitting) return;
+    setIsSubmitting(true);
+    try {
+      const res = storageService.updateOrderStatus(
+        handoverModalOrder.id,
+        'with_delivery',
+        settings.sellerName,
+        {
+          courierName: handoverCourier.trim() || 'شركة الشحن',
+          trackingNumber: handoverTracking.trim() || handoverModalOrder.trackingNumber || 'TRK-EXP',
+        }
       );
-      setHandoverModalOrder(null);
-      refreshOrders();
-    } else {
-      showToast(res.error || 'فشل التحديث', 'error');
+
+      if (res.success) {
+        showToast(
+          isRtl
+            ? 'تم تسليم الشحنة لشركة التوصيل ونقل الحيازة من (محجوز) إلى (في الطريق مع المندوب).'
+            : 'Handed to courier. Custody moved to In Transit.',
+          'success'
+        );
+        setHandoverModalOrder(null);
+        refreshOrders();
+      } else {
+        showToast(res.error || 'فشل التحديث', 'error');
+      }
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
   const handleUpdateStatus = (orderId: string, newStatus: OrderStatus) => {
+    if (isSubmitting) return;
     const order = orders.find((o) => o.id === orderId);
     if (newStatus === 'with_delivery') {
       setHandoverModalOrder(order || null);
@@ -361,31 +389,36 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
       return;
     }
 
-    const res = storageService.updateOrderStatus(orderId, newStatus, settings.sellerName);
-    if (res.success) {
-      if (newStatus === 'delivered') {
-        showToast(
-          isRtl
-            ? 'تم تأكيد تسليم الطلب ونقله إلى صفحة "الطلبات المكتملة بنجاح" وتسجيل الإيراد الفعلي.'
-            : 'Order delivered and moved to Successfully Completed Orders.',
-          'success'
-        );
-      } else if (newStatus === 'rejected') {
-        showToast(
-          isRtl
-            ? 'تم تسجيل رفض استلام الطلب وبدء دورة المرتجع في صفحة المرتجعات.'
-            : 'Delivery rejected. Return cycle initiated.',
-          'warning'
-        );
+    setIsSubmitting(true);
+    try {
+      const res = storageService.updateOrderStatus(orderId, newStatus, settings.sellerName);
+      if (res.success) {
+        if (newStatus === 'delivered') {
+          showToast(
+            isRtl
+              ? 'تم تأكيد تسليم الطلب ونقله إلى صفحة "الطلبات المكتملة بنجاح" وتسجيل الإيراد الفعلي.'
+              : 'Order delivered and moved to Successfully Completed Orders.',
+            'success'
+          );
+        } else if (newStatus === 'rejected') {
+          showToast(
+            isRtl
+              ? 'تم تسجيل رفض استلام الطلب وبدء دورة المرتجع في صفحة المرتجعات.'
+              : 'Delivery rejected. Return cycle initiated.',
+            'warning'
+          );
+        } else {
+          showToast(t.toasts.orderStatusUpdated, 'success');
+        }
+        refreshOrders();
+        if (viewOrder && viewOrder.id === orderId) {
+          setViewOrder(null);
+        }
       } else {
-        showToast(t.toasts.orderStatusUpdated, 'success');
+        showToast(res.error || t.toasts.error, 'error');
       }
-      refreshOrders();
-      if (viewOrder && viewOrder.id === orderId) {
-        setViewOrder(null);
-      }
-    } else {
-      showToast(res.error || t.toasts.error, 'error');
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -474,9 +507,10 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
             className="px-2.5 py-1.5 text-xs bg-[#F7F8FA] border border-[#E8ECF2] rounded-xl text-[#172033] focus:outline-none focus:ring-1 focus:ring-[#2563EB]"
           >
             <option value="all">{isRtl ? 'جميع المنصات' : 'All Marketplaces'}</option>
-            {settings.marketplaces.map((m) => (
+            {allMarketplaces.map((m) => (
               <option key={m.id} value={m.id}>
                 {isRtl ? m.nameAr : m.nameEn}
+                {!m.isActive ? (isRtl ? ' [معطلة]' : ' [Disabled]') : ''}
               </option>
             ))}
           </select>
@@ -528,7 +562,8 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
                 </tr>
               ) : (
                 filteredOrders.map((order) => {
-                  const mkt = settings.marketplaces.find((m) => m.id === order.marketplaceId);
+                  const mkt = allMarketplaces.find((m) => m.id === order.marketplaceId);
+                  const isDisabledMkt = mkt ? !mkt.isActive : true;
                   const firstItem = order.items[0];
 
                   return (
@@ -545,14 +580,15 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
 
                       <td className="py-3 px-3">
                         <span
-                          className="px-2 py-0.5 rounded text-[10px] font-semibold border inline-block"
+                          className="px-2 py-0.5 rounded text-[10px] font-semibold border inline-block whitespace-nowrap"
                           style={{
-                            backgroundColor: mkt?.badgeBg || '#FEF9C3',
-                            color: mkt?.badgeText || '#854D0E',
-                            borderColor: '#E8ECF2',
+                            backgroundColor: isDisabledMkt ? '#F1F5F9' : mkt?.badgeBg || '#F1F5F9',
+                            color: isDisabledMkt ? '#475569' : mkt?.badgeText || '#475569',
+                            borderColor: '#E2E8F0',
                           }}
                         >
                           {isRtl ? mkt?.nameAr || order.marketplaceId : mkt?.nameEn || order.marketplaceId}
+                          {isDisabledMkt ? (isRtl ? ' [معطلة]' : ' [Disabled]') : ''}
                         </span>
                       </td>
 
@@ -746,19 +782,27 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 p-3 bg-[#F8FAFC] rounded-2xl border border-[#E8ECF2]">
             <div>
               <label className="block text-[11px] font-bold text-[#172033] mb-1">
-                {isRtl ? 'المنصة المختارة للبيع:' : 'Sales Marketplace:'} *
+                {isRtl ? 'المنصة المفعّلة للبيع:' : 'Active Sales Marketplace:'} *
               </label>
-              <select
-                value={formMarketplace}
-                onChange={(e) => setFormMarketplace(e.target.value as MarketplaceId)}
-                className="w-full px-3 py-2 text-xs bg-white border border-[#E8ECF2] rounded-xl text-[#172033] font-semibold"
-              >
-                {settings.marketplaces.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {isRtl ? m.nameAr : m.nameEn}
-                  </option>
-                ))}
-              </select>
+              {activeMarketplaces.length === 0 ? (
+                <div className="p-2 bg-amber-50 border border-amber-200 rounded-xl text-[11px] text-amber-900">
+                  {isRtl
+                    ? 'لا توجد منصات مفعّلة حالياً. فعّل منصة واحدة على الأقل من الإعدادات.'
+                    : 'No active marketplaces enabled. Enable one in Settings.'}
+                </div>
+              ) : (
+                <select
+                  value={formMarketplace}
+                  onChange={(e) => setFormMarketplace(e.target.value as MarketplaceId)}
+                  className="w-full px-3 py-2 text-xs bg-white border border-[#E8ECF2] rounded-xl text-[#172033] font-semibold"
+                >
+                  {activeMarketplaces.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {isRtl ? m.nameAr : m.nameEn}
+                    </option>
+                  ))}
+                </select>
+              )}
             </div>
 
             <div>
@@ -798,7 +842,10 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
                 const prod = item.matchedProduct;
                 const channelListing = prod?.marketplaceListings[formMarketplace];
                 const unitPrice = channelListing ? channelListing.price : prod?.currentPrice || 0;
-                const isOutOfStock = prod ? item.quantity > prod.availableStock : false;
+                const capacity = prod && formMarketplace
+                  ? getSellableCapacityForMarketplace(prod, formMarketplace)
+                  : { sellable: prod?.availableStock || 0, source: 'central' as const };
+                const isOutOfStock = prod ? item.quantity > capacity.sellable : false;
 
                 return (
                   <div
@@ -816,7 +863,7 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
                           required
                           value={item.skuInput}
                           onChange={(e) => handleSkuInputChange(idx, e.target.value)}
-                          placeholder="مثال: ELEC-WATCH-01"
+                          placeholder="مثال: SKU-1001"
                           className="w-full px-3 py-1.5 text-xs bg-[#F7F8FA] border border-[#E8ECF2] rounded-xl text-[#172033] font-mono-code font-bold focus:bg-white focus:outline-none focus:ring-1 focus:ring-[#2563EB]"
                         />
                       </div>
@@ -829,7 +876,7 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
                         <input
                           type="number"
                           min="1"
-                          max={prod ? prod.availableStock : 999}
+                          max={prod ? Math.max(1, capacity.sellable) : 999}
                           required
                           value={item.quantity}
                           onChange={(e) => {
@@ -840,7 +887,7 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
                               return copy;
                             });
                           }}
-                          className={`w-full px-3 py-1.5 text-xs rounded-xl font-bold font-mono-code ${
+                          className={`w-full px-3 py-1.5 text-xs rounded-xl font-bold font-mono-code tabular-nums ${
                             isOutOfStock
                               ? 'bg-rose-50 border-rose-300 text-[#DC5555]'
                               : 'bg-[#F7F8FA] border-[#E8ECF2] text-[#172033]'
@@ -853,7 +900,7 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
                         <label className="block text-[10px] font-semibold text-[#64748B] mb-1">
                           {isRtl ? 'سعر البيع على المنصة:' : 'Channel Price:'}
                         </label>
-                        <div className="font-bold font-mono-code text-[#172033] py-1.5">
+                        <div className="font-bold font-mono-code text-[#172033] py-1.5 tabular-nums">
                           {(unitPrice * item.quantity).toFixed(2)} {settings.currency}
                           <span className="text-[10px] text-[#64748B] font-normal ms-1">
                             ({unitPrice} للقطعة)
@@ -880,7 +927,7 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
                       <div className="p-2.5 bg-[#F8FAFC] rounded-xl border border-blue-100 flex items-center justify-between">
                         <div className="flex items-center gap-2.5">
                           <img
-                            src={prod.imageUrl}
+                            src={resolveSafeProductImage(prod.imageUrl, prod.name, prod.category)}
                             alt={prod.name}
                             referrerPolicy="no-referrer"
                             className="w-8 h-8 rounded-lg object-cover border border-[#E8ECF2]"
@@ -890,8 +937,15 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
                               {isRtl && prod.nameAr ? prod.nameAr : prod.name}
                             </span>
                             <span className="text-[10px] text-emerald-700 font-semibold">
-                              {isRtl ? 'المخزون المتاح للبيع بالمستودع:' : 'Available in warehouse:'}{' '}
-                              <strong className="font-mono-code">{prod.availableStock}</strong> {isRtl ? 'قطعة' : 'units'}
+                              {capacity.source === 'platform'
+                                ? isRtl
+                                  ? 'مخزون المنصة المخصص المتاح:'
+                                  : 'Platform Allocated Avail:'
+                                : isRtl
+                                ? 'المتاح بالسحب من المستودع المركزي:'
+                                : 'Central Pool Available:'}{' '}
+                              <strong className="font-mono-code tabular-nums">{capacity.sellable}</strong>{' '}
+                              {isRtl ? 'قطعة' : 'units'}
                             </span>
                           </div>
                         </div>
@@ -899,7 +953,7 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
                         {isOutOfStock && (
                           <span className="text-[11px] font-bold text-[#DC5555] flex items-center gap-1">
                             <AlertCircle className="w-3.5 h-3.5" />
-                            <span>{isRtl ? 'تجاوز المخزون المتاح!' : 'Exceeds stock!'}</span>
+                            <span>{isRtl ? 'تجاوز المخزون المتاح!' : 'Exceeds capacity!'}</span>
                           </span>
                         )}
                       </div>
@@ -1047,7 +1101,8 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({
 
               <button
                 type="submit"
-                className="px-6 py-2 text-xs font-bold text-white bg-[#2563EB] hover:bg-blue-700 rounded-xl transition-colors shadow-xs cursor-pointer flex items-center gap-1.5"
+                disabled={isSubmitting || activeMarketplaces.length === 0}
+                className="px-6 py-2 text-xs font-bold text-white bg-[#2563EB] hover:bg-blue-700 disabled:opacity-50 rounded-xl transition-colors shadow-xs cursor-pointer flex items-center gap-1.5 whitespace-nowrap shrink-0"
               >
                 <Check className="w-4 h-4" />
                 <span>{isRtl ? 'حفظ الطلب وحجز المخزون' : 'Save & Reserve'}</span>

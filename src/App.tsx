@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { Sidebar, ActiveTab } from './components/layout/Sidebar';
 import { Header } from './components/layout/Header';
 import { ToastProvider } from './components/common/Toast';
@@ -37,13 +37,26 @@ export default function App() {
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   const [isTestSuiteOpen, setIsTestSuiteOpen] = useState(false);
 
+  // Store reactivity, account scope, and role gating state
+  const [storeRevision, setStoreRevision] = useState(0);
+  const [activeMerchantId, setActiveMerchantId] = useState(() =>
+    storageService.getActiveMerchantId()
+  );
+  const [isDeveloperMode, setIsDeveloperMode] = useState(() =>
+    storageService.isDeveloperMode()
+  );
+
   // Merchant Onboarding & Interactive Tutorials State
-  const [isOnboarded, setIsOnboarded] = useState(() => storageService.getMerchantProfile().isOnboarded);
-  const [isOnboardingOpen, setIsOnboardingOpen] = useState(() => !storageService.getMerchantProfile().isOnboarded);
+  const [isOnboarded, setIsOnboarded] = useState(
+    () => storageService.getMerchantProfile().isOnboarded
+  );
+  const [isOnboardingOpen, setIsOnboardingOpen] = useState(
+    () => !storageService.getMerchantProfile().isOnboarded
+  );
   const [activeGuide, setActiveGuide] = useState<TutorialGuide | null>(null);
   const [isLearningCenterOpen, setIsLearningCenterOpen] = useState(false);
 
-  // Global modal triggers from Header / Overview
+  // Global modal triggers from Overview / Quick Navigation
   const [openNewOrderModal, setOpenNewOrderModal] = useState(false);
   const [openAddProductModal, setOpenAddProductModal] = useState(false);
 
@@ -61,10 +74,12 @@ export default function App() {
     document.documentElement.lang = locale;
   }, [locale]);
 
-  // Refresh badges count
-  const refreshBadges = () => {
+  const refreshState = useCallback(() => {
     const activeOrders = storageService.getActiveOrders();
     const returns = storageService.getReturns();
+    const profile = storageService.getMerchantProfile();
+    const devMode = storageService.isDeveloperMode();
+    const merchantId = storageService.getActiveMerchantId();
 
     const pendingOrders = activeOrders.filter(
       (o) => o.status === 'preparing' || o.status === 'with_delivery'
@@ -76,47 +91,45 @@ export default function App() {
 
     setActiveOrdersCount(pendingOrders);
     setPendingReturnsCount(pendingReturns);
-  };
+    setIsDeveloperMode(devMode);
+    setActiveMerchantId(merchantId);
+    setIsOnboarded(profile.isOnboarded);
+    setIsOnboardingOpen(!profile.isOnboarded);
+    setStoreRevision((rev) => rev + 1);
+  }, []);
 
   useEffect(() => {
-    refreshBadges();
-  }, [currentTab]);
+    refreshState();
+  }, [currentTab, refreshState]);
+
+  useEffect(() => {
+    if (currentTab === 'developerCenter' && !isDeveloperMode) {
+      setCurrentTab('settings');
+    }
+  }, [currentTab, isDeveloperMode]);
 
   const handleToggleLocale = () => {
     setLocale((prev) => (prev === 'ar' ? 'en' : 'ar'));
   };
 
-  const handleQuickAction = (action: 'new_order' | 'add_product' | 'excel_import') => {
-    if (action === 'new_order') {
-      setOrdersFilter(undefined);
-      setCurrentTab('orders');
-      setOpenNewOrderModal(true);
-    } else if (action === 'add_product') {
-      setCurrentTab('products');
-      setOpenAddProductModal(true);
-    } else if (action === 'excel_import') {
-      setCurrentTab('excelImport');
-    }
-  };
-
   const handleNavigateFromOverview = (tab: ActiveTab, filterState?: Record<string, string>) => {
-    if (tab === 'orders') {
+    const resolvedTab: ActiveTab =
+      tab === 'developerCenter' && !storageService.isDeveloperMode() ? 'settings' : tab;
+    if (resolvedTab === 'orders') {
       setOrdersFilter(filterState?.status);
-    } else if (tab === 'returns') {
+    } else if (resolvedTab === 'returns') {
       setReturnsFilter(filterState?.status);
     }
-    setCurrentTab(tab);
-    refreshBadges();
+    setCurrentTab(resolvedTab);
+    refreshState();
   };
 
   // Tutorial and Onboarding Handlers
   const handleOnboardingComplete = () => {
-    setIsOnboarded(true);
-    setIsOnboardingOpen(false);
-    refreshBadges();
+    refreshState();
     // Launch dashboard guide immediately upon onboarding completion
     const dashGuide = getGuideById('dashboard');
-    if (dashGuide) {
+    if (dashGuide && !storageService.isTutorialCompleted(dashGuide.id)) {
       setTimeout(() => {
         setActiveGuide(dashGuide);
       }, 400);
@@ -153,10 +166,16 @@ export default function App() {
   };
 
   const handleSelectTab = (tab: ActiveTab) => {
+    if (tab === 'developerCenter' && !storageService.isDeveloperMode()) {
+      setCurrentTab('settings');
+      refreshState();
+      return;
+    }
+
     if (tab !== 'orders') setOrdersFilter(undefined);
     if (tab !== 'returns') setReturnsFilter(undefined);
     setCurrentTab(tab);
-    refreshBadges();
+    refreshState();
 
     // Check if contextual tutorial should trigger on first tab visit
     if (isOnboarded && !activeGuide) {
@@ -169,7 +188,6 @@ export default function App() {
     }
   };
 
-  // Determine sidebar width for main content offset
   const sidebarWidthClass = isSidebarCollapsed ? 'lg:pe-18' : 'lg:pe-64';
   const sidebarWidthClassLtr = isSidebarCollapsed ? 'lg:ps-18' : 'lg:ps-64';
 
@@ -187,13 +205,14 @@ export default function App() {
             onToggleCollapse={() => setIsSidebarCollapsed(!isSidebarCollapsed)}
             activeOrdersCount={activeOrdersCount}
             pendingReturnsCount={pendingReturnsCount}
+            isDeveloperMode={isDeveloperMode}
+            storeRevision={storeRevision}
           />
         </div>
 
         {/* Mobile Sidebar Overlay Drawer */}
         {isMobileMenuOpen && (
           <div className="fixed inset-0 z-50 lg:hidden flex">
-            {/* Backdrop */}
             <div
               className="fixed inset-0 bg-[#172033]/40 backdrop-blur-[2px]"
               onClick={() => setIsMobileMenuOpen(false)}
@@ -225,12 +244,14 @@ export default function App() {
                 onToggleCollapse={() => {}}
                 activeOrdersCount={activeOrdersCount}
                 pendingReturnsCount={pendingReturnsCount}
+                isDeveloperMode={isDeveloperMode}
+                storeRevision={storeRevision}
               />
             </div>
           </div>
         )}
 
-        {/* Main Content Workspace with exact offset for fixed sidebar */}
+        {/* Main Content Workspace */}
         <div
           className={`flex-1 flex flex-col min-h-screen transition-all duration-200 ${
             locale === 'ar' ? sidebarWidthClass : sidebarWidthClassLtr
@@ -239,14 +260,16 @@ export default function App() {
           {/* Top Bar Header (Streamlined: Brand & Store Name Only) */}
           <Header
             locale={locale}
+            storeRevision={storeRevision}
             onOpenMobileMenu={() => setIsMobileMenuOpen(true)}
           />
 
-          {/* Main Views Container */}
-          <main className="flex-1 p-4 sm:p-6 max-w-7xl w-full mx-auto pb-24 lg:pb-8">
+          {/* Main Views Container keyed by activeMerchantId for full workspace isolation */}
+          <main key={activeMerchantId} className="flex-1 p-4 sm:p-6 max-w-7xl w-full mx-auto pb-24 lg:pb-8">
             {currentTab === 'overview' && (
               <OverviewPage
                 locale={locale}
+                storeRevision={storeRevision}
                 onNavigate={handleNavigateFromOverview}
               />
             )}
@@ -256,6 +279,7 @@ export default function App() {
                 locale={locale}
                 isAddModalOpenInitially={openAddProductModal}
                 onCloseInitialAddModal={() => setOpenAddProductModal(false)}
+                onDataChange={refreshState}
               />
             )}
 
@@ -265,10 +289,10 @@ export default function App() {
                 isAddModalOpenInitially={openNewOrderModal}
                 onCloseInitialAddModal={() => setOpenNewOrderModal(false)}
                 initialStatusFilter={ordersFilter}
-                onOrdersChange={refreshBadges}
+                onOrdersChange={refreshState}
                 onNavigateToCompleted={() => {
                   setCurrentTab('completedOrders');
-                  refreshBadges();
+                  refreshState();
                 }}
               />
             )}
@@ -276,22 +300,24 @@ export default function App() {
             {currentTab === 'completedOrders' && (
               <CompletedOrdersPage
                 locale={locale}
-                onDataChange={refreshBadges}
+                onDataChange={refreshState}
                 onNavigateToReturns={() => {
                   setReturnsFilter(undefined);
                   setCurrentTab('returns');
-                  refreshBadges();
+                  refreshState();
                 }}
               />
             )}
 
-            {currentTab === 'inventory' && <InventoryPage locale={locale} />}
+            {currentTab === 'inventory' && (
+              <InventoryPage locale={locale} onDataChange={refreshState} />
+            )}
 
             {currentTab === 'returns' && (
               <ReturnsPage
                 locale={locale}
                 initialStatusFilter={returnsFilter}
-                onReturnsChange={refreshBadges}
+                onReturnsChange={refreshState}
               />
             )}
 
@@ -300,9 +326,10 @@ export default function App() {
             {currentTab === 'excelImport' && (
               <ExcelImportPage
                 locale={locale}
+                onDataChange={refreshState}
                 onNavigateToProducts={() => {
                   setCurrentTab('products');
-                  refreshBadges();
+                  refreshState();
                 }}
               />
             )}
@@ -310,14 +337,14 @@ export default function App() {
             {currentTab === 'smartImport' && (
               <SmartImportPage
                 locale={locale}
-                onOrdersImported={refreshBadges}
+                onOrdersImported={refreshState}
                 onNavigateToOrders={() => {
                   setCurrentTab('orders');
-                  refreshBadges();
+                  refreshState();
                 }}
                 onNavigateToCompleted={() => {
                   setCurrentTab('completedOrders');
-                  refreshBadges();
+                  refreshState();
                 }}
               />
             )}
@@ -325,25 +352,29 @@ export default function App() {
             {currentTab === 'guidance' && (
               <MerchantGuidancePage
                 locale={locale}
-                onNavigateToTab={(tab, filter) => handleNavigateFromOverview(tab as ActiveTab, filter)}
+                onNavigateToTab={(tab, filter) =>
+                  handleNavigateFromOverview(tab as ActiveTab, filter)
+                }
               />
             )}
 
             {currentTab === 'settings' && (
               <SettingsPage
                 locale={locale}
-                onDataReset={() => {
-                  refreshBadges();
-                }}
+                onDataReset={refreshState}
                 onNavigateToTab={(tab) => handleSelectTab(tab as ActiveTab)}
               />
             )}
 
-            {currentTab === 'developerCenter' && (
+            {currentTab === 'developerCenter' && isDeveloperMode && (
               <DeveloperCenterPage
                 locale={locale}
                 onOpenTestSuite={() => setIsTestSuiteOpen(true)}
-                onDataChange={refreshBadges}
+                onDataChange={refreshState}
+                onLockDeveloperMode={() => {
+                  setCurrentTab('settings');
+                  refreshState();
+                }}
               />
             )}
           </main>
@@ -354,23 +385,25 @@ export default function App() {
           currentTab={currentTab}
           onSelectTab={(tab) => handleSelectTab(tab as ActiveTab)}
           locale={locale}
+          isDeveloperMode={isDeveloperMode}
+          storeRevision={storeRevision}
         />
 
-        {/* In-App Operations Logic Test Suite Modal */}
+        {/* In-App Operations Logic Test Suite Modal (Developer Only) */}
         <TestSuiteModal
-          isOpen={isTestSuiteOpen}
+          isOpen={isTestSuiteOpen && isDeveloperMode}
           onClose={() => setIsTestSuiteOpen(false)}
           locale={locale}
         />
 
-        {/* 1. Merchant Onboarding Modal (Google First-Sign In) */}
+        {/* 1. Merchant Onboarding Modal */}
         <OnboardingModal
           isOpen={isOnboardingOpen}
           locale={locale}
           onComplete={handleOnboardingComplete}
         />
 
-        {/* 2. Interactive 3D Learning Assistant Overlay */}
+        {/* 2. Interactive Learning Assistant Overlay */}
         {activeGuide && (
           <TutorialOverlay
             guide={activeGuide}

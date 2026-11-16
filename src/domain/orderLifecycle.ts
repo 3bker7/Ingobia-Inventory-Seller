@@ -1,7 +1,8 @@
 /**
  * Pure Order Lifecycle State Machine and Stock Reservation Engine.
- * Enforces allowed transitions, aggregated per-product stock checks,
- * COGS snapshotting at creation, and idempotent closure rules.
+ * Enforces allowed transitions, active platform validation, central-vs-platform
+ * reservation sourcing, aggregated per-product stock checks, COGS snapshotting,
+ * and idempotent closure rules.
  */
 
 import {
@@ -14,7 +15,11 @@ import {
   ShipmentRecord,
   StockMovement,
 } from '../types';
-import { generateUniqueId, normalizeProductCustody } from './inventoryCustody';
+import {
+  generateUniqueId,
+  getSellableCapacityForMarketplace,
+  normalizeProductCustody,
+} from './inventoryCustody';
 
 export const ALLOWED_ORDER_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
   preparing: ['with_delivery', 'cancelled'],
@@ -33,6 +38,8 @@ export function createOrderPure(params: {
   orderData: Omit<Order, 'id' | 'createdAt' | 'updatedAt' | 'stockDeducted' | 'isClosed'>;
   products: Product[];
   existingOrders: Order[];
+  activeMarketplaceIds?: string[];
+  merchantId?: string;
   customId?: string;
   operator?: string;
   nowIso?: string;
@@ -48,10 +55,32 @@ export function createOrderPure(params: {
     orderData,
     products: rawProducts,
     existingOrders,
+    activeMarketplaceIds,
+    merchantId,
     customId,
     operator = 'مدير العمليات',
     nowIso = new Date().toISOString(),
   } = params;
+
+  if (!orderData.marketplaceId || !orderData.marketplaceId.trim()) {
+    return {
+      success: false,
+      error: 'يجب تحديد منصة البيع المرتبطة بالطلب.',
+      products: rawProducts,
+      orders: existingOrders,
+      movements: [],
+    };
+  }
+
+  if (activeMarketplaceIds && !activeMarketplaceIds.includes(orderData.marketplaceId)) {
+    return {
+      success: false,
+      error: `المنصة (${orderData.marketplaceId}) غير مفعلة في إعدادات حساب التاجر الحالي.`,
+      products: rawProducts,
+      orders: existingOrders,
+      movements: [],
+    };
+  }
 
   if (!orderData.items || orderData.items.length === 0) {
     return {
@@ -100,13 +129,18 @@ export function createOrderPure(params: {
     );
   }
 
-  // Verify aggregated total demand per product against available stock
+  // Verify aggregated total demand per product against platform allocation (or central pool when unallocated)
   for (const [productId, totalQty] of aggregatedQtyByProductId.entries()) {
     const product = products.find((p) => p.id === productId)!;
-    if (product.availableStock < totalQty) {
+    const cap = getSellableCapacityForMarketplace(product, orderData.marketplaceId);
+    if (cap.sellable < totalQty) {
+      const reason =
+        cap.source === 'platform'
+          ? `الكمية المطلوبة للمنتج (${product.name}) (${totalQty}) تتجاوز الرصيد المتاح المخصص لمنصة (${orderData.marketplaceId}) (${cap.sellable} قطعة). يمكنك تخصيص كميات إضافية من المستودع المركزي.`
+          : `الكمية المطلوبة للمنتج (${product.name}) (${totalQty}) تتجاوز المخزون المتاح حالياً (${cap.sellable} قطعة متاحة).`;
       return {
         success: false,
-        error: `الكمية المطلوبة للمنتج (${product.name}) (${totalQty}) تتجاوز المخزون المتاح حالياً (${product.availableStock} قطعة متاحة).`,
+        error: reason,
         products: rawProducts,
         orders: existingOrders,
         movements: [],
@@ -133,20 +167,46 @@ export function createOrderPure(params: {
   const newMovements: StockMovement[] = [];
   const snapshotItems: OrderItem[] = [];
 
-  // 2. Perform stock deductions, reservations, and COGS snapshots
+  // 2. Perform stock reservations cleanly on source bucket (platform or central)
   for (let i = 0; i < orderData.items.length; i++) {
     const item = orderData.items[i];
-    const product = resolvedProductByItemIdx.get(i)!;
+    const prodIdx = products.findIndex((p) => p.id === resolvedProductByItemIdx.get(i)!.id);
+    let product = products[prodIdx];
     const prevAvailable = product.availableStock;
     const prevPhysical = product.physicalStock;
+    const cap = getSellableCapacityForMarketplace(product, orderData.marketplaceId);
 
-    product.availableStock = Math.max(0, product.availableStock - item.quantity);
-    product.reservedStock += item.quantity;
+    const nextAllocations = { ...(product.platformAllocations || {}) };
+    let nextCentralAvailable = product.centralAvailableStock ?? 0;
+    let nextCentralReserved = product.centralReservedStock ?? 0;
+    const prevBucketBefore = cap.sellable;
+    let nextBucketAfter = prevBucketBefore - item.quantity;
 
-    if (product.marketplaceListings[orderData.marketplaceId]) {
-      const listing = product.marketplaceListings[orderData.marketplaceId];
-      const nextListingQty = Math.max(0, listing.quantity - item.quantity);
-      product.marketplaceListings[orderData.marketplaceId] = {
+    if (cap.source === 'platform' && nextAllocations[orderData.marketplaceId]) {
+      const prevAlloc = nextAllocations[orderData.marketplaceId];
+      const nextRes = prevAlloc.reservedQty + item.quantity;
+      const nextAvail = Math.max(0, prevAlloc.allocatedQty - nextRes);
+      nextBucketAfter = nextAvail;
+      nextAllocations[orderData.marketplaceId] = {
+        ...prevAlloc,
+        reservedQty: nextRes,
+        availableQty: nextAvail,
+        lastUpdated: nowIso,
+      };
+    } else {
+      nextCentralAvailable = Math.max(0, nextCentralAvailable - item.quantity);
+      nextCentralReserved += item.quantity;
+      nextBucketAfter = nextCentralAvailable;
+    }
+
+    const nextListings = { ...(product.marketplaceListings || {}) };
+    if (nextListings[orderData.marketplaceId]) {
+      const listing = nextListings[orderData.marketplaceId];
+      const nextListingQty =
+        cap.source === 'platform' && nextAllocations[orderData.marketplaceId]
+          ? nextAllocations[orderData.marketplaceId].availableQty
+          : Math.max(0, listing.quantity - item.quantity);
+      nextListings[orderData.marketplaceId] = {
         ...listing,
         quantity: nextListingQty,
         listingStatus: nextListingQty > 0 ? 'active' : 'out_of_stock',
@@ -154,10 +214,21 @@ export function createOrderPure(params: {
       };
     }
 
-    product.updatedAt = nowIso;
+    product = normalizeProductCustody({
+      ...product,
+      availableStock: Math.max(0, product.availableStock - item.quantity),
+      reservedStock: product.reservedStock + item.quantity,
+      centralAvailableStock: nextCentralAvailable,
+      centralReservedStock: nextCentralReserved,
+      platformAllocations: nextAllocations,
+      marketplaceListings: nextListings,
+      updatedAt: nowIso,
+    });
+    products[prodIdx] = product;
 
     snapshotItems.push({
       ...item,
+      reservationSource: cap.source,
       unitCostSnapshot:
         typeof item.unitCostSnapshot === 'number' && item.unitCostSnapshot > 0
           ? item.unitCostSnapshot
@@ -167,18 +238,30 @@ export function createOrderPure(params: {
     });
 
     newMovements.push({
-      id: `mov-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+      id: `mov-${Date.now()}-${i}-${Math.random().toString(36).substring(2, 6)}`,
+      merchantId: merchantId || product.merchantId,
       productId: product.id,
       productSku: product.sku || product.name,
       productName: product.name,
       marketplaceId: orderData.marketplaceId,
+      platformId: orderData.marketplaceId,
+      source: cap.source === 'platform' ? 'platform_allocation' : 'central_available',
+      destination: 'reserved',
       type: 'order_created',
       quantityChange: -item.quantity,
       previousPhysical: prevPhysical,
       newPhysical: product.physicalStock,
       previousAvailable: prevAvailable,
       newAvailable: product.availableStock,
+      beforeQty: prevBucketBefore,
+      afterQty: nextBucketAfter,
+      fromCustody:
+        cap.source === 'platform'
+          ? `رصيد منصة ${orderData.marketplaceId}`
+          : 'المستودع المركزي المتاح',
+      toCustody: 'محجوز للطلب بالمستودع',
       referenceOrderId: orderId,
+      eventKey: `order_created|${product.id}|${orderId}|${i}`,
       reason: `حجز مخزون للطلب الجديد #${orderId} عبر ${orderData.marketplaceId}`,
       operator,
       timestamp: nowIso,
@@ -187,6 +270,7 @@ export function createOrderPure(params: {
 
   const newOrder: Order = {
     ...orderData,
+    merchantId: merchantId || orderData.merchantId,
     id: orderId,
     items: snapshotItems,
     status: 'preparing',
@@ -214,6 +298,7 @@ export function updateOrderStatusPure(params: {
   returns: ReturnRecord[];
   currency: string;
   operator?: string;
+  merchantId?: string;
   shipmentDetails?: Partial<ShipmentRecord>;
   nowIso?: string;
 }): {
@@ -233,6 +318,7 @@ export function updateOrderStatusPure(params: {
     returns: rawReturns,
     currency,
     operator = 'مدير العمليات',
+    merchantId,
     shipmentDetails,
     nowIso = new Date().toISOString(),
   } = params;
@@ -300,33 +386,86 @@ export function updateOrderStatusPure(params: {
   const newTransactions: Array<Omit<FinancialTransaction, 'id' | 'date'> & { date?: string }> = [];
 
   if (newStatus === 'with_delivery') {
-    for (const item of order.items) {
-      const product = products.find(
+    for (let i = 0; i < order.items.length; i++) {
+      const item = order.items[i];
+      const prodIdx = products.findIndex(
         (p) => p.id === item.productId || (item.productSku && p.sku === item.productSku)
       );
-      if (product) {
+      if (prodIdx >= 0) {
+        let product = products[prodIdx];
         const prevAvail = product.availableStock;
         const prevPhys = product.physicalStock;
+        const prevReserved = product.reservedStock;
 
-        product.reservedStock = Math.max(0, product.reservedStock - item.quantity);
-        product.outboundInTransitStock = (product.outboundInTransitStock || 0) + item.quantity;
-        product.updatedAt = nowIso;
+        const nextAllocations = { ...(product.platformAllocations || {}) };
+        let nextCentralReserved = product.centralReservedStock ?? 0;
+
+        if (
+          item.reservationSource === 'platform' &&
+          nextAllocations[order.marketplaceId] &&
+          nextAllocations[order.marketplaceId].reservedQty > 0
+        ) {
+          const alloc = nextAllocations[order.marketplaceId];
+          const consumedRes = Math.min(alloc.reservedQty, item.quantity);
+          const nextAllocQty = Math.max(0, alloc.allocatedQty - consumedRes);
+          const nextResQty = Math.max(0, alloc.reservedQty - consumedRes);
+          nextAllocations[order.marketplaceId] = {
+            ...alloc,
+            allocatedQty: nextAllocQty,
+            reservedQty: nextResQty,
+            availableQty: Math.max(0, nextAllocQty - nextResQty),
+            lastUpdated: nowIso,
+          };
+        } else if (nextCentralReserved >= item.quantity) {
+          nextCentralReserved -= item.quantity;
+        } else if (
+          nextAllocations[order.marketplaceId] &&
+          nextAllocations[order.marketplaceId].reservedQty >= item.quantity
+        ) {
+          const alloc = nextAllocations[order.marketplaceId];
+          const nextAllocQty = Math.max(0, alloc.allocatedQty - item.quantity);
+          const nextResQty = Math.max(0, alloc.reservedQty - item.quantity);
+          nextAllocations[order.marketplaceId] = {
+            ...alloc,
+            allocatedQty: nextAllocQty,
+            reservedQty: nextResQty,
+            availableQty: Math.max(0, nextAllocQty - nextResQty),
+            lastUpdated: nowIso,
+          };
+        }
+
+        product = normalizeProductCustody({
+          ...product,
+          reservedStock: Math.max(0, prevReserved - item.quantity),
+          centralReservedStock: nextCentralReserved,
+          platformAllocations: nextAllocations,
+          outboundInTransitStock: (product.outboundInTransitStock || 0) + item.quantity,
+          updatedAt: nowIso,
+        });
+        products[prodIdx] = product;
 
         newMovements.push({
-          id: `mov-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+          id: `mov-${Date.now()}-${i}-${Math.random().toString(36).substring(2, 6)}`,
+          merchantId: order.merchantId || product.merchantId,
           productId: product.id,
           productSku: product.sku || product.name,
           productName: product.name,
           marketplaceId: order.marketplaceId,
+          platformId: order.marketplaceId,
+          source: 'reserved',
+          destination: 'outbound_transit',
           type: 'handover_to_courier',
           quantityChange: -item.quantity,
           previousPhysical: prevPhys,
           newPhysical: product.physicalStock,
           previousAvailable: prevAvail,
           newAvailable: product.availableStock,
+          beforeQty: prevReserved,
+          afterQty: product.reservedStock,
           fromCustody: 'محجوز بالمستودع',
           toCustody: 'خارج المستودع (مع شركة الشحن)',
           referenceOrderId: order.id,
+          eventKey: `handover_to_courier|${product.id}|${order.id}|${i}`,
           reason: `تسليم الشحنة لشركة الشحن (${order.courierName || shipmentDetails?.courierName || 'المندوب'}) للطلب #${order.id}`,
           operator,
           timestamp: nowIso,
@@ -357,38 +496,56 @@ export function updateOrderStatusPure(params: {
       notes: `رقم التتبع: ${order.trackingNumber || 'غير محدد'}`,
     });
   } else if (newStatus === 'delivered' && !order.deliveredProcessed) {
-    for (const item of order.items) {
-      const product = products.find(
+    for (let i = 0; i < order.items.length; i++) {
+      const item = order.items[i];
+      const prodIdx = products.findIndex(
         (p) => p.id === item.productId || (item.productSku && p.sku === item.productSku)
       );
-      if (product) {
+      if (prodIdx >= 0) {
+        let product = products[prodIdx];
         const prevPhysical = product.physicalStock;
         const prevAvail = product.availableStock;
 
-        if ((product.outboundInTransitStock || 0) >= item.quantity) {
-          product.outboundInTransitStock = Math.max(0, (product.outboundInTransitStock || 0) - item.quantity);
+        let nextOutbound = product.outboundInTransitStock || 0;
+        let nextReserved = product.reservedStock;
+
+        if (nextOutbound >= item.quantity) {
+          nextOutbound = Math.max(0, nextOutbound - item.quantity);
         } else {
-          product.reservedStock = Math.max(0, product.reservedStock - item.quantity);
+          nextReserved = Math.max(0, nextReserved - item.quantity);
         }
 
-        product.physicalStock = Math.max(0, product.physicalStock - item.quantity);
-        product.updatedAt = nowIso;
+        product = normalizeProductCustody({
+          ...product,
+          outboundInTransitStock: nextOutbound,
+          reservedStock: nextReserved,
+          physicalStock: Math.max(0, prevPhysical - item.quantity),
+          updatedAt: nowIso,
+        });
+        products[prodIdx] = product;
 
         newMovements.push({
-          id: `mov-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+          id: `mov-${Date.now()}-${i}-${Math.random().toString(36).substring(2, 6)}`,
+          merchantId: order.merchantId || product.merchantId,
           productId: product.id,
           productSku: product.sku || product.name,
           productName: product.name,
           marketplaceId: order.marketplaceId,
+          platformId: order.marketplaceId,
+          source: 'outbound_transit',
+          destination: 'customer',
           type: 'order_delivered',
           quantityChange: -item.quantity,
           previousPhysical: prevPhysical,
           newPhysical: product.physicalStock,
           previousAvailable: prevAvail,
           newAvailable: product.availableStock,
+          beforeQty: prevPhysical,
+          afterQty: product.physicalStock,
           fromCustody: 'في الطريق مع المندوب',
           toCustody: 'تم التسليم النهائي للعميل (مباع)',
           referenceOrderId: order.id,
+          eventKey: `order_delivered|${product.id}|${order.id}|${i}`,
           reason: `تأكيد تسليم الطلب #${order.id} للعميل وخصم المخزون الفعلي نهائياً`,
           operator,
           timestamp: nowIso,
@@ -403,6 +560,8 @@ export function updateOrderStatusPure(params: {
     order.closedAt = nowIso;
 
     newTransactions.push({
+      merchantId: order.merchantId,
+      eventRef: `order_delivered|sale_revenue|${order.id}`,
       orderId: order.id,
       marketplaceId: order.marketplaceId,
       type: 'sale_revenue',
@@ -416,6 +575,8 @@ export function updateOrderStatusPure(params: {
 
     if (order.shippingCost && order.shippingCost > 0) {
       newTransactions.push({
+        merchantId: order.merchantId,
+        eventRef: `order_delivered|courier_shipping|${order.id}`,
         orderId: order.id,
         marketplaceId: order.marketplaceId,
         type: 'courier_shipping',
@@ -430,6 +591,8 @@ export function updateOrderStatusPure(params: {
 
     if (order.marketplaceCommission && order.marketplaceCommission > 0) {
       newTransactions.push({
+        merchantId: order.merchantId,
+        eventRef: `order_delivered|marketplace_commission|${order.id}`,
         orderId: order.id,
         marketplaceId: order.marketplaceId,
         type: 'marketplace_commission',
@@ -453,21 +616,48 @@ export function updateOrderStatusPure(params: {
       newState: newStatus,
     });
   } else if (newStatus === 'cancelled') {
-    for (const item of order.items) {
-      const product = products.find(
+    for (let i = 0; i < order.items.length; i++) {
+      const item = order.items[i];
+      const prodIdx = products.findIndex(
         (p) => p.id === item.productId || (item.productSku && p.sku === item.productSku)
       );
-      if (product) {
+      if (prodIdx >= 0) {
+        let product = products[prodIdx];
         const prevPhysical = product.physicalStock;
         const prevAvail = product.availableStock;
 
-        product.reservedStock = Math.max(0, product.reservedStock - item.quantity);
-        product.availableStock += item.quantity;
+        const nextAllocations = { ...(product.platformAllocations || {}) };
+        let nextCentralReserved = product.centralReservedStock ?? 0;
+        let releasedTo: 'platform_allocation' | 'central_available' = 'central_available';
 
-        if (product.marketplaceListings[order.marketplaceId]) {
-          const listing = product.marketplaceListings[order.marketplaceId];
-          const nextQty = listing.quantity + item.quantity;
-          product.marketplaceListings[order.marketplaceId] = {
+        if (
+          item.reservationSource === 'platform' &&
+          nextAllocations[order.marketplaceId] &&
+          nextAllocations[order.marketplaceId].reservedQty > 0
+        ) {
+          const alloc = nextAllocations[order.marketplaceId];
+          const releaseQty = Math.min(alloc.reservedQty, item.quantity);
+          const nextRes = Math.max(0, alloc.reservedQty - releaseQty);
+          nextAllocations[order.marketplaceId] = {
+            ...alloc,
+            reservedQty: nextRes,
+            availableQty: Math.max(0, alloc.allocatedQty - nextRes),
+            lastUpdated: nowIso,
+          };
+          releasedTo = 'platform_allocation';
+        } else {
+          nextCentralReserved = Math.max(0, nextCentralReserved - item.quantity);
+          releasedTo = 'central_available';
+        }
+
+        const nextListings = { ...(product.marketplaceListings || {}) };
+        if (nextListings[order.marketplaceId]) {
+          const listing = nextListings[order.marketplaceId];
+          const nextQty =
+            releasedTo === 'platform_allocation' && nextAllocations[order.marketplaceId]
+              ? nextAllocations[order.marketplaceId].availableQty
+              : listing.quantity + item.quantity;
+          nextListings[order.marketplaceId] = {
             ...listing,
             quantity: nextQty,
             listingStatus: nextQty > 0 ? 'active' : listing.listingStatus,
@@ -475,24 +665,43 @@ export function updateOrderStatusPure(params: {
           };
         }
 
-        product.updatedAt = nowIso;
+        product = normalizeProductCustody({
+          ...product,
+          reservedStock: Math.max(0, product.reservedStock - item.quantity),
+          availableStock: prevAvail + item.quantity,
+          centralReservedStock: nextCentralReserved,
+          platformAllocations: nextAllocations,
+          marketplaceListings: nextListings,
+          updatedAt: nowIso,
+        });
+        products[prodIdx] = product;
 
         newMovements.push({
-          id: `mov-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+          id: `mov-${Date.now()}-${i}-${Math.random().toString(36).substring(2, 6)}`,
+          merchantId: order.merchantId || product.merchantId,
           productId: product.id,
           productSku: product.sku || product.name,
           productName: product.name,
           marketplaceId: order.marketplaceId,
+          platformId: order.marketplaceId,
+          source: 'reserved',
+          destination: releasedTo,
           type: 'order_cancelled',
           quantityChange: item.quantity,
           previousPhysical: prevPhysical,
           newPhysical: product.physicalStock,
           previousAvailable: prevAvail,
           newAvailable: product.availableStock,
+          beforeQty: prevAvail,
+          afterQty: product.availableStock,
           fromCustody: 'محجوز بالمستودع',
-          toCustody: 'متاح للبيع بالمستودع',
+          toCustody:
+            releasedTo === 'platform_allocation'
+              ? `إعادة لرصيد منصة ${order.marketplaceId}`
+              : 'متاح للبيع بالمستودع المركزي',
           referenceOrderId: order.id,
-          reason: `إلغاء الطلب #${order.id} وإعادة الكمية المحجوزة للمخزون المتاح`,
+          eventKey: `order_cancelled|${product.id}|${order.id}|${i}`,
+          reason: `إلغاء الطلب #${order.id} وإعادة الكمية المحجوزة للمصدر المتاح`,
           operator,
           timestamp: nowIso,
         });
@@ -514,34 +723,54 @@ export function updateOrderStatusPure(params: {
       newState: newStatus,
     });
   } else if (newStatus === 'rejected') {
-    for (const item of order.items) {
-      const product = products.find(
+    for (let i = 0; i < order.items.length; i++) {
+      const item = order.items[i];
+      const prodIdx = products.findIndex(
         (p) => p.id === item.productId || (item.productSku && p.sku === item.productSku)
       );
-      if (product) {
-        if ((product.outboundInTransitStock || 0) >= item.quantity) {
-          product.outboundInTransitStock = Math.max(0, (product.outboundInTransitStock || 0) - item.quantity);
+      if (prodIdx >= 0) {
+        let product = products[prodIdx];
+        const prevRetTransit = product.returnInTransitStock || 0;
+        let nextOutbound = product.outboundInTransitStock || 0;
+        let nextReserved = product.reservedStock;
+
+        if (nextOutbound >= item.quantity) {
+          nextOutbound = Math.max(0, nextOutbound - item.quantity);
         } else {
-          product.reservedStock = Math.max(0, product.reservedStock - item.quantity);
+          nextReserved = Math.max(0, nextReserved - item.quantity);
         }
-        product.returnInTransitStock = (product.returnInTransitStock || 0) + item.quantity;
-        product.updatedAt = nowIso;
+
+        product = normalizeProductCustody({
+          ...product,
+          outboundInTransitStock: nextOutbound,
+          reservedStock: nextReserved,
+          returnInTransitStock: prevRetTransit + item.quantity,
+          updatedAt: nowIso,
+        });
+        products[prodIdx] = product;
 
         newMovements.push({
-          id: `mov-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+          id: `mov-${Date.now()}-${i}-${Math.random().toString(36).substring(2, 6)}`,
+          merchantId: order.merchantId || product.merchantId,
           productId: product.id,
           productSku: product.sku || product.name,
           productName: product.name,
           marketplaceId: order.marketplaceId,
+          platformId: order.marketplaceId,
+          source: 'outbound_transit',
+          destination: 'return_transit',
           type: 'return_initiated',
           quantityChange: 0,
           previousPhysical: product.physicalStock,
           newPhysical: product.physicalStock,
           previousAvailable: product.availableStock,
           newAvailable: product.availableStock,
+          beforeQty: prevRetTransit,
+          afterQty: product.returnInTransitStock,
           fromCustody: 'مع مندوب التوصيل',
           toCustody: 'مرتجع في طريق العودة للمستودع',
           referenceOrderId: order.id,
+          eventKey: `return_initiated|${product.id}|${order.id}|${i}`,
           reason: `رفض استلام الطلب #${order.id} - نقل الشحنة إلى مسار العودة ولا تُعاد للمخزون المتاح إلا بعد الفحص`,
           operator,
           timestamp: nowIso,
@@ -555,12 +784,14 @@ export function updateOrderStatusPure(params: {
       const returnId = generateUniqueId('RET', existingReturnIds, 3);
       const newReturn: ReturnRecord = {
         id: returnId,
+        merchantId: order.merchantId,
         orderId: order.id,
         marketplaceId: order.marketplaceId,
         items: order.items,
         returnReason: 'رفض العميل استلام الشحنة عند الباب (Delivery Rejected)',
         returnStatus: 'in_transit_back',
         stockRestored: false,
+        rejectedFromResale: false,
         isCompleted: false,
         courierName: order.courierName || 'شركة الشحن',
         trackingNumber: order.trackingNumber || 'RET-AUTO',
@@ -583,6 +814,8 @@ export function updateOrderStatusPure(params: {
       returns.unshift(newReturn);
 
       newTransactions.push({
+        merchantId: order.merchantId,
+        eventRef: `return_initiated|return_shipping|${returnId}`,
         orderId: order.id,
         returnId,
         marketplaceId: order.marketplaceId,

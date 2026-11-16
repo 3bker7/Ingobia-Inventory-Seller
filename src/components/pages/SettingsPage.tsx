@@ -1,17 +1,22 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import {
-  Settings,
   Plus,
   Store,
-  DollarSign,
   User,
   Database,
   Download,
+  Upload,
   CheckCircle2,
+  PauseCircle,
+  PlayCircle,
   Trash2,
   GraduationCap,
   Sparkles,
   Terminal,
+  Lock,
+  Unlock,
+  Users,
+  ShieldAlert,
 } from 'lucide-react';
 import { storageService } from '../../services/storage';
 import { translations, Locale } from '../../locales/translations';
@@ -25,11 +30,42 @@ interface SettingsPageProps {
   onNavigateToTab?: (tab: string) => void;
 }
 
-export const SettingsPage: React.FC<SettingsPageProps> = ({ locale, onDataReset, onNavigateToTab }) => {
+const buildMarketplaceSlug = (nameEn: string, nameAr: string): string => {
+  const ascii = nameEn
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+  if (ascii.length >= 2) return ascii;
+  const source = (nameAr || nameEn).trim();
+  let hash = 2166136261;
+  for (let i = 0; i < source.length; i++) {
+    hash ^= source.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `mkt_${(hash >>> 0).toString(36)}`;
+};
+
+export const SettingsPage: React.FC<SettingsPageProps> = ({
+  locale,
+  onDataReset,
+  onNavigateToTab,
+}) => {
+  const isRtl = locale === 'ar';
   const t = translations[locale];
   const { showToast } = useToast();
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
   const [settings, setSettings] = useState(() => storageService.getSettings());
   const [profile, setProfile] = useState(() => storageService.getMerchantProfile());
+  const [marketplaces, setMarketplaces] = useState<MarketplaceConfig[]>(() =>
+    storageService.getAllMarketplaces()
+  );
+  const [accounts, setAccounts] = useState(() => storageService.getMerchantAccounts());
+  const [activeMerchantId, setActiveMerchantId] = useState(() =>
+    storageService.getActiveMerchantId()
+  );
+  const [isDevUnlocked, setIsDevUnlocked] = useState(() => storageService.isDeveloperMode());
 
   // Add marketplace modal
   const [isAddMktModalOpen, setIsAddMktModalOpen] = useState(false);
@@ -37,10 +73,34 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ locale, onDataReset,
   const [newMktNameAr, setNewMktNameAr] = useState('');
   const [newMktColor, setNewMktColor] = useState('#2563EB');
 
+  // Create merchant account modal
+  const [isAccountModalOpen, setIsAccountModalOpen] = useState(false);
+  const [newAccountStoreName, setNewAccountStoreName] = useState('');
+  const [newAccountMerchantName, setNewAccountMerchantName] = useState('');
+  const [newAccountEmail, setNewAccountEmail] = useState('');
+
+  // Developer unlock gate state
+  const [showDevGateForm, setShowDevGateForm] = useState(false);
+  const [devPasscode, setDevPasscode] = useState('');
+
   // Form state
   const [sellerName, setSellerName] = useState(profile.merchantName || settings.sellerName);
   const [storeName, setStoreName] = useState(profile.storeName || settings.storeName);
   const [currency, setCurrency] = useState(settings.currency);
+
+  const syncLocalSnapshots = () => {
+    const nextSettings = storageService.getSettings();
+    const nextProfile = storageService.getMerchantProfile();
+    setSettings(nextSettings);
+    setProfile(nextProfile);
+    setMarketplaces(storageService.getAllMarketplaces());
+    setAccounts(storageService.getMerchantAccounts());
+    setActiveMerchantId(storageService.getActiveMerchantId());
+    setIsDevUnlocked(storageService.isDeveloperMode());
+    setSellerName(nextProfile.merchantName || nextSettings.sellerName);
+    setStoreName(nextProfile.storeName || nextSettings.storeName);
+    setCurrency(nextSettings.currency);
+  };
 
   const handleSaveProfile = (e: React.FormEvent) => {
     e.preventDefault();
@@ -64,28 +124,42 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ locale, onDataReset,
       showToast(profileRes.error || t.toasts.error, 'error');
       return;
     }
-    setSettings(storageService.getSettings());
-    setProfile(storageService.getMerchantProfile());
+    syncLocalSnapshots();
+    onDataReset();
     showToast(t.toasts.settingsSaved, 'success');
   };
 
-  const handleRemoveMarketplace = (id: string) => {
-    if (settings.marketplaces.length <= 1) {
-      showToast(
-        locale === 'ar' ? 'يجب الإبقاء على منصة واحدة على الأقل.' : 'At least one marketplace is required.',
-        'error'
-      );
+  const handleToggleMarketplaceActive = (mkt: MarketplaceConfig) => {
+    const nextActive = mkt.isActive === false;
+    const res = storageService.setMarketplaceActive(mkt.id, nextActive);
+    if (!res.success) {
+      showToast(res.error || t.toasts.error, 'error');
       return;
     }
+    syncLocalSnapshots();
+    onDataReset();
+    showToast(
+      isRtl
+        ? nextActive
+          ? `تم تفعيل منصة (${mkt.nameAr}).`
+          : `تم تعطيل منصة (${mkt.nameAr}) مع الحفاظ على السجلات التاريخية.`
+        : nextActive
+        ? `Enabled ${mkt.nameEn}.`
+        : `Disabled ${mkt.nameEn} while preserving historical records.`,
+      'success'
+    );
+  };
+
+  const handleRemoveMarketplace = (id: string) => {
     const res = storageService.removeMarketplace(id);
     if (!res.success) {
       showToast(res.error || t.toasts.error, 'error');
       return;
     }
-    setSettings(storageService.getSettings());
+    syncLocalSnapshots();
     onDataReset();
     showToast(
-      locale === 'ar' ? 'تمت إزالة المنصة بنجاح.' : 'Marketplace removed successfully.',
+      isRtl ? 'تمت إزالة المنصة غير المرتبطة بسجلات بنجاح.' : 'Marketplace removed successfully.',
       'success'
     );
   };
@@ -93,7 +167,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ locale, onDataReset,
   const handleResetTutorials = () => {
     storageService.resetTutorial();
     showToast(
-      locale === 'ar'
+      isRtl
         ? 'تمت إعادة ضبط سجل الجولات التفاعلية بنجاح.'
         : 'All tutorials have been reset.',
       'success'
@@ -102,12 +176,20 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ locale, onDataReset,
 
   const handleAddMarketplace = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newMktNameEn.trim()) return;
-
-    const id = newMktNameEn.toLowerCase().replace(/[^a-z0-9]/g, '_');
-    if (settings.marketplaces.some((m) => m.id === id)) {
+    const enTrimmed = newMktNameEn.trim();
+    const arTrimmed = newMktNameAr.trim();
+    if (!enTrimmed && !arTrimmed) {
       showToast(
-        locale === 'ar' ? 'هذه المنصة مضافة مسبقاً.' : 'Marketplace already exists.',
+        isRtl ? 'يرجى إدخال اسم المنصة بالعربية أو الإنجليزية.' : 'Please enter a marketplace name.',
+        'error'
+      );
+      return;
+    }
+
+    const id = buildMarketplaceSlug(enTrimmed, arTrimmed);
+    if (marketplaces.some((m) => m.id === id)) {
+      showToast(
+        isRtl ? 'هذه المنصة مضافة مسبقاً.' : 'Marketplace already exists.',
         'error'
       );
       return;
@@ -115,8 +197,8 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ locale, onDataReset,
 
     const newMkt: MarketplaceConfig = {
       id,
-      nameEn: newMktNameEn.trim(),
-      nameAr: newMktNameAr.trim() || newMktNameEn.trim(),
+      nameEn: enTrimmed || arTrimmed,
+      nameAr: arTrimmed || enTrimmed,
       color: newMktColor,
       badgeBg: '#EFF6FF',
       badgeText: '#1E40AF',
@@ -128,47 +210,138 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ locale, onDataReset,
       showToast(res.error || t.toasts.error, 'error');
       return;
     }
-    setSettings(storageService.getSettings());
+    syncLocalSnapshots();
+    onDataReset();
     setIsAddMktModalOpen(false);
     setNewMktNameEn('');
     setNewMktNameAr('');
     showToast(
-      locale === 'ar'
+      isRtl
         ? `تمت إضافة منصة (${newMkt.nameAr}) وأعمدتها أصبحت متوفرة في الجداول.`
         : `Added ${newMkt.nameEn} marketplace.`,
       'success'
     );
   };
 
-  const handleExportBackup = () => {
-    const backupData = {
-      products: storageService.getProducts(),
-      orders: storageService.getOrders(),
-      movements: storageService.getMovements(),
-      returns: storageService.getReturns(),
-      priceHistory: storageService.getPriceHistory(),
-      financialTransactions: storageService.getFinancialTransactions(),
-      settings: storageService.getSettings(),
-      exportedAt: new Date().toISOString(),
-    };
+  const handleSwitchAccount = (merchantId: string) => {
+    if (merchantId === activeMerchantId) return;
+    const res = storageService.switchMerchantAccount(merchantId);
+    if (!res.success) {
+      showToast(res.error || t.toasts.error, 'error');
+      return;
+    }
+    syncLocalSnapshots();
+    onDataReset();
+    showToast(
+      isRtl ? 'تم التبديل إلى مساحة التاجر المعزولة بنجاح.' : 'Switched to isolated merchant space.',
+      'success'
+    );
+  };
 
-    const blob = new Blob([JSON.stringify(backupData, null, 2)], {
+  const handleCreateAccount = (e: React.FormEvent) => {
+    e.preventDefault();
+    const res = storageService.createMerchantAccount({
+      storeName: newAccountStoreName,
+      merchantName: newAccountMerchantName,
+      email: newAccountEmail,
+      language: locale,
+      currency,
+      switchTo: true,
+    });
+    if (!res.success) {
+      showToast(res.error || t.toasts.error, 'error');
+      return;
+    }
+    setIsAccountModalOpen(false);
+    setNewAccountStoreName('');
+    setNewAccountMerchantName('');
+    setNewAccountEmail('');
+    syncLocalSnapshots();
+    onDataReset();
+    showToast(
+      isRtl
+        ? `تم إنشاء وعزل حساب المتجر (${res.account?.storeName}) والتبديل إليه.`
+        : `Created and switched to isolated store (${res.account?.storeName}).`,
+      'success'
+    );
+  };
+
+  const handleExportBackup = () => {
+    const json = storageService.exportMerchantBackupJson();
+    const blob = new Blob([json], {
       type: 'application/json',
     });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `SellerOps_Backup_${new Date().toISOString().slice(0, 10)}.json`;
+    a.download = `Ingobia_Backup_${activeMerchantId}_${new Date().toISOString().slice(0, 10)}.json`;
     a.click();
     URL.revokeObjectURL(url);
-    showToast(locale === 'ar' ? 'تم تصدير النسخة الاحتياطية بنجاح.' : 'Backup exported successfully.', 'success');
+    showToast(
+      isRtl ? 'تم تصدير النسخة الاحتياطية الكاملة بنجاح.' : 'Backup exported successfully.',
+      'success'
+    );
+  };
+
+  const handleImportBackupFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const res = storageService.importMerchantBackupJson(text);
+      if (!res.success) {
+        showToast(res.error || t.toasts.error, 'error');
+        return;
+      }
+      syncLocalSnapshots();
+      onDataReset();
+      showToast(
+        isRtl
+          ? 'تم استيراد النسخة الاحتياطية JSON واستعادة البيانات بأمان.'
+          : 'JSON backup imported and verified safely.',
+        'success'
+      );
+    } catch {
+      showToast(
+        isRtl ? 'تعذر قراءة ملف النسخة الاحتياطية.' : 'Failed to read backup file.',
+        'error'
+      );
+    }
+  };
+
+  const handleUnlockDeveloper = (e: React.FormEvent) => {
+    e.preventDefault();
+    const res = storageService.unlockDeveloperMode(devPasscode);
+    if (!res.success) {
+      showToast(res.error || (isRtl ? 'رمز المطور غير صحيح.' : 'Invalid developer passcode.'), 'error');
+      return;
+    }
+    setDevPasscode('');
+    setShowDevGateForm(false);
+    syncLocalSnapshots();
+    onDataReset();
+    showToast(
+      isRtl ? 'تم تفعيل وضع المطور في هذه الجلسة.' : 'Developer mode unlocked for this session.',
+      'success'
+    );
+  };
+
+  const handleLockDeveloper = () => {
+    storageService.lockDeveloperMode();
+    syncLocalSnapshots();
+    onDataReset();
+    showToast(
+      isRtl ? 'تم قفل وضع المطور والعودة لصلاحيات التاجر.' : 'Developer mode locked.',
+      'success'
+    );
   };
 
   return (
     <div className="space-y-6 max-w-4xl">
       {/* Connected Marketplaces Section */}
       <div className="bg-white rounded-xl border border-[#E8ECF2] p-5 shadow-xs">
-        <div className="flex items-center justify-between pb-3 border-b border-[#E8ECF2] mb-4">
+        <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-[#E8ECF2] mb-4">
           <div className="flex items-center gap-2">
             <Store className="w-5 h-5 text-[#2563EB]" />
             <div>
@@ -176,70 +349,188 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ locale, onDataReset,
                 {t.settings.marketplacesSection}
               </h3>
               <p className="text-xs text-[#64748B]">
-                {locale === 'ar'
-                  ? 'إدارة المنصات التي تعرض أعمدة مخصصة في جدول المنتجات والمخزون'
-                  : 'Manage active channels and dynamic table columns'}
+                {isRtl
+                  ? 'مصدر الحقيقة الوحيد للقنوات: المنصات النشطة فقط تظهر في الإنشاء وإكسيل، بينما تظل السجلات التاريخية للمنصات المعطلة محفوظة'
+                  : 'Single source of truth: active channels appear in creation forms & Excel; disabled channels preserve historical logs'}
               </p>
             </div>
           </div>
 
           <button
+            type="button"
             onClick={() => setIsAddMktModalOpen(true)}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-[#2563EB] hover:bg-blue-700 rounded-lg transition-colors shadow-xs"
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-[#2563EB] hover:bg-blue-700 rounded-lg transition-colors shadow-xs cursor-pointer whitespace-nowrap shrink-0"
           >
             <Plus className="w-3.5 h-3.5" />
             <span>{t.settings.addMarketplace}</span>
           </button>
         </div>
 
-        <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
-          {settings.marketplaces.map((mkt) => (
-            <div
-              key={mkt.id}
-              className="p-3 bg-[#F7F8FA] border border-[#E8ECF2] rounded-xl flex items-center justify-between"
-            >
-              <div className="flex items-center gap-2.5 min-w-0">
+        {marketplaces.length === 0 ? (
+          <div className="p-4 bg-[#F7F8FA] rounded-xl border border-[#E8ECF2] text-xs text-[#64748B] text-center">
+            {isRtl
+              ? 'لا توجد منصات مضافة حالياً. أضف منصة بيع أو استخدم المتجر المستقل.'
+              : 'No marketplaces configured. Add a channel to manage platform allocations.'}
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            {marketplaces.map((mkt) => {
+              const isActive = mkt.isActive !== false;
+              return (
                 <div
-                  className="w-3.5 h-3.5 rounded-full shrink-0 border border-black/10"
-                  style={{ backgroundColor: mkt.color }}
-                />
-                <div className="min-w-0">
-                  <div className="font-bold text-xs text-[#172033] truncate">
-                    {locale === 'ar' ? mkt.nameAr : mkt.nameEn}
+                  key={mkt.id}
+                  className={`p-3 rounded-xl border flex items-center justify-between gap-2 ${
+                    isActive
+                      ? 'bg-[#F7F8FA] border-[#E8ECF2]'
+                      : 'bg-slate-50/70 border-slate-200 opacity-85'
+                  }`}
+                >
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <div
+                      className="w-3.5 h-3.5 rounded-full shrink-0 border border-black/10"
+                      style={{ backgroundColor: isActive ? mkt.color : '#94A3B8' }}
+                    />
+                    <div className="min-w-0">
+                      <div className="font-bold text-xs text-[#172033] truncate">
+                        {isRtl ? mkt.nameAr : mkt.nameEn}
+                      </div>
+                      <div className="text-[10px] text-[#64748B] font-mono-code truncate">
+                        {mkt.nameEn} · {mkt.id}
+                      </div>
+                    </div>
                   </div>
-                  <div className="text-[10px] text-[#64748B] font-mono-code truncate">
-                    {mkt.nameEn} · id: {mkt.id}
+
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    {isActive ? (
+                      <span className="text-[10px] font-semibold text-[#16A36A] flex items-center gap-1 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200 whitespace-nowrap shrink-0">
+                        <CheckCircle2 className="w-3 h-3" />
+                        {isRtl ? 'نشطة' : 'Active'}
+                      </span>
+                    ) : (
+                      <span className="text-[10px] font-semibold text-slate-600 flex items-center gap-1 bg-slate-100 px-2 py-0.5 rounded border border-slate-300 whitespace-nowrap shrink-0">
+                        <PauseCircle className="w-3 h-3" />
+                        {isRtl ? 'معطلة' : 'Disabled'}
+                      </span>
+                    )}
+
+                    <button
+                      type="button"
+                      onClick={() => handleToggleMarketplaceActive(mkt)}
+                      className="p-1.5 text-slate-500 hover:text-[#2563EB] hover:bg-white rounded border border-transparent hover:border-[#E8ECF2] transition-colors cursor-pointer"
+                      title={
+                        isActive
+                          ? isRtl
+                            ? 'تعطيل المنصة مع حفظ السجلات'
+                            : 'Disable channel'
+                          : isRtl
+                          ? 'إعادة تفعيل المنصة'
+                          : 'Activate channel'
+                      }
+                    >
+                      {isActive ? (
+                        <PauseCircle className="w-3.5 h-3.5" />
+                      ) : (
+                        <PlayCircle className="w-3.5 h-3.5 text-emerald-600" />
+                      )}
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => handleRemoveMarketplace(mkt.id)}
+                      className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-white rounded border border-transparent hover:border-rose-200 transition-colors cursor-pointer"
+                      title={
+                        isRtl
+                          ? 'حذف المنصة (يُسمح فقط إذا لم تكن مرتبطة بسجلات تاريخية)'
+                          : 'Delete channel if unused'
+                      }
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
                   </div>
                 </div>
-              </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
 
-              <div className="flex items-center gap-1.5 shrink-0">
-                <span className="text-[10px] font-semibold text-[#16A36A] flex items-center gap-1 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">
-                  <CheckCircle2 className="w-3 h-3" />
-                  {locale === 'ar' ? 'متصل' : 'Active'}
-                </span>
-                {settings.marketplaces.length > 1 && (
+      {/* Isolated Multi-Merchant Workspaces */}
+      <div className="bg-white rounded-xl border border-[#E8ECF2] p-5 shadow-xs space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-[#E8ECF2]">
+          <div className="flex items-center gap-2">
+            <Users className="w-5 h-5 text-[#2563EB]" />
+            <div>
+              <h3 className="text-sm font-bold text-[#172033]">
+                {isRtl ? 'حسابات التجار المعزولة محلياً' : 'Isolated Merchant Workspaces'}
+              </h3>
+              <p className="text-xs text-[#64748B]">
+                {isRtl
+                  ? 'كل حساب تاجر يمتلك مساحة تخزين معزولة بالكامل للمنتجات والطلبات والمخزون والدفتر المالي'
+                  : 'Each merchant workspace has isolated local storage for products, orders, inventory, and ledger'}
+              </p>
+            </div>
+          </div>
+
+          <button
+            type="button"
+            onClick={() => setIsAccountModalOpen(true)}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-[#2563EB] hover:bg-blue-700 rounded-lg transition-colors shadow-xs cursor-pointer whitespace-nowrap shrink-0"
+          >
+            <Plus className="w-3.5 h-3.5" />
+            <span>{isRtl ? 'إنشاء حساب تاجر جديد' : 'New Merchant Space'}</span>
+          </button>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          {accounts.map((acc) => {
+            const isCurrent = acc.id === activeMerchantId;
+            return (
+              <div
+                key={acc.id}
+                className={`p-3 rounded-xl border flex items-center justify-between gap-3 ${
+                  isCurrent
+                    ? 'bg-blue-50/60 border-[#2563EB]'
+                    : 'bg-[#F7F8FA] border-[#E8ECF2]'
+                }`}
+              >
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className="font-bold text-xs text-[#172033] truncate">
+                      {acc.storeName || (isRtl ? 'متجر غير مسمى' : 'Untitled Store')}
+                    </span>
+                    {isCurrent && (
+                      <span className="text-[10px] font-bold text-[#2563EB] bg-white px-2 py-0.5 rounded border border-blue-200 whitespace-nowrap shrink-0">
+                        {isRtl ? 'النشط' : 'Active'}
+                      </span>
+                    )}
+                  </div>
+                  <div className="text-[11px] text-[#64748B] truncate mt-0.5">
+                    {acc.merchantName || (isRtl ? 'تاجر' : 'Merchant')} ·{' '}
+                    <span className="font-mono-code">{acc.id}</span>
+                  </div>
+                </div>
+
+                {!isCurrent && (
                   <button
                     type="button"
-                    onClick={() => handleRemoveMarketplace(mkt.id)}
-                    className="p-1 text-slate-400 hover:text-rose-600 rounded transition-colors cursor-pointer"
-                    title={locale === 'ar' ? 'حذف المنصة' : 'Remove channel'}
+                    onClick={() => handleSwitchAccount(acc.id)}
+                    className="px-3 py-1.5 text-xs font-semibold text-[#172033] bg-white hover:bg-slate-100 border border-[#E8ECF2] rounded-lg transition-colors cursor-pointer whitespace-nowrap shrink-0"
                   >
-                    <Trash2 className="w-3.5 h-3.5" />
+                    {isRtl ? 'تبديل' : 'Switch'}
                   </button>
                 )}
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       </div>
 
-      {/* Google Account & Merchant Profile */}
+      {/* Merchant Profile */}
       <form
         onSubmit={handleSaveProfile}
         className="bg-white rounded-xl border border-[#E8ECF2] p-5 shadow-xs space-y-4"
       >
-        <div className="flex items-center justify-between pb-3 border-b border-[#E8ECF2]">
+        <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-[#E8ECF2]">
           <div className="flex items-center gap-2">
             <User className="w-5 h-5 text-[#2563EB]" />
             <div>
@@ -247,14 +538,16 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ locale, onDataReset,
                 {t.settings.sellerProfileSection}
               </h3>
               <p className="text-xs text-[#64748B]">
-                {locale === 'ar' ? 'بيانات التاجر وحساب Google الموثق' : 'Merchant identity and verified Google account'}
+                {isRtl ? 'بيانات التاجر والهوية التشغيلية للمتجر' : 'Merchant identity and store configuration'}
               </p>
             </div>
           </div>
 
           <div className="flex items-center gap-2 bg-[#F8FAFC] px-3 py-1 rounded-full border border-[#E8ECF2] text-xs">
             <div className="w-2 h-2 rounded-full bg-[#16A36A]" />
-            <span className="font-mono text-[#475569] text-[11px]">a7med3bker@gmail.com</span>
+            <span className="font-mono text-[#475569] text-[11px]">
+              {profile.email || (isRtl ? 'جلسة متجر محلية' : 'Local Store Session')}
+            </span>
           </div>
         </div>
 
@@ -267,6 +560,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ locale, onDataReset,
               type="text"
               value={sellerName}
               onChange={(e) => setSellerName(e.target.value)}
+              placeholder={isRtl ? 'اسم مسؤول العمليات' : 'Operator name'}
               className="w-full px-3 py-2 bg-[#F7F8FA] border border-[#E8ECF2] rounded-lg text-[#172033] focus:outline-none focus:ring-1 focus:ring-[#2563EB]"
             />
           </div>
@@ -279,6 +573,7 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ locale, onDataReset,
               type="text"
               value={storeName}
               onChange={(e) => setStoreName(e.target.value)}
+              placeholder={isRtl ? 'اسم المتجر التجاري' : 'Store name'}
               className="w-full px-3 py-2 bg-[#F7F8FA] border border-[#E8ECF2] rounded-lg text-[#172033] focus:outline-none focus:ring-1 focus:ring-[#2563EB]"
             />
           </div>
@@ -304,23 +599,25 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ locale, onDataReset,
         <div className="flex justify-end pt-2">
           <button
             type="submit"
-            className="px-4 py-2 text-xs font-semibold text-white bg-[#2563EB] hover:bg-blue-700 rounded-lg transition-colors shadow-xs"
+            className="px-4 py-2 text-xs font-semibold text-white bg-[#2563EB] hover:bg-blue-700 rounded-lg transition-colors shadow-xs cursor-pointer whitespace-nowrap shrink-0"
           >
             {t.actions.save}
           </button>
         </div>
       </form>
 
-      {/* Data Controls & Backup */}
+      {/* Data Controls & Backup (Export & Verified Import) */}
       <div className="bg-white rounded-xl border border-[#E8ECF2] p-5 shadow-xs space-y-4">
         <div className="flex items-center gap-2 pb-3 border-b border-[#E8ECF2]">
           <Database className="w-5 h-5 text-[#2563EB]" />
           <div>
             <h3 className="text-sm font-bold text-[#172033]">
-              {locale === 'ar' ? 'النسخ الاحتياطي للبيانات' : 'Store Data Backup'}
+              {isRtl ? 'النسخ الاحتياطي والاستعادة (JSON)' : 'Store Data Backup & Restore'}
             </h3>
             <p className="text-xs text-[#64748B]">
-              {locale === 'ar' ? 'تصدير نسخة احتياطية كاملة بصيغة JSON' : 'Export full store database backup'}
+              {isRtl
+                ? 'تصدير نسخة احتياطية كاملة أو استعادتها مع التحقق من البنية وحفظ لقطة احتياطية قبل الاستبدال'
+                : 'Export or restore verified JSON backups with automatic pre-restore snapshot protection'}
             </p>
           </div>
         </div>
@@ -331,19 +628,38 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ locale, onDataReset,
               {t.settings.backupJson}
             </span>
             <span className="text-[#64748B] text-[11px]">
-              {locale === 'ar'
-                ? 'تحميل ملف JSON كامل يحتوي على كافة الكتالوجات، والطلبات، والمرتجعات، وسجلات الأسعار'
-                : 'Download full JSON dump of catalog, orders, returns, and movements'}
+              {isRtl
+                ? 'يشمل الكتالوج، والطلبات، والمرتجعات، والحركات، والقيود المالية لهذا المتجر فقط'
+                : 'Includes catalog, orders, returns, movements, and ledger scoped to this store'}
             </span>
           </div>
 
-          <button
-            onClick={handleExportBackup}
-            className="flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold text-[#172033] bg-[#F7F8FA] hover:bg-slate-200/70 border border-[#E8ECF2] rounded-lg transition-colors"
-          >
-            <Download className="w-3.5 h-3.5 text-[#2563EB]" />
-            <span>{t.actions.export} (JSON)</span>
-          </button>
+          <div className="flex items-center gap-2 flex-wrap">
+            <button
+              type="button"
+              onClick={handleExportBackup}
+              className="flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold text-[#172033] bg-[#F7F8FA] hover:bg-slate-200/70 border border-[#E8ECF2] rounded-lg transition-colors cursor-pointer whitespace-nowrap shrink-0"
+            >
+              <Download className="w-3.5 h-3.5 text-[#2563EB]" />
+              <span>{t.actions.export} (JSON)</span>
+            </button>
+
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".json,application/json"
+              onChange={handleImportBackupFile}
+              className="hidden"
+            />
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              className="flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold text-[#172033] bg-white hover:bg-[#F7F8FA] border border-[#E8ECF2] rounded-lg transition-colors cursor-pointer whitespace-nowrap shrink-0"
+            >
+              <Upload className="w-3.5 h-3.5 text-[#16A36A]" />
+              <span>{isRtl ? 'استيراد نسخة احتياطية (JSON)' : 'Import Backup (JSON)'}</span>
+            </button>
+          </div>
         </div>
       </div>
 
@@ -353,12 +669,12 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ locale, onDataReset,
           <GraduationCap className="w-5 h-5 text-[#2563EB]" />
           <div>
             <h3 className="text-sm font-bold text-[#172033]">
-              {locale === 'ar' ? 'الجولات الإرشادية ومركز التدريب' : 'Interactive Guidance & Training'}
+              {isRtl ? 'الجولات الإرشادية ومركز التدريب' : 'Interactive Guidance & Training'}
             </h3>
             <p className="text-xs text-[#64748B]">
-              {locale === 'ar'
+              {isRtl
                 ? 'إدارة الجولات الإرشادية والمساعد التفاعلي ثلاثي الأبعاد'
-                : 'Manage interactive 3D assistant guides and walk-throughs'}
+                : 'Manage interactive assistant guides and walk-throughs'}
             </p>
           </div>
         </div>
@@ -366,10 +682,10 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ locale, onDataReset,
         <div className="flex flex-wrap items-center justify-between gap-3 text-xs">
           <div>
             <span className="font-semibold text-[#172033] block">
-              {locale === 'ar' ? 'إعادة تشغيل الجولات الإرشادية التلقائية' : 'Reset Walk-through History'}
+              {isRtl ? 'إعادة تشغيل الجولات الإرشادية التلقائية' : 'Reset Walk-through History'}
             </span>
             <span className="text-[#64748B] text-[11px]">
-              {locale === 'ar'
+              {isRtl
                 ? 'إعادة تعيين سجل المشاهدات لكي يبدأ المساعد بشرح كل صفحة عند زيارتها لأول مرة'
                 : 'Reset tour completion status so guides display automatically on each view'}
             </span>
@@ -378,59 +694,137 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ locale, onDataReset,
           <button
             type="button"
             onClick={handleResetTutorials}
-            className="flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold text-[#2563EB] bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded-lg transition-colors cursor-pointer"
+            className="flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold text-[#2563EB] bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded-lg transition-colors cursor-pointer whitespace-nowrap shrink-0"
           >
             <Sparkles className="w-3.5 h-3.5" />
-            <span>{locale === 'ar' ? 'إعادة تعيين الجولات' : 'Reset Tours'}</span>
+            <span>{isRtl ? 'إعادة تعيين الجولات' : 'Reset Tours'}</span>
           </button>
         </div>
       </div>
 
-      {/* Developer Center & Text Export Section */}
+      {/* Developer Mode Passcode Gate */}
       <div className="bg-white rounded-xl border border-[#E8ECF2] p-5 shadow-xs space-y-4">
-        <div className="flex items-center justify-between pb-3 border-b border-[#E8ECF2]">
+        <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-[#E8ECF2]">
           <div className="flex items-center gap-2">
-            <Terminal className="w-5 h-5 text-purple-600" />
+            <Terminal className="w-5 h-5 text-slate-700" />
             <div>
               <h3 className="text-sm font-bold text-[#172033]">
-                {locale === 'ar' ? 'مركز المطورين والتصدير النصي الشامل' : 'Developer Center & Text Export'}
+                {isRtl ? 'صلاحية المطور وأدوات التشخيص' : 'Developer Access & Diagnostics'}
               </h3>
               <p className="text-xs text-[#64748B]">
-                {locale === 'ar'
-                  ? 'فحص شامل لبنية المشروع وشيفرته المصدرية وتصديرها كنصوص مرقمة دون ملفات مضغوطة'
-                  : 'Full text-only inspection and numbered sections export of the codebase'}
+                {isRtl
+                  ? 'مخفية عن التاجر العادي ولا تُفتح إلا عبر رمز جلسة المطور'
+                  : 'Hidden from ordinary merchant workflows and gated by developer session passcode'}
               </p>
             </div>
           </div>
 
-          <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-purple-100 text-purple-800 font-mono-code">
-            DEVELOPER ACCESS
+          <span
+            className={`text-[10px] font-bold px-2 py-0.5 rounded-full font-mono-code whitespace-nowrap shrink-0 ${
+              isDevUnlocked
+                ? 'bg-emerald-100 text-emerald-800'
+                : 'bg-slate-100 text-slate-700'
+            }`}
+          >
+            {isDevUnlocked ? 'DEVELOPER SESSION ACTIVE' : 'MERCHANT ROLE (LOCKED)'}
           </span>
         </div>
 
-        <div className="flex flex-wrap items-center justify-between gap-3 text-xs">
-          <div>
-            <span className="font-semibold text-[#172033] block">
-              {locale === 'ar' ? 'الوصول لمركز الفحص النصي وتوليد اللقطات' : 'Access Text-First Developer Center'}
-            </span>
-            <span className="text-[#64748B] text-[11px]">
-              {locale === 'ar'
-                ? 'يتيح نسخ أجزاء الكود والمعمارية المحاسبية ونماذج العهدة المخزنية دفعة واحدة أو جزءاً جزءاً'
-                : 'Inspect actual source code, financial ledger schemas, and custody architecture'}
-            </span>
-          </div>
-
-          {onNavigateToTab && (
-            <button
-              type="button"
-              onClick={() => onNavigateToTab('developerCenter')}
-              className="flex items-center gap-1.5 px-4 py-2 text-xs font-bold text-white bg-purple-600 hover:bg-purple-700 rounded-lg transition-colors cursor-pointer shadow-xs"
-            >
-              <Terminal className="w-3.5 h-3.5" />
-              <span>{locale === 'ar' ? 'فتح مركز المطورين' : 'Open Developer Center'}</span>
-            </button>
-          )}
+        <div className="p-3 rounded-lg bg-[#F7F8FA] border border-[#E8ECF2] flex items-start gap-2 text-[11px] text-[#64748B]">
+          <ShieldAlert className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+          <span>
+            {isRtl
+              ? 'تنبيه شفافية: التطبيق يعمل محلياً داخل المتصفح (Client-side localStorage)، لذا يمثل رمز المطور بوابة فصل واجهة وصلاحية جلسة محلية وليس مصادقة خادم (Server-side RBAC).'
+              : 'Transparency note: This app runs client-side in browser localStorage; the developer passcode enforces UI/session role separation, not server-side RBAC.'}
+          </span>
         </div>
+
+        {!isDevUnlocked ? (
+          <div className="space-y-3 text-xs">
+            {!showDevGateForm ? (
+              <div className="flex items-center justify-between gap-3 flex-wrap">
+                <span className="text-[#64748B]">
+                  {isRtl
+                    ? 'مركز المطورين والبيانات التجريبية وسجل التدقيق مقفل حالياً.'
+                    : 'Developer Center, sandbox tools, and audit logs are currently locked.'}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setShowDevGateForm(true)}
+                  className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-[#172033] bg-[#F7F8FA] hover:bg-slate-200/70 border border-[#E8ECF2] rounded-lg transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                >
+                  <Lock className="w-3.5 h-3.5 text-[#64748B]" />
+                  <span>{isRtl ? 'فتح وضع المطور' : 'Unlock Developer Mode'}</span>
+                </button>
+              </div>
+            ) : (
+              <form
+                onSubmit={handleUnlockDeveloper}
+                className="flex flex-wrap items-center gap-2 bg-[#F7F8FA] p-3 rounded-xl border border-[#E8ECF2]"
+              >
+                <input
+                  type="password"
+                  required
+                  value={devPasscode}
+                  onChange={(e) => setDevPasscode(e.target.value)}
+                  placeholder={isRtl ? 'أدخل رمز المطور...' : 'Enter developer passcode...'}
+                  className="flex-1 min-w-[200px] px-3 py-2 bg-white border border-[#E8ECF2] rounded-lg text-[#172033] focus:outline-none focus:ring-1 focus:ring-[#2563EB]"
+                />
+                <button
+                  type="submit"
+                  className="flex items-center gap-1.5 px-4 py-2 text-xs font-bold text-white bg-[#2563EB] hover:bg-blue-700 rounded-lg transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                >
+                  <Unlock className="w-3.5 h-3.5" />
+                  <span>{isRtl ? 'تفعيل الجلسة' : 'Unlock'}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowDevGateForm(false);
+                    setDevPasscode('');
+                  }}
+                  className="px-3 py-2 text-xs font-medium text-[#64748B] hover:text-[#172033] bg-white border border-[#E8ECF2] rounded-lg cursor-pointer whitespace-nowrap shrink-0"
+                >
+                  {t.actions.cancel}
+                </button>
+              </form>
+            )}
+          </div>
+        ) : (
+          <div className="flex flex-wrap items-center justify-between gap-3 text-xs">
+            <div>
+              <span className="font-semibold text-[#172033] block">
+                {isRtl ? 'جلسة المطور مفعلة' : 'Developer Session Unlocked'}
+              </span>
+              <span className="text-[#64748B] text-[11px]">
+                {isRtl
+                  ? 'يمكنك فتح مركز المطورين أو قفل الصلاحية للعودة لواجهة التاجر القياسية.'
+                  : 'You can open the Developer Center or lock developer mode to return to standard merchant mode.'}
+              </span>
+            </div>
+
+            <div className="flex items-center gap-2 flex-wrap">
+              {onNavigateToTab && (
+                <button
+                  type="button"
+                  onClick={() => onNavigateToTab('developerCenter')}
+                  className="flex items-center gap-1.5 px-4 py-2 text-xs font-bold text-white bg-[#2563EB] hover:bg-blue-700 rounded-lg transition-colors cursor-pointer shadow-xs whitespace-nowrap shrink-0"
+                >
+                  <Terminal className="w-3.5 h-3.5" />
+                  <span>{isRtl ? 'فتح مركز المطورين' : 'Open Developer Center'}</span>
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={handleLockDeveloper}
+                className="flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-[#172033] bg-[#F7F8FA] hover:bg-slate-200/70 border border-[#E8ECF2] rounded-lg transition-colors cursor-pointer whitespace-nowrap shrink-0"
+              >
+                <Lock className="w-3.5 h-3.5" />
+                <span>{isRtl ? 'قفل وضع المطور' : 'Lock Developer Mode'}</span>
+              </button>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Add Marketplace Modal */}
@@ -439,8 +833,8 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ locale, onDataReset,
         onClose={() => setIsAddMktModalOpen(false)}
         title={t.settings.addMarketplace}
         subtitle={
-          locale === 'ar'
-            ? 'إضافة منصة جديدة يتيح تخصيص أسعارها وكمياتها فوراً في جدول المنتجات'
+          isRtl
+            ? 'إضافة منصة جديدة يتيح تخصيص مخزونها وأسعارها فوراً في الكتالوج'
             : 'Add new marketplace channel'
         }
         maxWidth="sm"
@@ -448,11 +842,10 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ locale, onDataReset,
         <form onSubmit={handleAddMarketplace} className="space-y-4 text-xs">
           <div>
             <label className="block font-semibold text-[#172033] mb-1">
-              {t.settings.marketplaceNameEn} *
+              {t.settings.marketplaceNameEn}
             </label>
             <input
               type="text"
-              required
               value={newMktNameEn}
               onChange={(e) => setNewMktNameEn(e.target.value)}
               placeholder="e.g. TikTok Shop, Carrefour, Trendyol"
@@ -494,15 +887,87 @@ export const SettingsPage: React.FC<SettingsPageProps> = ({ locale, onDataReset,
             <button
               type="button"
               onClick={() => setIsAddMktModalOpen(false)}
-              className="px-3.5 py-1.5 text-xs font-medium text-[#64748B] hover:text-[#172033] bg-[#F7F8FA] rounded-lg transition-colors"
+              className="px-3.5 py-1.5 text-xs font-medium text-[#64748B] hover:text-[#172033] bg-[#F7F8FA] rounded-lg transition-colors cursor-pointer"
             >
               {t.actions.cancel}
             </button>
             <button
               type="submit"
-              className="px-4 py-1.5 text-xs font-semibold text-white bg-[#2563EB] hover:bg-blue-700 rounded-lg transition-colors shadow-xs"
+              className="px-4 py-1.5 text-xs font-semibold text-white bg-[#2563EB] hover:bg-blue-700 rounded-lg transition-colors shadow-xs cursor-pointer"
             >
               {t.actions.confirm}
+            </button>
+          </div>
+        </form>
+      </Modal>
+
+      {/* Create Isolated Merchant Account Modal */}
+      <Modal
+        isOpen={isAccountModalOpen}
+        onClose={() => setIsAccountModalOpen(false)}
+        title={isRtl ? 'إنشاء حساب تاجر معزول جديد' : 'Create Isolated Merchant Space'}
+        subtitle={
+          isRtl
+            ? 'سيبدأ المتجر الجديد ببيانات فارغة معزولة تماماً عن المتاجر الأخرى.'
+            : 'Creates an isolated empty store workspace.'
+        }
+        maxWidth="sm"
+      >
+        <form onSubmit={handleCreateAccount} className="space-y-4 text-xs">
+          <div>
+            <label className="block font-semibold text-[#172033] mb-1">
+              {isRtl ? 'اسم المتجر *' : 'Store Name *'}
+            </label>
+            <input
+              type="text"
+              required
+              value={newAccountStoreName}
+              onChange={(e) => setNewAccountStoreName(e.target.value)}
+              placeholder={isRtl ? 'مثال: متجر النخبة' : 'e.g. Elite Store'}
+              className="w-full px-3 py-2 bg-[#F7F8FA] border border-[#E8ECF2] rounded-lg text-[#172033] focus:outline-none focus:ring-1 focus:ring-[#2563EB]"
+            />
+          </div>
+
+          <div>
+            <label className="block font-semibold text-[#172033] mb-1">
+              {isRtl ? 'اسم التاجر / المسؤول *' : 'Merchant Name *'}
+            </label>
+            <input
+              type="text"
+              required
+              value={newAccountMerchantName}
+              onChange={(e) => setNewAccountMerchantName(e.target.value)}
+              placeholder={isRtl ? 'اسم مدير الحساب' : 'Account owner'}
+              className="w-full px-3 py-2 bg-[#F7F8FA] border border-[#E8ECF2] rounded-lg text-[#172033] focus:outline-none focus:ring-1 focus:ring-[#2563EB]"
+            />
+          </div>
+
+          <div>
+            <label className="block font-semibold text-[#172033] mb-1">
+              {isRtl ? 'البريد الإلكتروني (اختياري)' : 'Email (Optional)'}
+            </label>
+            <input
+              type="email"
+              value={newAccountEmail}
+              onChange={(e) => setNewAccountEmail(e.target.value)}
+              placeholder="merchant@store.example"
+              className="w-full px-3 py-2 bg-[#F7F8FA] border border-[#E8ECF2] rounded-lg text-[#172033] focus:outline-none focus:ring-1 focus:ring-[#2563EB]"
+            />
+          </div>
+
+          <div className="flex items-center justify-end gap-3 pt-3 border-t border-[#E8ECF2]">
+            <button
+              type="button"
+              onClick={() => setIsAccountModalOpen(false)}
+              className="px-3.5 py-1.5 text-xs font-medium text-[#64748B] hover:text-[#172033] bg-[#F7F8FA] rounded-lg transition-colors cursor-pointer"
+            >
+              {t.actions.cancel}
+            </button>
+            <button
+              type="submit"
+              className="px-4 py-1.5 text-xs font-semibold text-white bg-[#2563EB] hover:bg-blue-700 rounded-lg transition-colors shadow-xs cursor-pointer"
+            >
+              {isRtl ? 'إنشاء والتبديل' : 'Create & Switch'}
             </button>
           </div>
         </form>

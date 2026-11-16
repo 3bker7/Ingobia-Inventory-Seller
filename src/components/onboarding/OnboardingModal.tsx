@@ -28,6 +28,23 @@ interface CustomMarketplace {
   nameAr: string;
 }
 
+function buildMarketplaceSlug(name: string): string {
+  const ascii = name
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+  if (ascii && ascii.replace(/_/g, '').length > 0) {
+    return ascii;
+  }
+  let hash = 2166136261;
+  for (let i = 0; i < name.length; i++) {
+    hash ^= name.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `mkt_${(hash >>> 0).toString(36)}`;
+}
+
 export const OnboardingModal: React.FC<OnboardingModalProps> = ({
   isOpen,
   locale,
@@ -42,9 +59,11 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
   const [showCustomInput, setShowCustomInput] = useState(false);
   const [ownStoreName, setOwnStoreName] = useState('');
 
-  // Step 2: Identity
-  const [merchantName, setMerchantName] = useState('أحمد إبراهيم');
-  const [storeName, setStoreName] = useState('روابي إكسبريس للتجارة الإلكترونية');
+  // Step 2: Identity (strictly clean empty inputs — zero hardcoded personal values)
+  const [merchantName, setMerchantName] = useState('');
+  const [storeName, setStoreName] = useState('');
+  const [merchantEmail, setMerchantEmail] = useState('');
+  const [identityError, setIdentityError] = useState('');
 
   if (!isOpen) return null;
 
@@ -66,7 +85,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
     const trimmed = currentCustomInput.trim();
     if (!trimmed) return;
 
-    const id = trimmed.toLowerCase().replace(/[^a-z0-9]/g, '_') || `mkt_${Date.now()}`;
+    const id = buildMarketplaceSlug(trimmed);
     if (customMarketplaces.some((m) => m.nameEn.toLowerCase() === trimmed.toLowerCase() || m.id === id)) {
       return;
     }
@@ -141,10 +160,13 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
       });
     });
 
+    const safeMerchantName = merchantName.trim() || (isRtl ? 'مدير المتجر' : 'Store Manager');
+    const safeStoreName = storeName.trim() || (isRtl ? 'متجري' : 'My Store');
+
     const onboardingRes = storageService.completeOnboarding(
       configuredMarketplaces,
-      merchantName.trim() || 'أحمد بكر',
-      storeName.trim() || 'متجر الأناقة الحديثة'
+      safeMerchantName,
+      safeStoreName
     );
 
     if (!onboardingRes.success) {
@@ -152,59 +174,78 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
       return;
     }
 
+    if (merchantEmail.trim()) {
+      const currentProfile = storageService.getMerchantProfile();
+      storageService.saveMerchantProfile({
+        ...currentProfile,
+        email: merchantEmail.trim(),
+      });
+    }
+
     onComplete();
   };
 
   const isRtl = locale === 'ar';
 
-  return (
-    <div className="fixed inset-0 z-50 bg-[#172033]/60 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto">
-      <div className="bg-white rounded-3xl border border-[#E8ECF2] shadow-2xl max-w-xl w-full overflow-hidden flex flex-col my-auto animate-in fade-in zoom-in-95 duration-200">
-        {/* Header Bar */}
-        <div className="bg-gradient-to-r from-blue-900 via-[#1E3A8A] to-[#2563EB] text-white p-6 relative overflow-hidden">
-          <div className="absolute -end-6 -bottom-6 w-32 h-32 rounded-full bg-white/10 blur-xl pointer-events-none" />
+  const handleNextStep = () => {
+    if (step === 2) {
+      if (!merchantName.trim() || !storeName.trim()) {
+        setIdentityError(
+          isRtl
+            ? 'يرجى إدخال اسم التاجر واسم المتجر التجاري للمتابعة.'
+            : 'Please enter both your name and store name to continue.'
+        );
+        return;
+      }
+      setIdentityError('');
+    }
+    setStep((prev) => (prev + 1) as 2 | 3);
+  };
 
-          {/* Top Google Sign-In pill */}
-          <div className="flex items-center justify-between mb-4">
-            <div className="flex items-center gap-2">
-              <div className="w-8 h-8 rounded-lg bg-white/20 flex items-center justify-center text-white font-bold backdrop-blur-xs">
+  return (
+    <div className="fixed inset-0 z-50 bg-[#172033]/50 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto">
+      <div className="bg-white rounded-2xl border border-[#E8ECF2] shadow-xl max-w-xl w-full overflow-hidden flex flex-col my-auto">
+        {/* Clean Light Header Bar */}
+        <div className="bg-[#F8FAFC] border-b border-[#E8ECF2] text-[#172033] p-6">
+          <div className="flex items-center justify-between mb-3">
+            <div className="flex items-center gap-2.5">
+              <div className="w-8 h-8 rounded-lg bg-[#2563EB] flex items-center justify-center text-white font-bold">
                 <Store className="w-4 h-4" />
               </div>
-              <span className="font-bold tracking-tight text-sm">
-                INGOBIA <span className="opacity-80 font-normal">| إنجوبيا</span>
+              <span className="font-bold tracking-tight text-sm text-[#172033]">
+                INGOBIA <span className="text-[#64748B] font-normal">| إنجوبيا</span>
               </span>
             </div>
 
-            <div className="flex items-center gap-2 bg-white/15 px-3 py-1 rounded-full text-[11px] backdrop-blur-xs border border-white/20">
-              <div className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-              <span className="font-mono text-white/90">a7med3bker@gmail.com</span>
-            </div>
+            <span className="text-[11px] font-semibold text-[#64748B] bg-white px-2.5 py-1 rounded-lg border border-[#E8ECF2]">
+              {isRtl ? 'إعداد المتجر الجديد' : 'Store Setup'}
+            </span>
           </div>
 
-          <h2 className="text-xl font-bold tracking-tight">
+          <h2 className="text-lg font-bold tracking-tight text-[#172033]">
             {isRtl ? 'مرحباً بك في إنجوبيا' : 'Welcome to Ingobia'}
           </h2>
-          <p className="text-xs text-blue-100 mt-1 max-w-md">
+          <p className="text-xs text-[#64748B] mt-1 max-w-md">
             {isRtl
-              ? 'دعنا نخصص بيئة العمل لمتجرك في خطوات بسيطة لبدء إدارة وتوحيد عمليات التجارة الإلكترونية.'
-              : 'Let us customize your workspace in a few simple steps to unify your e-commerce operations.'}
+              ? 'خصص قنوات البيع وهوية متجرك في خطوات سريعة للبدء بنظام مخزون موحد ودقيق.'
+              : 'Configure your sales channels and store identity to start with unified warehouse custody.'}
           </p>
 
           {/* Progress Indicator */}
-          <div className="flex items-center gap-2 mt-5">
+          <div className="flex items-center gap-2 mt-4">
             <div
               className={`h-1.5 flex-1 rounded-full transition-all ${
-                step >= 1 ? 'bg-white' : 'bg-white/30'
+                step >= 1 ? 'bg-[#2563EB]' : 'bg-[#E2E8F0]'
               }`}
             />
             <div
               className={`h-1.5 flex-1 rounded-full transition-all ${
-                step >= 2 ? 'bg-white' : 'bg-white/30'
+                step >= 2 ? 'bg-[#2563EB]' : 'bg-[#E2E8F0]'
               }`}
             />
             <div
               className={`h-1.5 flex-1 rounded-full transition-all ${
-                step >= 3 ? 'bg-white' : 'bg-white/30'
+                step >= 3 ? 'bg-[#2563EB]' : 'bg-[#E2E8F0]'
               }`}
             />
           </div>
@@ -483,15 +524,30 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                     type="text"
                     required
                     value={storeName}
-                    onChange={(e) => setStoreName(e.target.value)}
-                    placeholder={isRtl ? 'أدخل اسم متجرك' : 'Enter store name'}
+                    onChange={(e) => {
+                      setStoreName(e.target.value);
+                      setIdentityError('');
+                    }}
+                    placeholder={isRtl ? 'مثال: متجر النخبة للتجارة' : 'Enter store name'}
                     className="w-full px-3.5 py-2.5 text-xs bg-[#F7F8FA] border border-[#E8ECF2] rounded-xl text-[#172033] focus:outline-none focus:bg-white focus:ring-2 focus:ring-[#2563EB]/20 focus:border-[#2563EB]"
                   />
-                  <span className="text-[11px] text-[#64748B] block mt-1">
-                    {isRtl
-                      ? 'ملاحظة: يمكنك تعديل كلا الحقلين لاحقاً من إعدادات الحساب.'
-                      : 'Note: You can edit both fields later from account settings.'}
-                  </span>
+                </div>
+
+                <div>
+                  <label className="block text-xs font-bold text-[#172033] mb-1.5">
+                    {isRtl ? 'البريد الإلكتروني للتاجر (اختياري):' : 'Merchant Email (optional):'}
+                  </label>
+                  <input
+                    type="email"
+                    value={merchantEmail}
+                    onChange={(e) => setMerchantEmail(e.target.value)}
+                    placeholder="merchant@example.com"
+                    dir="ltr"
+                    className="w-full px-3.5 py-2.5 text-xs bg-[#F7F8FA] border border-[#E8ECF2] rounded-xl text-[#172033] focus:outline-none focus:bg-white focus:ring-2 focus:ring-[#2563EB]/20 focus:border-[#2563EB]"
+                  />
+                  {identityError && (
+                    <p className="text-xs text-rose-600 font-semibold mt-2">{identityError}</p>
+                  )}
                 </div>
               </div>
             </div>
@@ -509,7 +565,7 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                 </h3>
                 <p className="text-xs text-[#64748B] mt-1">
                   {isRtl
-                    ? 'تم تهيئة مساحة العمل الخاصة بك بنجاح وفقاً للمنصات المختارة.'
+                    ? 'تم تهيئة مساحة العمل الخاصة بك وفقاً للمنصات المختارة.'
                     : 'Your workspace has been customized according to your channels.'}
                 </p>
               </div>
@@ -524,10 +580,12 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
                   <span className="text-[#64748B]">{isRtl ? 'اسم المتجر:' : 'Store Name:'}</span>
                   <strong className="text-[#2563EB] font-bold">{storeName}</strong>
                 </div>
-                <div className="flex items-center justify-between text-xs">
-                  <span className="text-[#64748B]">{isRtl ? 'البريد الإلكتروني:' : 'Email:'}</span>
-                  <span className="font-mono text-[#172033]">a7med3bker@gmail.com</span>
-                </div>
+                {merchantEmail.trim() && (
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-[#64748B]">{isRtl ? 'البريد الإلكتروني:' : 'Email:'}</span>
+                    <span className="font-mono text-[#172033]">{merchantEmail.trim()}</span>
+                  </div>
+                )}
 
                 <div className="pt-2 border-t border-[#E8ECF2]">
                   <span className="text-[11px] text-[#64748B] block mb-1.5 font-semibold">
@@ -599,8 +657,8 @@ export const OnboardingModal: React.FC<OnboardingModalProps> = ({
           {step < 3 ? (
             <button
               type="button"
-              onClick={() => setStep((prev) => (prev + 1) as 2 | 3)}
-              className="flex items-center gap-1.5 px-5 py-2.5 text-xs font-semibold text-white bg-[#2563EB] hover:bg-blue-700 rounded-xl transition-colors shadow-xs cursor-pointer"
+              onClick={handleNextStep}
+              className="flex items-center gap-1.5 px-5 py-2.5 text-xs font-semibold text-white bg-[#2563EB] hover:bg-blue-700 rounded-xl transition-colors shadow-xs cursor-pointer whitespace-nowrap shrink-0"
             >
               <span>{isRtl ? 'متابعة' : 'Next'}</span>
               {isRtl ? <ArrowLeft className="w-4 h-4" /> : <ArrowRight className="w-4 h-4" />}

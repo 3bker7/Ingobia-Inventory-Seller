@@ -1,0 +1,732 @@
+Ingobia Seller Operations — Comprehensive Engineering, Reliability, Security & UX Completion
+
+Mission
+
+Perform a comprehensive engineering audit, correction, and improvement of the existing Ingobia Seller Operations application.
+
+This is a completion and stabilization task, NOT a rebuild.
+
+The current priority is to finish the existing operational system so it can reliably manage products, inventory, orders, returns, financial records, and platform-specific operations.
+
+The application must become accurate, stable, secure, intuitive, and comfortable to use before moving to Phase 2 of the roadmap.
+
+Do not focus on adding more features. Focus on correcting the existing system, eliminating technical and logical defects, improving the user experience, and ensuring that all operational workflows behave realistically.
+
+---
+
+1. Mandatory Development Rules
+
+1. Inspect the entire existing codebase before making changes.
+2. Understand the current architecture, data models, business rules, storage mechanisms, authentication, authorization, and component relationships.
+3. Identify existing defects before modifying code.
+4. Fix the underlying causes, not just the visible symptoms.
+5. Preserve existing working functionality, user data, accounts, and application identity.
+6. Do not rebuild the application from scratch.
+7. Do not replace existing business logic with simplified mock implementations.
+8. Do not introduce dummy transactions, fake products, sample orders, or fabricated analytics into real user accounts.
+9. Do not silently discard, reset, overwrite, or corrupt existing user data.
+10. Avoid unnecessary dependencies, duplicated code, excessive abstractions, and unnecessary complexity.
+11. Maintain backward compatibility with existing stored data wherever possible.
+12. If a data migration is necessary, implement a safe and reversible migration strategy.
+13. Do not claim that a feature, security mechanism, or test is complete unless it has actually been implemented and verified.
+
+Before implementation, prepare an internal dependency map of the important systems so that fixing one area does not unexpectedly break another.
+
+---
+
+2. Dynamic Platform Management — Critical Priority
+
+One of the most important existing problems is the appearance of platforms that do not belong to the merchant or are not enabled in their account.
+
+The platform system must be genuinely dynamic.
+
+Required behavior
+
+- Each merchant must have their own active platform configuration.
+- Platform names must not be hardcoded throughout unrelated components.
+- All platform-dependent interfaces must derive their data from one consistent source of truth.
+- Only the merchant's enabled platforms should appear in relevant interfaces.
+- Disabled or unconfigured platforms must not appear as active operational options.
+- Adding or removing a platform must update all dependent views consistently.
+
+This must apply to:
+
+- Products.
+- Inventory allocations.
+- Orders.
+- Returns.
+- Filters.
+- Reports.
+- Import and export operations.
+- Excel column headers.
+- Platform settings.
+- Dashboard summaries.
+- Platform-specific operational forms.
+
+For example:
+
+If a merchant enables Noon and Trendyol but does not enable Amazon, the application must not display Amazon as an active platform in their operational screens or Excel exports.
+
+Do not solve this by hiding a few labels in the UI. Correct the underlying data model, filtering logic, and platform configuration relationships.
+
+Data integrity requirements
+
+- Every platform-specific record must reference a valid merchant and platform.
+- Platform references must be validated before creating or updating records.
+- Removing a platform must not silently destroy historical orders or financial records.
+- Historical data must remain accessible and correctly associated with its original platform.
+- Disabled platforms must be distinguishable from deleted historical references.
+- Platform configuration must not leak between different merchants or accounts.
+
+---
+
+3. Centralized Inventory With Platform Allocations — Approved Architecture
+
+Implement and validate the following inventory model.
+
+The approved model is one physical central inventory with separate allocations for each active sales platform.
+
+The central inventory represents the merchant's actual physical stock. Platform allocations represent portions of that stock reserved for selling through specific platforms.
+
+They are NOT additional physical inventory.
+
+Inventory structure
+
+Each product should support:
+
+- Actual central physical stock.
+- Central reserved quantity.
+- Central available-for-allocation quantity.
+- Platform-specific allocated quantity.
+- Platform-specific reserved quantity.
+- Platform-specific available-for-sale quantity.
+- Damaged quantity.
+- Returned quantity awaiting inspection.
+- Returned quantity approved for restocking.
+- Returned quantity rejected from resale.
+
+Core inventory calculations
+
+Central available quantity:
+
+Central physical stock
+
+- Central reservations
+- Total platform allocations
+
+Platform available quantity:
+
+Platform allocation
+
+- Platform order reservations
+
+Total sellable available inventory:
+
+Central available quantity
+
++ Sum of platform available quantities
+
+Do not count central allocations twice.
+
+Operational rules
+
+1. Allocating stock to a platform must decrease central available-for-allocation quantity without creating new physical stock.
+2. Confirming an order must reserve the appropriate quantity exactly once.
+3. Order status changes must update reservations according to the actual business rules.
+4. Cancellation must release the corresponding reservation exactly once.
+5. A completed sale must reduce the physical stock correctly and reconcile the relevant allocation.
+6. Returns must not automatically become sellable inventory.
+7. Returned products must pass inspection before being restocked.
+8. Damaged and rejected items must not appear as available-for-sale inventory.
+9. Transfers between central stock and platform allocations must be recorded as traceable movements.
+10. Prevent negative inventory and invalid allocations unless a clearly defined, explicitly authorized business rule allows them.
+
+Inventory movement ledger
+
+Every inventory movement must have:
+
+- Unique movement ID.
+- Merchant ID.
+- Product ID.
+- Source and destination.
+- Platform reference when applicable.
+- Movement type.
+- Quantity.
+- Timestamp.
+- Related order or return ID when applicable.
+- Reason.
+- User or system actor.
+- Relevant before-and-after quantities.
+
+Prevent duplicate movement recording and ensure that retries do not apply the same stock change twice.
+
+All inventory summaries must be derived from consistent, traceable data rather than independent, conflicting calculations.
+
+---
+
+4. Orders, Returns, and Inventory Consistency
+
+Audit the entire operational lifecycle.
+
+Orders
+
+Verify:
+
+- Order creation.
+- Order validation.
+- Platform association.
+- Product association.
+- Quantity validation.
+- Stock reservation.
+- Status transitions.
+- Cancellation.
+- Completion.
+- Financial consequences.
+- Duplicate order prevention.
+- Repeated status update protection.
+
+Invalid status transitions must be rejected.
+
+Do not allow the same order event to reserve or deduct inventory more than once.
+
+Returns
+
+Verify the complete return lifecycle:
+
+- Return registration.
+- Association with the original order.
+- Product and quantity validation.
+- Return inspection.
+- Inspection result.
+- Restocking eligibility.
+- Damaged or rejected classification.
+- Inventory adjustment.
+- Financial adjustment.
+- Return status history.
+
+A returned quantity must never exceed the eligible quantity from the original order unless a valid partial-return history supports it.
+
+Cross-system consistency
+
+Orders, returns, inventory, and financial records must remain consistent.
+
+For example:
+
+A canceled order must not remain deducted from available inventory.
+
+A returned product awaiting inspection must not appear as sellable stock.
+
+A failed database or storage operation must not be reported as successful.
+
+An operation that affects multiple data records must use a reliable transaction mechanism where supported, or a carefully implemented recoverable strategy with explicit failure handling.
+
+Do not claim that a sequence of local storage writes is an atomic database transaction.
+
+---
+
+5. Financial Logic and Data Accuracy
+
+Audit all financial calculations and transaction recording.
+
+Verify:
+
+- Revenue.
+- Product cost.
+- Platform commissions.
+- Shipping costs.
+- Operational expenses.
+- Refunds.
+- Pending transactions.
+- Confirmed transactions.
+- Estimated values.
+- Net profit.
+- Per-order profitability.
+- Financial summaries.
+
+Important requirements
+
+- Clearly distinguish recorded values from estimated values.
+- Never present an estimated commission as a confirmed expense.
+- Do not silently substitute a locally generated transaction object when persistent recording fails.
+- A failed transaction write must return an explicit failure result.
+- Callers must handle that failure instead of assuming the transaction was recorded.
+- Avoid overly broad deduplication rules that may incorrectly discard legitimate financial transactions.
+- Use unique event or transaction references wherever possible.
+- Prevent duplicate financial entries caused by retries or repeated status changes.
+- Ensure refunds and canceled orders are reflected exactly once.
+- Keep financial history traceable to its original order, return, or expense.
+
+All financial formulas must have explicit definitions and consistent meanings throughout the application.
+
+---
+
+6. Technical Logic and Code Quality Audit — Highest Priority
+
+Perform a deep review of the application for technical, textual, structural, and logical defects.
+
+Look for:
+
+- Incorrect business rules.
+- Invalid state transitions.
+- Incorrect calculations.
+- Race conditions.
+- Duplicate operations.
+- Stale state.
+- Asynchronous operation failures.
+- Incorrect error handling.
+- Missing validation.
+- Incorrect data types.
+- Null and undefined handling problems.
+- Incorrect date and time calculations.
+- Time-zone inconsistencies.
+- Currency and decimal precision errors.
+- Broken relationships between records.
+- Incorrect React state synchronization.
+- Unnecessary component re-rendering.
+- Memory leaks.
+- Inconsistent API contracts.
+- Unhandled promise rejections.
+- Incorrect fallback behavior.
+- Dangerous destructive operations.
+- Inconsistent storage keys.
+- Data migration problems.
+- Inaccurate empty states.
+- Incorrect notifications and success messages.
+- Misleading labels and calculations.
+- Unused code and duplicated business logic.
+
+Business logic must be realistic
+
+The application must behave like a real merchant operations system, not a collection of screens that appear to work independently.
+
+Every operation must have:
+
+- Clear input validation.
+- A defined business rule.
+- A predictable state transition.
+- Correct data persistence.
+- Correct downstream effects.
+- Appropriate failure handling.
+- A clear user-facing result.
+
+Do not create unrealistic behavior simply to make an interaction appear successful.
+
+If a business rule is ambiguous, inspect the existing implementation and preserve established behavior where appropriate. Do not invent a new rule that could damage historical data or operational accuracy.
+
+---
+
+7. Security, Authentication, Authorization, and Account Isolation
+
+Security must be audited as an engineering requirement, not treated as a visual feature.
+
+Review the security of both ordinary users and developer/admin functionality.
+
+Authentication
+
+- Verify the actual authentication mechanism.
+- Ensure that login state is validated correctly.
+- Prevent unauthorized access to protected screens and operations.
+- Handle expired sessions correctly.
+- Avoid trusting client-side state as proof of authentication.
+- Prevent account data from being exposed through incorrect user switching or stale sessions.
+
+Authorization and merchant isolation
+
+- Every merchant must only access their own operational data.
+- Verify ownership on every sensitive read and write operation.
+- Do not rely exclusively on client-side filtering.
+- Validate merchant ownership on the backend or trusted data-access layer wherever available.
+- Prevent cross-account access through manipulated IDs or requests.
+- Ensure that platform configurations, products, orders, returns, inventory, and financial records are isolated by merchant.
+
+If the current application uses local browser storage rather than a trusted backend, explicitly document the security limitations. Do not describe client-side storage as secure multi-user authorization.
+
+Developer and administrative access
+
+Audit the Developer Center and every privileged operation.
+
+- Separate ordinary user permissions from developer/admin permissions.
+- Do not use a hardcoded email address or a hidden UI element as the sole security mechanism.
+- Never expose privileged operations to ordinary users.
+- Verify authorization at the trusted backend or server-side boundary.
+- Protect data export, clearing, recovery, account management, and administrative operations.
+- Add explicit confirmation for destructive actions.
+- Provide a safe backup or recovery path before destructive data operations.
+- Do not allow corrupted data to be silently overwritten during recovery.
+- Log sensitive administrative actions with actor, timestamp, and action details.
+- Avoid exposing secrets, credentials, tokens, or private account information in client code or logs.
+
+If secure server-side developer authorization cannot currently be implemented because the architecture lacks a trusted backend, do not fake it. Clearly identify the limitation and implement the strongest safe behavior supported by the existing architecture.
+
+Data protection
+
+- Validate and sanitize user input.
+- Protect against unauthorized record modification.
+- Avoid exposing sensitive data in error messages.
+- Use secure session handling appropriate to the existing architecture.
+- Review dependency vulnerabilities where tooling permits.
+- Avoid introducing unnecessary permissions or external data exposure.
+
+---
+
+8. Performance and Application Stability
+
+The application currently needs better responsiveness and operational reliability.
+
+Investigate the causes of slow performance rather than merely reducing visible content.
+
+Review:
+
+- Large component rendering.
+- Repeated data calculations.
+- Unnecessary full-page re-renders.
+- Excessive local storage reads and writes.
+- Inefficient filtering and sorting.
+- Large tables and lists.
+- Expensive dashboard calculations.
+- Repeated data transformations.
+- Unnecessary network requests.
+- Memory usage.
+- Slow application initialization.
+- Large dependency bundles.
+
+Required improvements
+
+- Load and process only the data needed for the current view when possible.
+- Avoid repeatedly recalculating unchanged values.
+- Use pagination or virtualization for genuinely large datasets where appropriate.
+- Keep common operations responsive.
+- Avoid unnecessary loading screens.
+- Provide clear loading, empty, success, and error states.
+- Prevent double submissions.
+- Prevent accidental repeated actions.
+- Ensure that errors do not leave the application in a misleading or inconsistent state.
+
+Do not sacrifice correctness for speed.
+
+---
+
+9. User Experience and Interface Redesign
+
+The existing application suffers from excessive and sometimes uncomfortable interface designs.
+
+Improve usability without introducing unnecessary complexity.
+
+Design direction
+
+- Clean, professional Light Theme.
+- Consistent Arabic RTL layout.
+- Responsive desktop and mobile layouts.
+- Clear visual hierarchy.
+- Comfortable spacing.
+- Readable typography.
+- Consistent component styling.
+- Calm and restrained use of colors.
+- Meaningful icons.
+- Clear buttons and action hierarchy.
+- Avoid excessive cards, borders, decorative elements, and nested containers.
+- Avoid making every section look like a separate dashboard.
+- Avoid unnecessary tables when a simpler presentation is more useful.
+- Avoid horizontal overflow on mobile.
+- Avoid excessive scrolling and deeply nested navigation.
+
+The result should feel like a practical merchant operations application, not an overloaded administrative dashboard or a complicated spreadsheet.
+
+Navigation and accessibility
+
+- Reduce the number of steps required to reach common operations.
+- Make the most frequently used actions easy to find.
+- Group related operations logically.
+- Use consistent navigation patterns.
+- Keep page titles and action names understandable.
+- Make important status information visible without excessive interaction.
+- Ensure sufficient text contrast and appropriate touch-target sizes.
+- Use clear focus and disabled states.
+- Avoid confusing icon-only actions without accessible labels.
+
+Do not remove important functionality just to make screens look simpler.
+
+---
+
+10. Natural Arabic Text and Content Quality
+
+Review all Arabic interface text.
+
+The current application needs more natural, clear, and consistent wording.
+
+Improve:
+
+- Page titles.
+- Navigation labels.
+- Field names.
+- Buttons.
+- Status labels.
+- Validation messages.
+- Error messages.
+- Success notifications.
+- Empty states.
+- Confirmation dialogs.
+- Tooltips.
+- Learning instructions.
+- Help content.
+
+Arabic writing requirements
+
+- Use natural, professional Arabic.
+- Avoid robotic translations.
+- Avoid unnecessarily formal or complicated wording.
+- Avoid ambiguous labels.
+- Keep terminology consistent across all screens.
+- Use the same term for the same business concept everywhere.
+- Make instructions short and actionable.
+- Do not display technical error codes as the only explanation to the user.
+- Do not show misleading success messages when an operation fails.
+
+The interface should communicate what happened, why it happened, and what the user can do next.
+
+---
+
+11. Learning Experience and Ease of Use
+
+Improve the application's onboarding and learning experience.
+
+The user should understand how to use the system without needing to study every screen.
+
+Implement or improve contextual guidance where genuinely useful:
+
+- Explain central stock versus platform allocations.
+- Explain available versus reserved quantities.
+- Explain order status transitions.
+- Explain return inspection and restocking.
+- Explain inventory movement history.
+- Explain financial estimates versus confirmed transactions.
+- Explain important platform settings.
+
+Use concise contextual explanations, helpful empty states, tooltips, and guided steps where appropriate.
+
+Do not overwhelm users with long tutorials, repetitive popups, or instructions that appear every time a page is opened.
+
+Guidance should be dismissible and should not interrupt normal operations.
+
+---
+
+12. Import, Export, and Data Integrity
+
+Review all import and export workflows.
+
+- Validate imported data before modifying existing records.
+- Detect duplicate records.
+- Provide understandable validation errors.
+- Prevent partial imports from leaving inconsistent data.
+- Support the currently enabled platforms dynamically.
+- Generate Excel headers based on the actual platform configuration.
+- Do not display columns for unrelated or disabled platforms.
+- Preserve product identifiers and quantities correctly.
+- Handle missing, invalid, and unexpected values safely.
+- Provide a clear summary of successful and failed rows.
+- Never silently discard invalid rows.
+
+Exported reports must reflect actual stored data and clearly identify estimated or incomplete values.
+
+---
+
+13. Testing and Verification
+
+Do not finish this task based on visual inspection alone.
+
+Review and improve the existing test suite.
+
+Create or update tests for critical business scenarios, including:
+
+Inventory
+
+- Central stock creation.
+- Platform allocation.
+- Allocation reduction.
+- Platform reservation.
+- Order cancellation and reservation release.
+- Sale completion.
+- Return awaiting inspection.
+- Approved return restocking.
+- Rejected and damaged returns.
+- Duplicate movement prevention.
+- Negative stock prevention.
+- Multiple platforms sharing one physical stock.
+
+Orders and returns
+
+- Valid and invalid status transitions.
+- Partial orders and partial returns.
+- Duplicate events.
+- Failed persistence.
+- Repeated cancellation.
+- Return quantity validation.
+
+Financial records
+
+- Confirmed and pending transactions.
+- Failed financial writes.
+- Duplicate transaction prevention.
+- Refunds.
+- Commission estimates.
+- Order profitability.
+- Summary calculations.
+
+Platform isolation
+
+- Merchant with Noon only.
+- Merchant with Noon and Trendyol.
+- Merchant with different platform configurations.
+- Disabled platform.
+- Historical records from a disabled platform.
+- Prevention of cross-merchant data access.
+
+Security and recovery
+
+- Unauthorized access.
+- Ordinary user attempting privileged actions.
+- Invalid ownership references.
+- Corrupted stored data.
+- Failed writes.
+- Recovery and backup behavior.
+
+UI and performance
+
+- Empty states.
+- Loading states.
+- Error states.
+- Mobile responsiveness.
+- Large datasets.
+- Dynamic platform columns and filters.
+
+Run the available project checks where the environment permits:
+
+- Tests.
+- TypeScript validation.
+- Linting, if configured.
+- Production build.
+
+Fix the failures introduced or exposed by the changes.
+
+Never report a test as passed unless it was actually executed successfully.
+
+---
+
+14. Architecture and Future Compatibility
+
+The future roadmap must be considered when making architectural decisions, but future features must NOT be implemented now.
+
+Future roadmap — reference only
+
+Phase 2:
+
+- Public product landing pages.
+- Direct customer order submissions.
+- Automatic integration of incoming orders with inventory.
+- Order status tracking and notifications.
+
+Phase 3:
+
+- Merchant competition and performance comparisons.
+- Reliable performance metrics and merchant rankings.
+
+Phase 4:
+
+- Dropshipping support.
+
+For the current task:
+
+- Keep the architecture reasonably extensible.
+- Avoid decisions that unnecessarily block these future phases.
+- Do not build any of these features now.
+- Do not add unused modules, screens, or placeholder workflows for future phases.
+
+The current phase must be completed before Phase 2 begins.
+
+---
+
+15. Definition of Done — Current Phase Completion Criteria
+
+The current phase should not be considered complete until the following conditions are met:
+
+1. Only the merchant's configured platforms appear in operational interfaces.
+2. Platform-dependent tables, filters, reports, and Excel exports are genuinely dynamic.
+3. Central physical stock and platform allocations are correctly separated.
+4. Inventory totals cannot be inflated through double counting.
+5. Order reservations and cancellations work consistently.
+6. Returns cannot become available stock before inspection.
+7. Inventory movement history is traceable and reliable.
+8. Financial transactions cannot be falsely reported as saved.
+9. Financial calculations are consistent and distinguish confirmed from estimated values.
+10. Merchant data is properly isolated.
+11. Developer and ordinary-user permissions are correctly separated to the extent supported by the architecture.
+12. Destructive operations have appropriate safeguards.
+13. Common operations are responsive and stable.
+14. Arabic UI text is natural, consistent, and understandable.
+15. Navigation and daily workflows are easier to use.
+16. Mobile and desktop layouts are usable.
+17. Critical business logic is covered by meaningful tests.
+18. Available type checks, tests, and production builds are verified.
+19. Existing user data and functionality remain intact.
+20. No Phase 2, Phase 3, or Phase 4 features have been implemented.
+
+---
+
+16. Required Final Engineering Report
+
+After implementation, provide a concise but detailed report containing:
+
+A. Defects discovered
+
+List the significant technical, logical, financial, security, performance, and UX problems discovered.
+
+B. Corrections implemented
+
+For each important problem, explain:
+
+- What was wrong.
+- What caused it.
+- What was changed.
+- Which files or modules were affected.
+
+C. Data integrity
+
+Explain how inventory, orders, returns, and financial records remain consistent.
+
+D. Platform management
+
+Explain how platform configuration is now centralized and how disabled or unrelated platforms are prevented from appearing.
+
+E. Security
+
+Explain the actual authentication and authorization protections implemented, their enforcement location, and any remaining limitations.
+
+F. Testing
+
+List the tests and commands actually executed, their results, and any failures that remain.
+
+G. Remaining issues
+
+Clearly separate:
+
+- Critical unresolved defects.
+- Important improvements still needed.
+- Minor non-blocking issues.
+
+H. Completion assessment
+
+Give an honest assessment of whether the current phase is ready for production use, still requires testing, or is not yet complete.
+
+Do not label the project production-ready merely because the interface looks polished or the build succeeds.
+
+---
+
+Final Instruction
+
+Work carefully through the existing application.
+
+Correctness first. Data integrity second. Security and stability third. Usability and visual quality fourth.
+
+All of these matter, but a beautiful interface cannot compensate for incorrect business logic or unreliable data.
+
+The goal is to finish a dependable merchant operations system that can be confidently extended into Phase 2 without carrying fundamental technical and logical defects into the next stage.

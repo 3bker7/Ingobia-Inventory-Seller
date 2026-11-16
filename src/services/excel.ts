@@ -11,9 +11,10 @@
  */
 
 import * as XLSX from 'xlsx';
-import { ExcelValidationResult, ExcelImportRow, Product, StockMovement } from '../types';
+import { ExcelValidationResult, ExcelImportRow, PlatformInventoryAllocation, Product, StockMovement } from '../types';
 import { storageService } from './storage';
-import { computeEditedAvailableStock } from '../domain/inventoryCustody';
+import { computeEditedAvailableStock, normalizeProductCustody } from '../domain/inventoryCustody';
+import { resolveSafeProductImage } from '../utils/productVisual';
 
 export const CORE_COLUMNS = [
   'Product Name',
@@ -37,7 +38,7 @@ export const OFFICIAL_TEMPLATE_COLUMNS = [
  * Dynamically computes official template columns based on the merchant's active marketplaces.
  */
 export function getDynamicTemplateColumns(): string[] {
-  const marketplaces = storageService.getMarketplaces();
+  const marketplaces = storageService.getActiveMarketplaces();
   const cols = [...CORE_COLUMNS];
 
   for (const mkt of marketplaces) {
@@ -153,8 +154,8 @@ export async function parseAndValidateExcel(file: File): Promise<ExcelValidation
     };
   }
 
-  // Map dynamic marketplaces
-  const marketplaces = storageService.getMarketplaces();
+  // Map active dynamic marketplaces only
+  const marketplaces = storageService.getActiveMarketplaces();
   const mktColumnMap: Record<string, { priceIdx: number; qtyIdx: number }> = {};
 
   for (const mkt of marketplaces) {
@@ -224,10 +225,8 @@ export async function parseAndValidateExcel(file: File): Promise<ExcelValidation
 
     const name = String(row[nameIdx] || '').trim();
     const sku = skuIdx !== -1 ? String(row[skuIdx] || '').trim() : '';
-    const imageUrl =
-      imgIdx !== -1 && row[imgIdx]
-        ? String(row[imgIdx]).trim()
-        : 'https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=160&auto=format&fit=crop&q=80';
+    const rawImg = imgIdx !== -1 && row[imgIdx] ? String(row[imgIdx]).trim() : '';
+    const imageUrl = resolveSafeProductImage(rawImg, name || sku || 'Product');
 
     const rawStock = stockIdx !== -1 ? row[stockIdx] : 0;
     const numericStock = parseNum(rawStock, NaN);
@@ -236,6 +235,23 @@ export async function parseAndValidateExcel(file: File): Promise<ExcelValidation
     if (!name) errors.push('اسم المنتج مطلوب.');
     if (!Number.isFinite(numericStock) || numericStock < 0) {
       errors.push('المخزون الفعلي يجب أن يكون رقماً صحيحاً أكبر من أو يساوي 0.');
+    }
+
+    // Dynamic marketplace values extraction
+    const dynamicMktData: Record<string, { price: number; quantity: number }> = {};
+    let totalPlatformAllocatedQty = 0;
+    for (const mkt of marketplaces) {
+      const { priceIdx, qtyIdx } = mktColumnMap[mkt.id] || { priceIdx: -1, qtyIdx: -1 };
+      const mPrice = priceIdx !== -1 ? Math.max(0, parseNum(row[priceIdx], 0)) : 0;
+      const mQty = qtyIdx !== -1 ? Math.max(0, Math.floor(parseNum(row[qtyIdx], 0))) : 0;
+      dynamicMktData[mkt.id] = { price: mPrice, quantity: mQty };
+      totalPlatformAllocatedQty += mQty;
+    }
+
+    if (totalPlatformAllocatedQty > physicalStock) {
+      errors.push(
+        `مجموع الكميات المخصصة للمنصات (${totalPlatformAllocatedQty}) يتجاوز المخزون الفعلي (${physicalStock}).`
+      );
     }
 
     const key = (sku || name).toLowerCase();
@@ -261,15 +277,6 @@ export async function parseAndValidateExcel(file: File): Promise<ExcelValidation
       status = 'new';
       newProductsCount++;
       validCount++;
-    }
-
-    // Dynamic marketplace values extraction
-    const dynamicMktData: Record<string, { price: number; quantity: number }> = {};
-    for (const mkt of marketplaces) {
-      const { priceIdx, qtyIdx } = mktColumnMap[mkt.id] || { priceIdx: -1, qtyIdx: -1 };
-      const mPrice = priceIdx !== -1 ? Math.max(0, parseNum(row[priceIdx], 0)) : 0;
-      const mQty = qtyIdx !== -1 ? Math.max(0, Math.floor(parseNum(row[qtyIdx], 0))) : 0;
-      dynamicMktData[mkt.id] = { price: mPrice, quantity: mQty };
     }
 
     const rowData: ExcelImportRow = {
@@ -328,25 +335,31 @@ export function executeExcelImport(
   let importedNew = 0;
   let updatedExisting = 0;
   let skippedInvalid = 0;
-  const marketplaces = storageService.getMarketplaces();
-  const workingProducts = storageService.getProducts().map((p) => ({
+  const activeMerchantId = storageService.getActiveMerchantId();
+  const marketplaces = storageService.getActiveMarketplaces();
+  const workingProducts: Product[] = storageService.getProducts().map((p) => ({
     ...p,
     marketplaceListings: { ...p.marketplaceListings },
+    platformAllocations: { ...(p.platformAllocations || {}) },
   }));
   const movementsToRecord: StockMovement[] = [];
+  const nowIso = new Date().toISOString();
 
   for (let rowIdx = 0; rowIdx < validRows.length; rowIdx++) {
     const row = validRows[rowIdx];
     const trimmedSku = row.sku ? row.sku.trim().toLowerCase() : '';
     const trimmedName = row.productName.trim().toLowerCase();
-    const existing = workingProducts.find(
+    const existingIdx = workingProducts.findIndex(
       (p) =>
         (trimmedSku && p.sku && p.sku.toLowerCase() === trimmedSku) ||
         p.name.toLowerCase() === trimmedName ||
         (p.nameAr && p.nameAr.toLowerCase() === trimmedName)
     );
 
-    if (existing) {
+    const safeImage = resolveSafeProductImage(row.imageUrl, row.productName);
+
+    if (existingIdx >= 0) {
+      const existing = workingProducts[existingIdx];
       const prevPhysical = existing.physicalStock;
       const prevAvailable = existing.availableStock;
       const stockCheck = computeEditedAvailableStock(existing, row.physicalStock);
@@ -355,54 +368,140 @@ export function executeExcelImport(
         continue;
       }
 
-      const stockDiff = row.physicalStock - prevPhysical;
-      existing.physicalStock = row.physicalStock;
-      existing.availableStock = stockCheck.newAvailable;
-
-      // Update dynamic marketplace listings
+      const nextAllocations: Record<string, PlatformInventoryAllocation> = {
+        ...(existing.platformAllocations || {}),
+      };
       if (row.marketplaceData) {
+        const sumRequested = Object.values(row.marketplaceData).reduce(
+          (s, d) => s + Math.max(0, Math.floor(d.quantity || 0)),
+          0
+        );
+        if (sumRequested > stockCheck.newAvailable) {
+          skippedInvalid++;
+          continue;
+        }
         for (const [mktId, data] of Object.entries(row.marketplaceData)) {
           if (data.price > 0 || data.quantity > 0) {
+            const existingPrice = existing.marketplaceListings[mktId]?.price ?? existing.currentPrice ?? 0;
+            const prevRes = nextAllocations[mktId]?.reservedQty || 0;
             existing.marketplaceListings[mktId] = {
               marketplaceId: mktId,
-              price: data.price > 0 ? data.price : (existing.marketplaceListings[mktId]?.price || 100),
+              price: data.price > 0 ? data.price : existingPrice,
               quantity: data.quantity,
               listingStatus: data.quantity > 0 ? 'active' : 'out_of_stock',
-              lastUpdated: new Date().toISOString(),
+              lastUpdated: nowIso,
             };
+            if (data.quantity > 0 || prevRes > 0) {
+              nextAllocations[mktId] = {
+                marketplaceId: mktId,
+                allocatedQty: data.quantity + prevRes,
+                reservedQty: prevRes,
+                availableQty: data.quantity,
+                lastUpdated: nowIso,
+              };
+            }
           }
         }
       }
 
-      if (row.imageUrl) existing.imageUrl = row.imageUrl;
-      existing.updatedAt = new Date().toISOString();
+      const stockDiff = row.physicalStock - prevPhysical;
+      const updated = normalizeProductCustody({
+        ...existing,
+        merchantId: existing.merchantId || activeMerchantId,
+        physicalStock: row.physicalStock,
+        availableStock: stockCheck.newAvailable,
+        platformAllocations: nextAllocations,
+        imageUrl: safeImage,
+        updatedAt: nowIso,
+      });
+      workingProducts[existingIdx] = updated;
 
       if (stockDiff !== 0) {
         movementsToRecord.push({
           id: `mov-${Date.now()}-${rowIdx}-${Math.random().toString(36).substring(2, 6)}`,
-          productId: existing.id,
-          productSku: existing.sku || existing.name,
-          productName: existing.name,
+          merchantId: activeMerchantId,
+          productId: updated.id,
+          productSku: updated.sku || updated.name,
+          productName: updated.name,
           type: 'excel_import',
           quantityChange: stockDiff,
           previousPhysical: prevPhysical,
-          newPhysical: existing.physicalStock,
+          newPhysical: updated.physicalStock,
           previousAvailable: prevAvailable,
-          newAvailable: existing.availableStock,
+          newAvailable: updated.availableStock,
           reason: 'تحديث عبر استيراد إكسيل المجمع الموحد',
           operator,
-          timestamp: new Date().toISOString(),
+          timestamp: nowIso,
         });
       }
 
       updatedExisting++;
     } else {
-      const newProduct: Product = {
+      const mktValues = row.marketplaceData ? Object.values(row.marketplaceData) : [];
+      const firstPositivePrice =
+        mktValues.find((d) => d.price > 0)?.price ??
+        (row.noonPrice > 0 ? row.noonPrice : row.amazonPrice > 0 ? row.amazonPrice : 0);
+
+      const newAllocations: Record<string, PlatformInventoryAllocation> = {};
+      const listings: Product['marketplaceListings'] = {};
+
+      if (row.marketplaceData) {
+        const sumRequested = Object.values(row.marketplaceData).reduce(
+          (s, d) => s + Math.max(0, Math.floor(d.quantity || 0)),
+          0
+        );
+        if (sumRequested > row.physicalStock) {
+          skippedInvalid++;
+          continue;
+        }
+        for (const [mktId, data] of Object.entries(row.marketplaceData)) {
+          listings[mktId] = {
+            marketplaceId: mktId,
+            price: data.price > 0 ? data.price : 0,
+            quantity: data.quantity,
+            listingStatus: data.quantity > 0 ? 'active' : 'out_of_stock',
+            lastUpdated: nowIso,
+          };
+          if (data.quantity > 0) {
+            newAllocations[mktId] = {
+              marketplaceId: mktId,
+              allocatedQty: data.quantity,
+              reservedQty: 0,
+              availableQty: data.quantity,
+              lastUpdated: nowIso,
+            };
+          }
+        }
+      } else {
+        for (const mkt of marketplaces) {
+          const p = mkt.id === 'noon' ? row.noonPrice : mkt.id === 'amazon' ? row.amazonPrice : 0;
+          const q = mkt.id === 'noon' ? row.noonQuantity : mkt.id === 'amazon' ? row.amazonQuantity : 0;
+          listings[mkt.id] = {
+            marketplaceId: mkt.id,
+            price: p > 0 ? p : 0,
+            quantity: q,
+            listingStatus: q > 0 ? 'active' : 'out_of_stock',
+            lastUpdated: nowIso,
+          };
+          if (q > 0) {
+            newAllocations[mkt.id] = {
+              marketplaceId: mkt.id,
+              allocatedQty: q,
+              reservedQty: 0,
+              availableQty: q,
+              lastUpdated: nowIso,
+            };
+          }
+        }
+      }
+
+      const newProduct = normalizeProductCustody({
         id: `prod-${Date.now()}-${rowIdx}-${Math.random().toString(36).substring(2, 6)}`,
+        merchantId: activeMerchantId,
         sku: row.sku || `SKU-${Date.now().toString().slice(-4)}-${rowIdx}`,
         name: row.productName,
-        imageUrl: row.imageUrl,
-        currentPrice: row.noonPrice || row.amazonPrice || 100,
+        imageUrl: safeImage,
+        currentPrice: firstPositivePrice,
         physicalStock: row.physicalStock,
         availableStock: row.physicalStock,
         reservedStock: 0,
@@ -410,39 +509,17 @@ export function executeExcelImport(
         damagedStock: 0,
         outboundInTransitStock: 0,
         returnInTransitStock: 0,
-        marketplaceListings: {},
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      };
-
-      if (row.marketplaceData) {
-        for (const [mktId, data] of Object.entries(row.marketplaceData)) {
-          newProduct.marketplaceListings[mktId] = {
-            marketplaceId: mktId,
-            price: data.price > 0 ? data.price : 100,
-            quantity: data.quantity,
-            listingStatus: data.quantity > 0 ? 'active' : 'out_of_stock',
-            lastUpdated: new Date().toISOString(),
-          };
-        }
-      } else {
-        for (const mkt of marketplaces) {
-          const p = mkt.id === 'noon' ? row.noonPrice : mkt.id === 'amazon' ? row.amazonPrice : 100;
-          const q = mkt.id === 'noon' ? row.noonQuantity : mkt.id === 'amazon' ? row.amazonQuantity : 0;
-          newProduct.marketplaceListings[mkt.id] = {
-            marketplaceId: mkt.id,
-            price: p > 0 ? p : 100,
-            quantity: q,
-            listingStatus: q > 0 ? 'active' : 'out_of_stock',
-            lastUpdated: new Date().toISOString(),
-          };
-        }
-      }
+        platformAllocations: newAllocations,
+        marketplaceListings: listings,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      });
 
       workingProducts.unshift(newProduct);
 
       movementsToRecord.push({
         id: `mov-${Date.now()}-${rowIdx}-${Math.random().toString(36).substring(2, 6)}`,
+        merchantId: activeMerchantId,
         productId: newProduct.id,
         productSku: newProduct.sku || newProduct.name,
         productName: newProduct.name,
@@ -454,7 +531,7 @@ export function executeExcelImport(
         newAvailable: newProduct.availableStock,
         reason: 'إنشاء منتج جديد عبر استيراد إكسيل المجمع',
         operator,
-        timestamp: new Date().toISOString(),
+        timestamp: nowIso,
       });
 
       importedNew++;

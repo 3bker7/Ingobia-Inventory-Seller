@@ -2,10 +2,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Product, Order, FinancialTransaction, StockMovement } from '../types';
 import {
+  allocateStockToPlatformPure,
   applyManualStockAdjustmentPure,
   computeEditedAvailableStock,
   computePriceChangeMetrics,
   getLockedCustodyFloor,
+  getSellableCapacityForMarketplace,
+  getTotalPlatformAllocatedStock,
+  releasePlatformAllocationPure,
 } from '../domain/inventoryCustody';
 import {
   computeOrderFinancialBreakdown,
@@ -21,12 +25,14 @@ import {
   ALLOWED_RETURN_TRANSITIONS,
   addReturnNotePure,
   advanceReturnStatusPure,
+  getOrderReturnableItems,
   processReturnInspectionPure,
   registerPostDeliveryReturnPure,
 } from '../domain/returnLifecycle';
 import { saveSmartImportOrdersPure } from '../domain/smartImportCustody';
 import { DEFAULT_PRODUCTS, DEFAULT_ORDERS, DEFAULT_RETURNS, STORAGE_KEYS } from '../services/seedData';
 import { storageService } from '../services/storage';
+import { getDynamicTemplateColumns } from '../services/excel';
 
 const makeProduct = (overrides: Partial<Product> = {}): Product => ({
   id: 'prod-test-1',
@@ -1222,3 +1228,434 @@ test('computeFinancialSummary handles all 8 confirmed/pending/cancelled, refund,
   assert.equal(amzNov.pendingTransactionsTotal, 0);
   assert.equal(amzNov.confirmedSettlement, 450);
 });
+
+// ---------------------------------------------------------------------------
+// 12. Central Pool vs Platform Allocation Custody & Restock Routing
+// ---------------------------------------------------------------------------
+test('central pool and platform allocations reconcile without double-counting across orders and returns', () => {
+  const baseProd = makeProduct({
+    id: 'p-alloc-1',
+    sku: 'ALLOC-SKU-1',
+    physicalStock: 10,
+    availableStock: 10,
+  });
+
+  // Allocate 4 to Noon (should leave 6 central, 4 platform, total available still 10)
+  const alloc1 = allocateStockToPlatformPure({
+    products: [baseProd],
+    productId: baseProd.id,
+    marketplaceId: 'noon',
+    quantity: 4,
+    isMarketplaceActive: true,
+  });
+  assert.equal(alloc1.success, true);
+  assert.equal(alloc1.products[0].centralAvailableStock, 6);
+  assert.equal(alloc1.products[0].availableStock, 10);
+  assert.equal(alloc1.products[0].physicalStock, 10);
+  assert.equal(getTotalPlatformAllocatedStock(alloc1.products[0]), 4);
+  assert.deepEqual(getSellableCapacityForMarketplace(alloc1.products[0], 'noon'), {
+    sellable: 4,
+    source: 'platform',
+  });
+  assert.deepEqual(getSellableCapacityForMarketplace(alloc1.products[0], 'amazon'), {
+    sellable: 6,
+    source: 'central',
+  });
+
+  // Block over-allocation above centralAvailableStock (7 > 6)
+  const overAlloc = allocateStockToPlatformPure({
+    products: alloc1.products,
+    productId: baseProd.id,
+    marketplaceId: 'amazon',
+    quantity: 7,
+    isMarketplaceActive: true,
+  });
+  assert.equal(overAlloc.success, false);
+
+  // Order 3 units on Noon -> consumes Noon platform allocation (4 -> 1 available, 3 reserved)
+  const ordRes = createOrderPure({
+    orderData: {
+      marketplaceId: 'noon',
+      customerName: 'عميل منصة نون',
+      shippingAddress: 'الرياض',
+      items: [
+        {
+          productId: baseProd.id,
+          productSku: baseProd.sku,
+          productName: baseProd.name,
+          imageUrl: baseProd.imageUrl,
+          quantity: 3,
+          unitPrice: 200,
+        },
+      ],
+      totalAmount: 600,
+      shippingCost: 20,
+      status: 'preparing',
+      orderDate: '2026-11-12T10:00:00Z',
+    },
+    products: alloc1.products,
+    existingOrders: [],
+    customId: 'ORD-ALLOC-1',
+  });
+  assert.equal(ordRes.success, true);
+  const pAfterOrder = ordRes.products[0];
+  assert.equal(pAfterOrder.centralAvailableStock, 6);
+  assert.equal(pAfterOrder.platformAllocations?.noon?.availableQty, 1);
+  assert.equal(pAfterOrder.platformAllocations?.noon?.reservedQty, 3);
+  assert.equal(pAfterOrder.availableStock, 7);
+
+  // Attempting to release 2 unreserved units from Noon (only 1 unreserved) fails
+  const badRelease = releasePlatformAllocationPure({
+    products: ordRes.products,
+    productId: baseProd.id,
+    marketplaceId: 'noon',
+    quantity: 2,
+  });
+  assert.equal(badRelease.success, false);
+
+  // Releasing 1 unreserved unit returns it cleanly to central (6 -> 7)
+  const okRelease = releasePlatformAllocationPure({
+    products: ordRes.products,
+    productId: baseProd.id,
+    marketplaceId: 'noon',
+    quantity: 1,
+  });
+  assert.equal(okRelease.success, true);
+  assert.equal(okRelease.products[0].centralAvailableStock, 7);
+  assert.equal(okRelease.products[0].platformAllocations?.noon?.availableQty, 0);
+
+  // Handover -> courier rejection -> warehouse receipt -> restock directly to Amazon platform allocation
+  const handover = updateOrderStatusPure({
+    orderId: 'ORD-ALLOC-1',
+    newStatus: 'with_delivery',
+    orders: ordRes.orders,
+    products: okRelease.products,
+    returns: [],
+    currency: 'SAR',
+  });
+  assert.equal(handover.success, true);
+
+  const rejected = updateOrderStatusPure({
+    orderId: 'ORD-ALLOC-1',
+    newStatus: 'rejected',
+    orders: handover.orders,
+    products: handover.products,
+    returns: handover.returns,
+    currency: 'SAR',
+  });
+  assert.equal(rejected.success, true);
+
+  const retId = rejected.returns[0].id;
+  const received = advanceReturnStatusPure({
+    returnId: retId,
+    targetStatus: 'received_at_warehouse',
+    returns: rejected.returns,
+    products: rejected.products,
+    orders: rejected.orders,
+  });
+  assert.equal(received.success, true);
+
+  // Inspect 3 units as restockable targeted explicitly to active 'amazon' allocation
+  const inspected = processReturnInspectionPure({
+    returnId: retId,
+    outcome: 'restockable',
+    condition: 'like_new',
+    notes: 'توجيه لمنصة أمازون',
+    restockTarget: 'amazon',
+    activeMarketplaceIds: ['noon', 'amazon'],
+    returns: received.returns,
+    products: received.products,
+    orders: rejected.orders,
+    currency: 'SAR',
+  });
+  assert.equal(inspected.success, true);
+  assert.equal(inspected.products[0].centralAvailableStock, 7);
+  assert.equal(inspected.products[0].platformAllocations?.amazon?.availableQty, 3);
+  assert.equal(inspected.products[0].availableStock, 10);
+});
+
+// ---------------------------------------------------------------------------
+// 13. Sequential Partial Returns & Ledger Write-Error Safety
+// ---------------------------------------------------------------------------
+test('partial post-delivery returns bound remaining quantities accurately and emit distinct return ledger eventRefs', () => {
+  const prod = makeProduct({ id: 'p-part-1', sku: 'PART-SKU-1', physicalStock: 10, availableStock: 10 });
+  const deliveredOrder = makeOrder({
+    id: 'ORD-PART-1',
+    status: 'delivered',
+    deliveredProcessed: true,
+    isClosed: true,
+    items: [
+      {
+        productId: prod.id,
+        productSku: prod.sku,
+        productName: prod.name,
+        imageUrl: prod.imageUrl,
+        quantity: 5,
+        unitPrice: 100,
+        unitCostSnapshot: 60,
+      },
+    ],
+    totalAmount: 500,
+  });
+
+  // First partial return: 2 of 5 units
+  const partial1 = registerPostDeliveryReturnPure({
+    orderId: deliveredOrder.id,
+    reason: 'مقاس غير مناسب',
+    selectedItems: [{ productId: prod.id, productSku: prod.sku, quantity: 2 }],
+    orders: [deliveredOrder],
+    returns: [],
+    products: [prod],
+    currency: 'SAR',
+  });
+  assert.equal(partial1.success, true);
+  assert.equal(partial1.returnRecord?.items[0].quantity, 2);
+
+  // Remaining returnable quantity must now be 3
+  const remAfter1 = getOrderReturnableItems(partial1.orders[0], partial1.returns);
+  assert.equal(remAfter1[0].alreadyReturnedQty, 2);
+  assert.equal(remAfter1[0].remainingQty, 3);
+
+  // Attempting to return 4 units (> 3 remaining) must fail
+  const overRet = registerPostDeliveryReturnPure({
+    orderId: deliveredOrder.id,
+    reason: 'تجاوز الكمية',
+    selectedItems: [{ productId: prod.id, productSku: prod.sku, quantity: 4 }],
+    orders: partial1.orders,
+    returns: partial1.returns,
+    products: partial1.products,
+    currency: 'SAR',
+  });
+  assert.equal(overRet.success, false);
+
+  // Second partial return: remaining 3 units
+  const partial2 = registerPostDeliveryReturnPure({
+    orderId: deliveredOrder.id,
+    reason: 'باقي الكمية',
+    selectedItems: [{ productId: prod.id, productSku: prod.sku, quantity: 3 }],
+    orders: partial1.orders,
+    returns: partial1.returns,
+    products: partial1.products,
+    currency: 'SAR',
+  });
+  assert.equal(partial2.success, true);
+
+  // Return shipping transactions must have distinct eventRefs per return ID
+  assert.notEqual(partial1.newTransactions[0].eventRef, partial2.newTransactions[0].eventRef);
+
+  // Damaged return must set rejectedFromResale=true and rejectedResaleStock=2 without adding to availableStock
+  const recv1 = advanceReturnStatusPure({
+    returnId: partial1.returnRecord!.id,
+    targetStatus: 'received_at_warehouse',
+    returns: partial2.returns,
+    products: partial2.products,
+    orders: partial2.orders,
+  });
+  assert.equal(recv1.success, true);
+
+  const dmgInsp = processReturnInspectionPure({
+    returnId: partial1.returnRecord!.id,
+    outcome: 'damaged',
+    condition: 'damaged',
+    notes: 'تالف أثناء الشحن',
+    returns: recv1.returns,
+    products: recv1.products,
+    orders: partial2.orders,
+    currency: 'SAR',
+  });
+  assert.equal(dmgInsp.success, true);
+  const inspectedRet = dmgInsp.returns.find((r) => r.id === partial1.returnRecord!.id);
+  assert.equal(inspectedRet?.rejectedFromResale, true);
+  assert.equal(dmgInsp.products[0].damagedStock, 2);
+  assert.equal(dmgInsp.products[0].rejectedResaleStock, 2);
+  assert.equal(dmgInsp.products[0].availableStock, 10);
+});
+
+// ---------------------------------------------------------------------------
+// 14. Dynamic Platform Isolation & Excel Columns
+// ---------------------------------------------------------------------------
+test('disabled marketplaces block new orders/allocations and Excel columns while keeping historical visibility', () => {
+  const backing = new Map<string, string>();
+  Object.defineProperty(globalThis, 'localStorage', {
+    value: {
+      get length() { return backing.size; },
+      clear() { backing.clear(); },
+      getItem(k: string) { return backing.get(k) ?? null; },
+      key(i: number) { return Array.from(backing.keys())[i] ?? null; },
+      removeItem(k: string) { backing.delete(k); },
+      setItem(k: string, v: string) { backing.set(k, v); },
+    },
+    configurable: true,
+    writable: true,
+  });
+
+  storageService.init();
+  storageService.clearAllStoreData();
+
+  const prod = makeProduct({ id: 'p-mkt-1', sku: 'MKT-1', physicalStock: 10, availableStock: 10 });
+  assert.equal(storageService.saveProduct(prod).success, true);
+
+  // Create historical order on Amazon while active
+  const ordRes = storageService.createOrder({
+    marketplaceId: 'amazon',
+    customerName: 'عميل تاريخي',
+    shippingAddress: 'جدة',
+    items: [
+      {
+        productId: prod.id,
+        productSku: prod.sku,
+        productName: prod.name,
+        imageUrl: prod.imageUrl,
+        quantity: 1,
+        unitPrice: 200,
+      },
+    ],
+    totalAmount: 200,
+    shippingCost: 20,
+    status: 'preparing',
+    orderDate: '2026-11-12T10:00:00Z',
+  });
+  assert.equal(ordRes.success, true);
+
+  // Disable Amazon -> active marketplaces should exclude Amazon, Excel columns exclude Amazon, allocations & orders blocked
+  assert.equal(storageService.setMarketplaceActive('amazon', false).success, true);
+  assert.equal(storageService.getActiveMarketplaces().some((m) => m.id === 'amazon'), false);
+  assert.equal(storageService.getAllMarketplaces().some((m) => m.id === 'amazon'), true);
+
+  const dynamicCols = getDynamicTemplateColumns();
+  assert.equal(dynamicCols.some((c) => c.toLowerCase().includes('amazon')), false);
+
+  const blockedAlloc = storageService.allocateStockToPlatform(prod.id, 'amazon', 2);
+  assert.equal(blockedAlloc.success, false);
+
+  const blockedOrder = storageService.createOrder({
+    marketplaceId: 'amazon',
+    customerName: 'عميل محظور',
+    shippingAddress: 'جدة',
+    items: [
+      {
+        productId: prod.id,
+        productSku: prod.sku,
+        productName: prod.name,
+        imageUrl: prod.imageUrl,
+        quantity: 1,
+        unitPrice: 200,
+      },
+    ],
+    totalAmount: 200,
+    shippingCost: 20,
+    status: 'preparing',
+    orderDate: '2026-11-12T11:00:00Z',
+  });
+  assert.equal(blockedOrder.success, false);
+
+  // Historical order on disabled Amazon remains intact
+  assert.equal(storageService.getOrders().some((o) => o.id === ordRes.order!.id), true);
+});
+
+// ---------------------------------------------------------------------------
+// 15. Multi-Merchant Isolation, Developer Mode Gating & Pre-Destructive Backups
+// ---------------------------------------------------------------------------
+test('multi-merchant workspaces isolate data, developer passcode gates access, and backups restore state', () => {
+  const backing = new Map<string, string>();
+  Object.defineProperty(globalThis, 'localStorage', {
+    value: {
+      get length() { return backing.size; },
+      clear() { backing.clear(); },
+      getItem(k: string) { return backing.get(k) ?? null; },
+      key(i: number) { return Array.from(backing.keys())[i] ?? null; },
+      removeItem(k: string) { backing.delete(k); },
+      setItem(k: string, v: string) { backing.set(k, v); },
+    },
+    configurable: true,
+    writable: true,
+  });
+
+  storageService.init();
+  storageService.clearAllStoreData();
+
+  // Developer Mode defaults to false, rejects invalid passcodes, unlocks with valid passcode, locks cleanly
+  assert.equal(storageService.isDeveloperMode(), false);
+  const badUnlock = storageService.unlockDeveloperMode('WRONG-PASS');
+  assert.equal(badUnlock.success, false);
+  assert.equal(storageService.isDeveloperMode(), false);
+
+  const okUnlock = storageService.unlockDeveloperMode('INGOBIA-DEV-2026');
+  assert.equal(okUnlock.success, true);
+  assert.equal(storageService.isDeveloperMode(), true);
+  assert.ok(storageService.getAdminAuditLog().some((l) => l.action === 'developer_mode_unlocked' && l.success));
+
+  // Save product in default merchant A
+  const prodA = makeProduct({ id: 'prod-merch-a', sku: 'MERCH-A-1', physicalStock: 12, availableStock: 12 });
+  assert.equal(storageService.saveProduct(prodA).success, true);
+  assert.equal(storageService.getProducts().length, 1);
+
+  // Pre-destructive backup captured before clearAllStoreData -> restore recovers product A
+  const clearRes = storageService.clearAllStoreData();
+  assert.equal(clearRes.success, true);
+  assert.equal(storageService.getProducts().length, 0);
+  const backups = storageService.getPreDestructiveBackups();
+  assert.ok(backups.length >= 1);
+  assert.equal(storageService.restorePreDestructiveBackup(backups[0].id).success, true);
+  assert.equal(storageService.getProducts().length, 1);
+  assert.equal(storageService.getProducts()[0].sku, 'MERCH-A-1');
+
+  // Create & switch to isolated merchant B -> must see zero products from merchant A
+  const merchB = storageService.createMerchantAccount({
+    storeName: 'متجر النور التجاري',
+    merchantName: 'خالد المنصور',
+    switchTo: true,
+  });
+  assert.equal(merchB.success, true);
+  assert.equal(storageService.getProducts().length, 0);
+
+  // Switch back to default merchant -> merchant A's product is intact
+  assert.equal(storageService.switchMerchantAccount('default').success, true);
+  assert.equal(storageService.getProducts().length, 1);
+  assert.equal(storageService.getProducts()[0].sku, 'MERCH-A-1');
+
+  assert.equal(storageService.lockDeveloperMode().success, true);
+  assert.equal(storageService.isDeveloperMode(), false);
+});
+
+// ---------------------------------------------------------------------------
+// 16. SmartImport Strict Sellable Stock Enforcement (No Silent Stock Fabrication)
+// ---------------------------------------------------------------------------
+test('saveSmartImportOrdersPure rejects active orders exceeding sellable stock instead of inventing inventory', () => {
+  const prod = makeProduct({ id: 'p-imp-1', sku: 'IMP-1', physicalStock: 2, availableStock: 2 });
+
+  const overOrder = makeOrder({
+    id: 'ORD-IMP-OVER',
+    marketplaceId: 'noon',
+    status: 'preparing',
+    items: [
+      {
+        productId: prod.id,
+        productSku: prod.sku,
+        productName: prod.name,
+        imageUrl: prod.imageUrl,
+        quantity: 5,
+        unitPrice: 200,
+      },
+    ],
+    totalAmount: 1000,
+  });
+
+  const res = saveSmartImportOrdersPure({
+    ordersToImport: [overOrder],
+    isHistoricalDeducted: false,
+    existingOrders: [],
+    products: [prod],
+    returns: [],
+    activeMarketplaceIds: ['noon', 'amazon'],
+  });
+
+  assert.equal(res.importedCount, 0);
+  assert.equal(res.rejectedCount, 1);
+  assert.equal(res.rejectedOrders.length, 1);
+  assert.equal(res.rejectedOrders[0].orderId, 'ORD-IMP-OVER');
+  assert.equal(res.orders.length, 0);
+  assert.equal(res.products[0].availableStock, 2);
+  assert.equal(res.products[0].physicalStock, 2);
+});
+

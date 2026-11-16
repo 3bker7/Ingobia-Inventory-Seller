@@ -17,6 +17,7 @@ import {
   SmartImportValidationResult,
 } from '../types';
 import { storageService } from './storage';
+import { resolveSafeProductImage } from '../utils/productVisual';
 
 // Multilingual synonym dictionary for order reports
 const FIELD_SYNONYMS: Record<DetectedFieldType, { nameAr: string; nameEn: string; keywords: string[] }> = {
@@ -473,12 +474,9 @@ export function processMappedOrderRows(
     const rawDate = dateCol ? String(row[dateCol] || '').trim() : new Date().toISOString();
     const customerName = customerCol ? String(row[customerCol] || '').trim() : undefined;
 
-    // Resolve product info from catalog
     const matchedProduct = productSkuMap.get(rawSku.toLowerCase());
     const productName = matchedProduct?.name || `Product (${rawSku})`;
-    const imageUrl =
-      matchedProduct?.imageUrl ||
-      'https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=160&auto=format&fit=crop&q=80';
+    const imageUrl = resolveSafeProductImage(matchedProduct?.imageUrl, productName);
     const productId = matchedProduct?.id || `auto-prod-${rawSku}`;
 
     const orderItem: SmartOrderItem = {
@@ -527,13 +525,20 @@ export function processMappedOrderRows(
 
   const orders = Array.from(groupedOrdersMap.values());
 
+  const activeMarketplaceIds = storageService.getActiveMarketplaces().map((m) => m.id);
+  const isMarketplaceActive = activeMarketplaceIds.includes(marketplace);
+
   let newOrdersCount = 0;
   let historicalOrdersCount = 0;
   let duplicateOrdersCount = 0;
   let errorOrdersCount = 0;
 
   for (const ord of orders) {
-    if (ord.isDuplicate) {
+    if (!isMarketplaceActive && !ord.isHistorical && !ord.isDuplicate) {
+      ord.hasErrors = true;
+      ord.errors.push(`المنصة المختارة (${marketplace}) معطلة حالياً ولا يمكن إنشاء طلبات نشطة عليها.`);
+      errorOrdersCount++;
+    } else if (ord.isDuplicate) {
       duplicateOrdersCount++;
     } else if (ord.isHistorical) {
       historicalOrdersCount++;

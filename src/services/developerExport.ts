@@ -5,6 +5,8 @@
  * Strictly text-first: No ZIPs, no PDFs, no external binary downloads.
  */
 
+import { storageService } from './storage';
+
 export interface SnapshotSection {
   sectionNumber: number;
   totalSections: number;
@@ -36,27 +38,42 @@ export interface ProjectSnapshot {
 
 const STORAGE_KEY_SNAPSHOTS = 'ingobia_developer_snapshots_v1';
 
+function computeDeterministicDigest(input: string): string {
+  let h1 = 0x811c9dc5;
+  let h2 = 0x9e3779b9;
+  for (let i = 0; i < input.length; i++) {
+    const c = input.charCodeAt(i);
+    h1 ^= c;
+    h1 = Math.imul(h1, 0x01000193);
+    h2 ^= c + i;
+    h2 = Math.imul(h2, 0x85ebca6b);
+  }
+  return (
+    (h1 >>> 0).toString(16).padStart(8, '0').toUpperCase() +
+    (h2 >>> 0).toString(16).padStart(8, '0').toUpperCase()
+  );
+}
+
 export class DeveloperExportService {
   private static generateSnapshotId(): string {
     const d = new Date();
     const dateStr = d.toISOString().slice(0, 10).replace(/-/g, '');
-    const rand = Math.random().toString(36).substring(2, 7).toUpperCase();
-    return `SNAP-INGOBIA-${dateStr}-${rand}`;
+    const timeStr = d.toISOString().slice(11, 19).replace(/:/g, '');
+    return `SNAP-INGOBIA-${dateStr}-${timeStr}`;
   }
 
-  public static isAuthorizedDeveloper(email?: string): boolean {
-    const authorized = ['a7med3bker@gmail.com', 'developer@ingobia.local'];
-    if (!email) return true; // Default allow inside dev container
-    return authorized.includes(email.toLowerCase().trim());
+  public static isAuthorizedDeveloper(): boolean {
+    return storageService.isDeveloperMode();
   }
 
-  public static createFullSnapshot(developerAccount = 'a7med3bker@gmail.com'): ProjectSnapshot {
+  public static createFullSnapshot(developerAccount = 'Developer Session'): ProjectSnapshot {
     const snapshotId = this.generateSnapshotId();
     const timestamp = new Date().toISOString();
-    const version = '3.6.0-DomainModular-CustodyLedger';
+    const version = '4.0.0-CentralCustody-IsolatedAccounts';
 
     const sourceFilesList = [
       '/src/types/index.ts',
+      '/src/utils/productVisual.ts',
       '/src/domain/inventoryCustody.ts',
       '/src/domain/financialLedger.ts',
       '/src/domain/orderLifecycle.ts',
@@ -65,6 +82,7 @@ export class DeveloperExportService {
       '/src/services/seedData.ts',
       '/src/services/storage.ts',
       '/src/services/excel.ts',
+      '/src/services/smartImport.ts',
       '/src/services/developerExport.ts',
       '/src/tests/businessLogic.test.ts',
       '/src/components/layout/Header.tsx',
@@ -81,6 +99,7 @@ export class DeveloperExportService {
       '/src/components/pages/ExcelImportPage.tsx',
       '/src/components/pages/SmartImportPage.tsx',
       '/src/components/pages/SettingsPage.tsx',
+      '/src/components/pages/DeveloperCenterPage.tsx',
       '/src/components/common/TestSuiteModal.tsx',
       '/src/components/onboarding/OnboardingModal.tsx',
       '/src/locales/translations.ts',
@@ -249,28 +268,31 @@ SECTION 3 OF ${totalSections}: AUTHENTICATION & DEVELOPER SECURITY GATE
 TIMESTAMP: ${timestamp}
 ================================================================================
 
-1. GOOGLE ACCOUNT RECOGNITION & SESSION
+1. MERCHANT SESSION & MULTI-MERCHANT ISOLATION
 --------------------------------------------------------------------------------
-- Primary Session Account: a7med3bker@gmail.com
-- Identity Storage: Local verified profile stored under 'ingobia_merchant_profile_v3'
-- Security Redaction Rule: Passwords, session tokens, and real consumer PII are
-  strictly redacted from exports.
+- Session Key: 'ingobia_auth_session_v1' (tracks activeMerchantId & role: 'merchant' | 'developer')
+- Accounts Registry: 'ingobia_merchant_accounts_v1'
+- Namespace Isolation: Each created merchant account isolates all operational arrays
+  under 'ingobia_m_<merchantId>_*' with ownership filtering and stamping on read/write.
+- Client-Side Security Honesty: Because this build persists in browser localStorage with
+  no backend server, role switching and developer passcode gates are client-side UX/session
+  controls — true server-side RBAC/auth requires an authenticated backend API.
 
 2. DYNAMIC NON-FORCED ONBOARDING
 --------------------------------------------------------------------------------
-- Initial State: Marketplace selection starts strictly at [] (Zero platforms).
-- Multi-Platform Flexibility: Merchants can select Amazon, Noon, Custom Storefront,
-  or proceed with zero external marketplaces if running an independent store.
-- Custom Storefront Input: Merchants who choose 'My Own Store / Website' provide their
-  direct URL without mandatory third-party marketplace dependencies.
-- Persistence: 'isOnboarded: true' is committed once and never prompts repeatedly.
+- Initial State: Marketplace selection starts cleanly without forced third-party lock-in.
+- Dynamic Single Source of Truth: Every UI form, order creation screen, Excel export/import,
+  and inventory allocation picker reads active channels via storageService.getActiveMarketplaces().
+- Historical Safety: Disabling a platform (isActive = false) hides it from new operations while
+  preserving all historical orders, returns, and price history neutrally.
 
-3. DEVELOPER RESTRICTION GATE
+3. DEVELOPER RESTRICTION GATE & AUDIT TRAIL
 --------------------------------------------------------------------------------
-- Access to this Developer Center is restricted to authorized developer accounts:
-  * Authorized: ${developerAccount}
-- All raw source code inspection, architecture trees, and snapshot generators are
-  shielded from ordinary store employees.`,
+- Access Mode: ${developerAccount} (unlocked explicitly via Settings -> Developer Mode passcode).
+- Pre-Destructive Backups: Wiping store data, seeding demo data, or importing JSON backups
+  automatically snapshots prior merchant state into 'ingobia_pre_destructive_backups_v1'.
+- Admin Audit Log: Developer unlocks, failed attempts, demo seeding, clears, backups, and
+  merchant switches are recorded chronologically in 'ingobia_admin_audit_log_v1'.`,
       },
 
       // -------------------------------------------------------------
@@ -602,7 +624,7 @@ TIMESTAMP: ${timestamp}
 - The top header is strictly restrained to prevent vertical screen waste.
 - It displays ONLY:
   * Platform brand name: 'عمليات البائع | Ingobia'
-  * Merchant store / website name: e.g. 'روابي إكسبريس للتجارة الإلكترونية'
+  * Merchant store / website name: e.g. 'متجر التاجر الإلكتروني'
   * Minimal live status indicator.
 - Action buttons are relocated contextually inside their respective functional pages.`,
       },
@@ -703,11 +725,13 @@ PROJECT SNAPSHOT COMPLETE
           'binary assets',
         ],
         knownLimitations: [
-          'Direct marketplace API synchronization is mocked/simulated without requiring live Amazon SP-API credentials.',
-          'Database is client-authoritative in LocalStorage with full state isolation.',
-          'Project inspection is strictly text-based as requested by the user.',
+          'Operates offline-first without live marketplace SP-API/Noon webhooks; imports happen via Excel/Smart Import and manual workflows.',
+          'Browser localStorage uses synchronous best-effort multi-key rollback (commitMultiKeyWrites), NOT database ACID transactions or multi-tab locks.',
+          'Role isolation & developer passcode gates are client-side controls until connected to a server-side auth/RBAC backend.',
         ],
-        systemIntegrityHash: `SHA256-${Math.random().toString(36).substring(2, 14).toUpperCase()}`,
+        systemIntegrityHash: `FNV1A-${computeDeterministicDigest(
+          JSON.stringify({ version, sourceFilesList, sectionsCount: sections.length })
+        )}`,
       },
       sections,
     };

@@ -15,6 +15,8 @@ import {
   FinancialTransaction,
 } from '../types';
 
+import { generateProductSvgDataUri } from '../utils/productVisual';
+
 export const STORAGE_KEYS = {
   PRODUCTS: 'seller_ops_products_v2',
   ORDERS: 'seller_ops_orders_v2',
@@ -28,11 +30,23 @@ export const STORAGE_KEYS = {
   RECOMMENDATIONS: 'seller_ops_recommendations_v2',
 };
 
+export const SYSTEM_STORAGE_KEYS = {
+  AUTH_SESSION: 'ingobia_auth_session_v1',
+  MERCHANT_ACCOUNTS: 'ingobia_merchant_accounts_v1',
+  ADMIN_AUDIT_LOG: 'ingobia_admin_audit_log_v1',
+  PRE_DESTRUCTIVE_BACKUPS: 'ingobia_pre_destructive_backups_v1',
+  MIGRATION_BACKUP: 'ingobia_migration_backup_v1',
+};
+
+export const DEFAULT_MERCHANT_ID = 'default';
+
 export const DEFAULT_MERCHANT_PROFILE: MerchantProfile = {
-  name: 'أحمد إبراهيم',
-  merchantName: 'أحمد إبراهيم',
-  email: 'a7med3bker@gmail.com',
-  storeName: 'روابي إكسبريس للتجارة الإلكترونية',
+  merchantId: DEFAULT_MERCHANT_ID,
+  role: 'merchant',
+  name: '',
+  merchantName: '',
+  email: '',
+  storeName: '',
   isOnboarded: false,
   selectedMarketplaceIds: [],
   completedTutorials: [],
@@ -63,20 +77,20 @@ export const DEFAULT_MARKETPLACES: MarketplaceConfig[] = [
 export const DEFAULT_SETTINGS: AppSettings = {
   language: 'ar',
   currency: 'SAR',
-  sellerName: 'أحمد إبراهيم (مدير العمليات)',
-  storeName: 'روابي إكسبريس للتجارة الإلكترونية',
+  sellerName: '',
+  storeName: '',
   marketplaces: DEFAULT_MARKETPLACES,
 };
 
 const sampleImages = {
-  smartWatch: 'https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=160&auto=format&fit=crop&q=80',
-  headphones: 'https://images.unsplash.com/photo-1505740420928-5e560c06d30e?w=160&auto=format&fit=crop&q=80',
-  backpack: 'https://images.unsplash.com/photo-1553062407-98eeb64c6a62?w=160&auto=format&fit=crop&q=80',
-  coffeeMaker: 'https://images.unsplash.com/photo-1517668808822-9ebb02f2a0e6?w=160&auto=format&fit=crop&q=80',
-  sneakers: 'https://images.unsplash.com/photo-1542291026-7eec264c27ff?w=160&auto=format&fit=crop&q=80',
-  powerbank: 'https://images.unsplash.com/photo-1609592424361-9c60e36511a0?w=160&auto=format&fit=crop&q=80',
-  sunglasses: 'https://images.unsplash.com/photo-1511499767150-a48a237f0083?w=160&auto=format&fit=crop&q=80',
-  keyboard: 'https://images.unsplash.com/photo-1587829741301-dc798b83add3?w=160&auto=format&fit=crop&q=80',
+  smartWatch: generateProductSvgDataUri('Smart Watch Series 8 Ultra', 'Electronics'),
+  headphones: generateProductSvgDataUri('Wireless ANC Headphones Pro', 'Audio'),
+  backpack: generateProductSvgDataUri('Travel Laptop Backpack 15.6', 'Bags & Luggage'),
+  coffeeMaker: generateProductSvgDataUri('Espresso Maker Stainless', 'Home & Kitchen'),
+  sneakers: generateProductSvgDataUri('Performance Running Shoes', 'Footwear'),
+  powerbank: generateProductSvgDataUri('Magnetic Power Bank 20000mAh', 'Electronics'),
+  sunglasses: generateProductSvgDataUri('Polarized Aviator Sunglasses', 'Accessories'),
+  keyboard: generateProductSvgDataUri('Mechanical RGB Keyboard', 'Gaming'),
 };
 
 export const DEFAULT_PRODUCTS: Product[] = [
@@ -932,7 +946,7 @@ export const DEFAULT_PRICE_HISTORY: PriceHistoryRecord[] = [
     percentageDiff: -9.4,
     changeType: 'decrease',
     reason: 'عروض الجمعة الصفراء / خصم تنافسي',
-    changedBy: 'أحمد إبراهيم',
+    changedBy: 'مدير المتجر',
     timestamp: '2026-11-10T14:30:00Z',
   },
   {
@@ -946,7 +960,7 @@ export const DEFAULT_PRICE_HISTORY: PriceHistoryRecord[] = [
     percentageDiff: 9.03,
     changeType: 'increase',
     reason: 'تعديل السعر بعد ارتفاع رسوم الشحن السريع FBA',
-    changedBy: 'أحمد إبراهيم',
+    changedBy: 'مدير المتجر',
     timestamp: '2026-11-08T12:00:00Z',
   },
 ];

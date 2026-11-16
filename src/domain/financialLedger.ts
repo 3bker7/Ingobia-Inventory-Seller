@@ -253,13 +253,19 @@ export function computeFinancialSummary(
   });
 
   // Deduplicate transactions to prevent double-counting identical or retried postings
+  // while preserving distinct legitimate multi-events on the same order via eventRef.
   const seenIds = new Set<string>();
+  const seenEventRefs = new Set<string>();
   const seenAutoSignatures = new Set<string>();
   const dedupedTx: FinancialTransaction[] = [];
 
   for (const tx of relevantTx) {
     if (tx.id && seenIds.has(tx.id)) continue;
-    if (tx.source === 'automatic' && tx.type !== 'adjustment') {
+    if (tx.eventRef) {
+      const refSig = `ref|${tx.eventRef}|${tx.status}`;
+      if (seenEventRefs.has(refSig)) continue;
+      seenEventRefs.add(refSig);
+    } else if (tx.source === 'automatic' && tx.type !== 'adjustment') {
       const signature =
         tx.type === 'damage_writeoff'
           ? `auto|${tx.orderId}|${tx.returnId || ''}|${tx.type}|${tx.status}|${tx.amount}|${tx.notes || ''}`

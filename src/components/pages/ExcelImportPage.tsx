@@ -18,7 +18,7 @@ import {
   generateExcelTemplate,
   parseAndValidateExcel,
   executeExcelImport,
-  OFFICIAL_TEMPLATE_COLUMNS,
+  getDynamicTemplateColumns,
 } from '../../services/excel';
 import { translations, Locale } from '../../locales/translations';
 import { useToast } from '../common/Toast';
@@ -26,20 +26,25 @@ import { useToast } from '../common/Toast';
 interface ExcelImportPageProps {
   locale: Locale;
   onNavigateToProducts: () => void;
+  onDataChange?: () => void;
 }
 
 export const ExcelImportPage: React.FC<ExcelImportPageProps> = ({
   locale,
   onNavigateToProducts,
+  onDataChange,
 }) => {
   const t = translations[locale];
   const { showToast } = useToast();
   const settings = storageService.getSettings();
+  const activeMarketplaces = storageService.getActiveMarketplaces();
+  const dynamicColumns = getDynamicTemplateColumns();
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // State
   const [isDragging, setIsDragging] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const [currentFile, setCurrentFile] = useState<File | null>(null);
   const [validationResult, setValidationResult] = useState<ExcelValidationResult | null>(null);
   const [activeTab, setActiveTab] = useState<'all' | 'new' | 'existing' | 'duplicate' | 'invalid'>('all');
@@ -47,6 +52,7 @@ export const ExcelImportPage: React.FC<ExcelImportPageProps> = ({
     importedNew: number;
     updatedExisting: number;
     totalProcessed: number;
+    skippedInvalid?: number;
   } | null>(null);
 
   // Template Download Handler - 100% EMPTY HEADERS ONLY
@@ -121,7 +127,7 @@ export const ExcelImportPage: React.FC<ExcelImportPageProps> = ({
 
   // Confirm Import
   const handleConfirmImport = () => {
-    if (!validationResult) return;
+    if (!validationResult || isSubmitting) return;
 
     const validRows = validationResult.rows
       .filter((r) => (r.status === 'new' || r.status === 'existing') && r.data)
@@ -135,13 +141,19 @@ export const ExcelImportPage: React.FC<ExcelImportPageProps> = ({
       return;
     }
 
-    const summary = executeExcelImport(validRows, settings.sellerName);
-    if (!summary.success) {
-      showToast(summary.error || t.toasts.error, 'error');
-      return;
+    setIsSubmitting(true);
+    try {
+      const summary = executeExcelImport(validRows, settings.sellerName);
+      if (!summary.success) {
+        showToast(summary.error || t.toasts.error, 'error');
+        return;
+      }
+      setImportSummary(summary);
+      onDataChange?.();
+      showToast(t.toasts.excelImported, 'success');
+    } finally {
+      setIsSubmitting(false);
     }
-    setImportSummary(summary);
-    showToast(t.toasts.excelImported, 'success');
   };
 
   // Filter preview rows by selected tab
@@ -169,20 +181,20 @@ export const ExcelImportPage: React.FC<ExcelImportPageProps> = ({
             </div>
             <p className="text-[11px] text-[#64748B] leading-relaxed">
               {locale === 'ar'
-                ? 'نموذج فارغ تماماً يتضمن الـ 8 أعمدة المعتمدة فقط دون أي صفوف أو بيانات تجريبية.'
-                : 'A clean 8-column empty template with headers only and zero dummy rows.'}
+                ? `نموذج فارغ تماماً يتضمن ${dynamicColumns.length} أعمدة ديناميكية معتمدة فقط دون أي صفوف أو بيانات تجريبية.`
+                : `A clean ${dynamicColumns.length}-column empty template with headers only and zero dummy rows.`}
             </p>
           </div>
           <button
             onClick={handleDownloadTemplate}
-            className="mt-3 w-full flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-[#2563EB] bg-blue-50/70 hover:bg-blue-100/70 border border-blue-200 rounded-lg transition-colors cursor-pointer"
+            className="mt-3 w-full flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-[#2563EB] bg-blue-50/70 hover:bg-blue-100/70 border border-blue-200 rounded-lg transition-colors cursor-pointer whitespace-nowrap"
           >
             <Download className="w-3.5 h-3.5" />
             <span>{t.excelImport.downloadBtn}</span>
           </button>
         </div>
 
-        {/* Step 2: Unified 8-Column Architecture */}
+        {/* Step 2: Unified Dynamic Column Architecture */}
         <div className="bg-white p-4 rounded-xl border border-[#E8ECF2] shadow-xs flex flex-col justify-between">
           <div>
             <div className="flex items-center gap-2 text-xs font-semibold text-[#172033] mb-1.5">
@@ -191,12 +203,16 @@ export const ExcelImportPage: React.FC<ExcelImportPageProps> = ({
             </div>
             <p className="text-[11px] text-[#64748B] leading-relaxed">
               {locale === 'ar'
-                ? 'ملف واحد يحتوي على 8 أعمدة معتمدة يجمع المخزون الفعلي بالمستودع مع أسعار وكميات منصتي نون وأمازون بشكل مستقل تماماً.'
-                : 'A single 8-column spreadsheet unites physical stock with independent Noon and Amazon listings.'}
+                ? activeMarketplaces.length > 0
+                  ? `ملف موحد يجمع المخزون الفعلي بالمستودع مع أسعار وكميات قنواتك النشطة (${activeMarketplaces.map((m) => m.nameAr).join('، ')}).`
+                  : 'ملف موحد للمخزون المركزي بالمستودع (يمكنك تفعيل قنوات البيع من الإعدادات لإضافة أعمدتها).'
+                : activeMarketplaces.length > 0
+                ? `A unified spreadsheet linking physical stock with your active channels (${activeMarketplaces.map((m) => m.nameEn).join(', ')}).`
+                : 'A unified central stock sheet (enable sales channels in Settings to include channel columns).'}
             </p>
           </div>
           <div className="mt-2 text-[10px] text-[#64748B] bg-[#F7F8FA] p-2 rounded border border-[#E8ECF2] font-mono-code truncate">
-            {OFFICIAL_TEMPLATE_COLUMNS.slice(0, 4).join(' | ')}...
+            {dynamicColumns.slice(0, 4).join(' | ')}{dynamicColumns.length > 4 ? ` (+${dynamicColumns.length - 4})` : ''}
           </div>
         </div>
 
@@ -258,8 +274,8 @@ export const ExcelImportPage: React.FC<ExcelImportPageProps> = ({
             <FileSpreadsheet className="w-4 h-4" />
             <span>
               {locale === 'ar'
-                ? 'استيراد كتالوج المنتجات الموحد (8 أعمدة معتمدة)'
-                : 'Unified 8-Column Products Catalog Import'}
+                ? `استيراد كتالوج المنتجات الموحد (${dynamicColumns.length} أعمدة ديناميكية)`
+                : `Unified ${dynamicColumns.length}-Column Products Catalog Import`}
             </span>
           </div>
         </div>
@@ -278,9 +294,16 @@ export const ExcelImportPage: React.FC<ExcelImportPageProps> = ({
             </h3>
             <p className="text-xs text-[#64748B] mt-1">
               {locale === 'ar'
-                ? `تم بنجاح تحديث وتخصيص المخزون الفعلي وإدراجات نون وأمازون (${importSummary.totalProcessed} منتج)`
-                : `Successfully processed physical stock and marketplace listings (${importSummary.totalProcessed} items)`}
+                ? `تم بنجاح تحديث وتخصيص المخزون الفعلي والقنوات النشطة (${importSummary.totalProcessed} منتج)`
+                : `Successfully processed physical stock and active channels (${importSummary.totalProcessed} items)`}
             </p>
+            {(importSummary.skippedInvalid || 0) > 0 && (
+              <p className="text-xs text-[#D99A27] font-semibold mt-1">
+                {locale === 'ar'
+                  ? `تم تخطي ${importSummary.skippedInvalid} صفوف لعدم كفاية المخزون الحر لتخصيص المنصات.`
+                  : `Skipped ${importSummary.skippedInvalid} rows where channel allocations exceeded physical availability.`}
+              </p>
+            )}
           </div>
 
           <div className="grid grid-cols-2 max-w-md mx-auto gap-3 text-start">
@@ -450,7 +473,7 @@ export const ExcelImportPage: React.FC<ExcelImportPageProps> = ({
             )}
           </div>
 
-          {/* Centralized 8-Column Preview Table */}
+          {/* Centralized Dynamic Preview Table */}
           <div className="border border-[#E8ECF2] rounded-lg overflow-x-auto max-h-96">
             <table className="w-full text-start text-xs border-collapse">
               <thead className="sticky top-0 bg-[#F7F8FA] border-b border-[#E8ECF2] text-[#64748B] font-semibold">
@@ -459,12 +482,11 @@ export const ExcelImportPage: React.FC<ExcelImportPageProps> = ({
                   <th className="py-2.5 px-3 text-start">{t.products.productColumn}</th>
                   <th className="py-2.5 px-3 text-start">SKU</th>
                   <th className="py-2.5 px-3 text-center">{locale === 'ar' ? 'المخزون الفعلي' : 'Physical'}</th>
-                  <th className="py-2.5 px-3 text-center bg-amber-50/40 text-amber-900">
-                    {locale === 'ar' ? 'نون (سعر | كمية)' : 'Noon (Price | Qty)'}
-                  </th>
-                  <th className="py-2.5 px-3 text-center bg-sky-50/40 text-sky-900">
-                    {locale === 'ar' ? 'أمازون (سعر | كمية)' : 'Amazon (Price | Qty)'}
-                  </th>
+                  {activeMarketplaces.map((mkt) => (
+                    <th key={mkt.id} className="py-2.5 px-3 text-center whitespace-nowrap">
+                      {locale === 'ar' ? `${mkt.nameAr} (سعر | كمية)` : `${mkt.nameEn} (Price | Qty)`}
+                    </th>
+                  ))}
                   <th className="py-2.5 px-3 text-start">{locale === 'ar' ? 'التصنيف' : 'Classification'}</th>
                   <th className="py-2.5 px-3 text-start">{locale === 'ar' ? 'النتيجة والملاحظات' : 'Remarks'}</th>
                 </tr>
@@ -501,26 +523,18 @@ export const ExcelImportPage: React.FC<ExcelImportPageProps> = ({
                           ? row.data.physicalStock
                           : String(row.raw.physicalStock || '0')}
                       </td>
-                      {/* Noon */}
-                      <td className="py-2 px-3 text-center tabular-nums bg-amber-50/20">
-                        {row.data ? (
-                          <span className="font-mono-code">
-                            {row.data.noonPrice} {settings.currency} | <strong>{row.data.noonQuantity}</strong>
-                          </span>
-                        ) : (
-                          `${row.raw.noonPrice || 0} | ${row.raw.noonQty || 0}`
-                        )}
-                      </td>
-                      {/* Amazon */}
-                      <td className="py-2 px-3 text-center tabular-nums bg-sky-50/20">
-                        {row.data ? (
-                          <span className="font-mono-code">
-                            {row.data.amazonPrice} {settings.currency} | <strong>{row.data.amazonQuantity}</strong>
-                          </span>
-                        ) : (
-                          `${row.raw.amazonPrice || 0} | ${row.raw.amazonQty || 0}`
-                        )}
-                      </td>
+                      {activeMarketplaces.map((mkt) => {
+                        const cellData = row.data?.marketplaceData?.[mkt.id] ?? (row.raw[mkt.id] as { price?: number; quantity?: number } | undefined);
+                        const p = cellData?.price ?? 0;
+                        const q = cellData?.quantity ?? 0;
+                        return (
+                          <td key={mkt.id} className="py-2 px-3 text-center tabular-nums">
+                            <span className="font-mono-code">
+                              {p} {settings.currency} | <strong>{q}</strong>
+                            </span>
+                          </td>
+                        );
+                      })}
                       {/* Classification Badge */}
                       <td className="py-2 px-3">
                         {isNew && (
@@ -590,11 +604,11 @@ export const ExcelImportPage: React.FC<ExcelImportPageProps> = ({
               </span>
 
               <button
-                disabled={validationResult.validCount === 0}
+                disabled={validationResult.validCount === 0 || isSubmitting}
                 onClick={handleConfirmImport}
-                className={`px-5 py-2 text-xs font-semibold text-white rounded-lg transition-colors shadow-sm cursor-pointer ${
-                  validationResult.validCount > 0
-                    ? 'bg-[#2563EB] hover:bg-blue-700'
+                className={`px-5 py-2 text-xs font-semibold text-white rounded-lg transition-colors shadow-sm whitespace-nowrap shrink-0 ${
+                  validationResult.validCount > 0 && !isSubmitting
+                    ? 'bg-[#2563EB] hover:bg-blue-700 cursor-pointer'
                     : 'bg-slate-300 cursor-not-allowed'
                 }`}
               >

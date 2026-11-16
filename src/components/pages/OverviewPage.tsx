@@ -28,12 +28,10 @@ import {
 } from 'lucide-react';
 import { storageService } from '../../services/storage';
 import { resolveOrderItemUnitCost } from '../../domain/financialLedger';
+import { resolveSafeProductImage } from '../../utils/productVisual';
 import { translations, Locale } from '../../locales/translations';
 import { ActiveTab } from '../layout/Sidebar';
 import {
-  Order,
-  Product,
-  ReturnRecord,
   DateFilterOption,
   OperationalAlert,
   TopSellingProductItem,
@@ -44,12 +42,17 @@ import {
 
 interface OverviewPageProps {
   locale: Locale;
+  storeRevision?: number;
   onNavigate: (tab: ActiveTab, filterState?: Record<string, string>) => void;
 }
 
-export const OverviewPage: React.FC<OverviewPageProps> = ({ locale, onNavigate }) => {
+export const OverviewPage: React.FC<OverviewPageProps> = ({
+  locale,
+  storeRevision = 0,
+  onNavigate,
+}) => {
   const t = translations[locale];
-  const settings = storageService.getSettings();
+  const settings = useMemo(() => storageService.getSettings(), [storeRevision]);
 
   // 1. Dashboard Filters State
   const [dateFilter, setDateFilter] = useState<DateFilterOption>('allTime');
@@ -105,18 +108,18 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({ locale, onNavigate }
     return { start, end, daysCount: diffDays };
   }, [dateFilter, customStartDate, customEndDate, monthStartIso, todayIso]);
 
-  // Active Marketplaces
-  const configuredMarketplaces = useMemo(() => storageService.getMarketplaces(), []);
+  // Configured Marketplaces (active + historical)
+  const configuredMarketplaces = useMemo(() => storageService.getAllMarketplaces(), [storeRevision]);
 
   // Raw Database Queries
-  const allProducts = useMemo(() => storageService.getProducts(), []);
+  const allProducts = useMemo(() => storageService.getProducts(), [storeRevision]);
   const filteredOrders = useMemo(
     () => storageService.getFilteredOrders(activeDateRange, selectedMarketplace),
-    [activeDateRange, selectedMarketplace]
+    [activeDateRange, selectedMarketplace, storeRevision]
   );
   const filteredReturns = useMemo(
     () => storageService.getFilteredReturns(activeDateRange, selectedMarketplace),
-    [activeDateRange, selectedMarketplace]
+    [activeDateRange, selectedMarketplace, storeRevision]
   );
 
   // ----------------------------------------------------------------------
@@ -412,7 +415,7 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({ locale, onNavigate }
         recommendedAction: 'افتح صفحة المرتجعات لإجراء الفحص واعتماد الصالح لإعادة البيع.',
         recommendedActionEn: 'Perform inspection to approve resellable units and write off damaged goods.',
         targetTab: 'returns',
-        targetFilter: { status: 'under_inspection' },
+        targetFilter: { status: 'awaiting_inspection' },
       });
     }
 
@@ -785,7 +788,7 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({ locale, onNavigate }
 
         {/* Returns Awaiting Inspection */}
         <div
-          onClick={() => onNavigate('returns', { status: 'under_inspection' })}
+          onClick={() => onNavigate('returns', { status: 'awaiting_inspection' })}
           className="bg-[#F7F8FA] p-3 rounded-xl border border-[#E8ECF2] hover:bg-white transition-all cursor-pointer"
         >
           <span className="text-[11px] text-[#64748B] block">{locale === 'ar' ? 'بانتظار الفحص' : 'Awaiting Inspection'}</span>
@@ -955,7 +958,10 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({ locale, onNavigate }
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {platformStatsList.map((stat) => (
+          {platformStatsList.map((stat) => {
+            const mktCfg = configuredMarketplaces.find((m) => m.id === stat.marketplaceId);
+            const isMktDisabled = mktCfg ? mktCfg.isActive === false : true;
+            return (
             <div
               key={stat.marketplaceId}
               className="p-4 rounded-xl border border-[#E8ECF2] bg-[#F7F8FA]/60 space-y-3"
@@ -963,26 +969,25 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({ locale, onNavigate }
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <span
-                    className="w-8 h-8 rounded-lg flex items-center justify-center font-bold text-xs"
+                    className="w-8 h-8 rounded-lg flex items-center justify-center font-bold text-xs border border-[#E8ECF2]"
                     style={{
-                      backgroundColor:
-                        stat.marketplaceId === 'noon'
-                          ? '#FEEC00'
-                          : stat.marketplaceId === 'amazon'
-                          ? '#FF9900'
-                          : '#2563EB',
-                      color:
-                        stat.marketplaceId === 'noon'
-                          ? '#854D0E'
-                          : '#FFFFFF',
+                      backgroundColor: isMktDisabled ? '#F1F5F9' : mktCfg?.badgeBg || '#F1F5F9',
+                      color: isMktDisabled ? '#475569' : mktCfg?.badgeText || '#475569',
                     }}
                   >
                     {stat.marketplaceId.slice(0, 4).toUpperCase()}
                   </span>
                   <div>
-                    <h4 className="text-xs font-bold text-[#172033]">
-                      {locale === 'ar' ? stat.nameAr : stat.nameEn}
-                    </h4>
+                    <div className="flex items-center gap-1.5">
+                      <h4 className="text-xs font-bold text-[#172033]">
+                        {locale === 'ar' ? stat.nameAr : stat.nameEn}
+                      </h4>
+                      {isMktDisabled && (
+                        <span className="text-[9px] font-semibold px-1.5 py-0.2 rounded bg-slate-100 text-slate-600 border border-slate-200">
+                          {locale === 'ar' ? 'معطلة' : 'Disabled'}
+                        </span>
+                      )}
+                    </div>
                     <span className="text-[10px] text-[#64748B]">
                       {stat.totalOrders} {locale === 'ar' ? 'طلب مسجل' : 'orders'}
                     </span>
@@ -1026,7 +1031,8 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({ locale, onNavigate }
                 </div>
               )}
             </div>
-          ))}
+            );
+          })}
         </div>
       </div>
 
@@ -1068,7 +1074,7 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({ locale, onNavigate }
                       #{idx + 1}
                     </span>
                     <img
-                      src={item.product.imageUrl}
+                      src={resolveSafeProductImage(item.product.imageUrl, item.product.name, item.product.category)}
                       alt={item.product.name}
                       referrerPolicy="no-referrer"
                       className="w-9 h-9 rounded-lg object-cover border border-[#E8ECF2] shrink-0"
@@ -1130,7 +1136,7 @@ export const OverviewPage: React.FC<OverviewPageProps> = ({ locale, onNavigate }
                 >
                   <div className="flex items-center gap-2.5 min-w-0">
                     <img
-                      src={item.product.imageUrl}
+                      src={resolveSafeProductImage(item.product.imageUrl, item.product.name, item.product.category)}
                       alt={item.product.name}
                       referrerPolicy="no-referrer"
                       className="w-9 h-9 rounded-lg object-cover border border-[#E8ECF2] shrink-0"

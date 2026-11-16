@@ -2,7 +2,63 @@
  * Core domain types for Seller Operations Multi-Platform Management
  */
 
-export type MarketplaceId = 'noon' | 'amazon' | string;
+export type MarketplaceId = string;
+
+export type UserRole = 'merchant' | 'developer';
+
+export interface MerchantAccount {
+  id: string;
+  storeName: string;
+  merchantName: string;
+  email: string;
+  role: UserRole;
+  createdAt: string;
+  lastAccessedAt: string;
+  lastActiveAt?: string;
+}
+
+export interface AuthSession {
+  activeMerchantId: string;
+  role: UserRole;
+  developerUnlockedAt?: string;
+}
+
+export interface AdminAuditLogEntry {
+  id: string;
+  timestamp: string;
+  actorRole: UserRole;
+  actorName: string;
+  merchantId: string;
+  action: string;
+  details: string;
+  success: boolean;
+}
+
+export interface PreDestructiveBackup {
+  id: string;
+  createdAt: string;
+  merchantId: string;
+  reason: string;
+  data: {
+    products: Product[];
+    orders: Order[];
+    returns: ReturnRecord[];
+    movements: StockMovement[];
+    priceHistory: PriceHistoryRecord[];
+    financialTransactions: FinancialTransaction[];
+    settings: AppSettings;
+    merchantProfile: MerchantProfile;
+  };
+  snapshotJson?: string;
+}
+
+export interface PlatformInventoryAllocation {
+  marketplaceId: MarketplaceId;
+  allocatedQty: number;
+  reservedQty: number;
+  availableQty: number; // always max(0, allocatedQty - reservedQty)
+  lastUpdated: string;
+}
 
 export interface MarketplaceConfig {
   id: MarketplaceId;
@@ -17,13 +73,14 @@ export interface MarketplaceConfig {
 export interface MarketplaceListing {
   marketplaceId: MarketplaceId;
   price: number;
-  quantity: number; // quantity listed on this marketplace
+  quantity: number; // mirrors platform allocated availableQty or central pool reference
   listingStatus: 'active' | 'inactive' | 'out_of_stock';
   lastUpdated: string;
 }
 
 export interface Product {
   id: string;
+  merchantId?: string;
   sku: string; // optional or auto-generated
   name: string;
   nameAr?: string;
@@ -31,14 +88,18 @@ export interface Product {
   category?: string;
   baseCost?: number;
   currentPrice: number; // reference selling price
-  // --- Inventory Custody Model ---
-  // Merchant-owned Warehouse custody
-  physicalStock: number; // actual warehouse count = available + reserved + awaitingInspection + damaged
-  availableStock: number; // physically present in warehouse, inspected, sellable for new orders
-  reservedStock: number; // allocated to active orders awaiting shipment handover
-  awaitingInspectionStock?: number; // physically received in warehouse, pending quality inspection
+  // --- Centralized Warehouse Custody & Platform Allocations Model ---
+  // Central Warehouse Custody (merchant-owned)
+  physicalStock: number; // total merchant-owned physical units = availableStock + reservedStock + awaitingInspectionStock + damagedStock + outboundInTransitStock + returnInTransitStock
+  availableStock: number; // total sellable available = centralAvailableStock + sum(platformAllocations[id].availableQty)
+  centralAvailableStock?: number; // unallocated stock sitting in central warehouse ready to allocate or fulfill unallocated channels
+  centralReservedStock?: number; // units reserved from centralAvailableStock (unallocated channel orders)
+  reservedStock: number; // total reserved for open preparing orders = centralReservedStock + sum(platformAllocations[id].reservedQty)
+  platformAllocations?: Record<MarketplaceId, PlatformInventoryAllocation>;
+  awaitingInspectionStock?: number; // physically received in warehouse, quarantined pending quality inspection
   damagedStock?: number; // physically present in warehouse, confirmed damaged/unsellable
-  // Outside Warehouse custody (merchant-owned but in transit)
+  rejectedResaleStock?: number; // explicit alias/counter of returned items rejected from resale
+  // Outside Warehouse Custody (in transit)
   outboundInTransitStock?: number; // handed to courier, travelling to customer
   returnInTransitStock?: number; // returning from customer/courier back to warehouse
   marketplaceListings: Record<MarketplaceId, MarketplaceListing>;
@@ -48,6 +109,7 @@ export interface Product {
 
 export interface PriceHistoryRecord {
   id: string;
+  merchantId?: string;
   productId: string;
   productSku: string;
   productName: string;
@@ -76,6 +138,7 @@ export interface OrderItem {
   unitPrice: number; // snapshot at order time
   unitCostSnapshot?: number; // COGS snapshot at order/import time so catalog edits don't rewrite historical profits
   quantity: number;
+  reservationSource?: 'platform' | 'central'; // tracks whether reservation came from platform allocation or central available
 }
 
 export interface ShipmentRecord {
@@ -149,6 +212,7 @@ export interface OrderFinancialBreakdown {
 
 export interface Order {
   id: string; // Order ID e.g. "ORD-9821"
+  merchantId?: string;
   marketplaceId: MarketplaceId;
   items: OrderItem[];
   totalAmount: number;
@@ -175,7 +239,7 @@ export interface Order {
   isClosed?: boolean; // Set to true when successfully completed or return cycle completed
   closedReason?: 'delivered' | 'return_completed' | 'cancelled';
   closedAt?: string;
-  hasPostDeliveryReturn?: boolean; // Tracks if a return was filed after successful delivery
+  hasPostDeliveryReturn?: boolean; // Tracks if at least one post-delivery return was filed
   createdAt: string;
   updatedAt: string;
 }
@@ -190,25 +254,45 @@ export type MovementType =
   | 'return_restocked' // inspected return approved -> returned to available physical stock
   | 'return_damaged' // inspected return marked damaged -> moved to damagedStock (unsellable)
   | 'return_missing' // returned item missing -> written off
+  | 'allocation_to_platform' // central available allocated to platform pool
+  | 'allocation_returned_central' // platform unreserved allocation released back to central warehouse
   | 'manual_adjustment' // manual stock count adjustment
   | 'excel_import'; // batch update
 
+export type StockMovementBucket =
+  | 'central_available'
+  | 'platform_allocation'
+  | 'reserved'
+  | 'outbound_transit'
+  | 'return_transit'
+  | 'awaiting_inspection'
+  | 'damaged'
+  | 'customer'
+  | 'external';
+
 export interface StockMovement {
   id: string;
+  merchantId?: string;
   productId: string;
   productSku: string;
   productName: string;
   marketplaceId?: MarketplaceId;
+  platformId?: MarketplaceId;
+  source?: StockMovementBucket;
+  destination?: StockMovementBucket;
   type: MovementType;
   quantityChange: number; // + or -
   previousPhysical: number;
   newPhysical: number;
   previousAvailable: number;
   newAvailable: number;
+  beforeQty?: number;
+  afterQty?: number;
   fromCustody?: string;
   toCustody?: string;
   referenceOrderId?: string;
   referenceReturnId?: string;
+  eventKey?: string;
   reason: string;
   operator: string;
   timestamp: string;
@@ -237,6 +321,7 @@ export type InspectionOutcome =
 
 export interface ReturnRecord {
   id: string;
+  merchantId?: string;
   orderId: string;
   marketplaceId: MarketplaceId;
   items: OrderItem[];
@@ -245,6 +330,8 @@ export interface ReturnRecord {
   inspectionOutcome?: InspectionOutcome;
   physicalCondition?: 'like_new' | 'opened_good' | 'damaged' | 'lost';
   stockRestored: boolean; // safeguard against multiple restocks
+  rejectedFromResale?: boolean; // explicit flag when damaged/rejected from resale
+  restockTarget?: 'central' | MarketplaceId; // where approved items were restocked
   isCompleted?: boolean; // Marked true once inspected and closed
   isPostDeliveryReturn?: boolean; // True if created after successful delivery
   // Shipping & Custody details
@@ -275,6 +362,8 @@ export type FinancialTransactionType =
 
 export interface FinancialTransaction {
   id: string;
+  merchantId?: string;
+  eventRef?: string; // targeted event reference for precise idempotency without collapsing valid multi-events
   orderId: string;
   returnId?: string;
   marketplaceId: MarketplaceId;
@@ -356,6 +445,7 @@ export interface ExcelValidationResult {
 }
 
 export interface AppSettings {
+  merchantId?: string;
   language: 'ar' | 'en';
   currency: string;
   sellerName: string;
@@ -364,6 +454,8 @@ export interface AppSettings {
 }
 
 export interface MerchantProfile {
+  merchantId?: string;
+  role?: UserRole;
   name: string;
   merchantName?: string;
   email: string;
@@ -530,6 +622,7 @@ export interface SmartImportValidationResult {
 
 export interface SmartImportHistory {
   id: string;
+  merchantId?: string;
   marketplaceId: MarketplaceId;
   fileName: string;
   importedAt: string;

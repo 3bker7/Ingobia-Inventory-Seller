@@ -42,6 +42,8 @@ interface SidebarProps {
   onToggleCollapse: () => void;
   activeOrdersCount: number;
   pendingReturnsCount: number;
+  isDeveloperMode?: boolean;
+  storeRevision?: number;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({
@@ -53,9 +55,14 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onToggleCollapse,
   activeOrdersCount,
   pendingReturnsCount,
+  isDeveloperMode = false,
+  storeRevision = 0,
 }) => {
+  void storeRevision;
   const t = translations[locale];
   const settings = storageService.getSettings();
+  const profile = storageService.getMerchantProfile();
+  const activeMarketplaces = storageService.getActiveMarketplaces();
 
   const navItems: {
     id: ActiveTab;
@@ -127,13 +134,17 @@ export const Sidebar: React.FC<SidebarProps> = ({
       label: t.nav.settings,
       icon: Settings,
     },
-    {
-      id: 'developerCenter',
-      label: t.nav.developerCenter,
-      icon: Terminal,
-      badgeText: 'Dev',
-      badgeColor: 'bg-purple-100 text-purple-900',
-    },
+    ...(isDeveloperMode
+      ? [
+          {
+            id: 'developerCenter' as ActiveTab,
+            label: t.nav.developerCenter,
+            icon: Terminal,
+            badgeText: 'Dev',
+            badgeColor: 'bg-purple-100 text-purple-900',
+          },
+        ]
+      : []),
   ];
 
   return (
@@ -173,22 +184,28 @@ export const Sidebar: React.FC<SidebarProps> = ({
         </button>
       </div>
 
-      {/* Marketplaces quick status bar (when expanded) */}
+      {/* Active Marketplaces quick status bar (when expanded) */}
       {!isCollapsed && (
-        <div className="px-4 py-2.5 bg-[#F7F8FA]/80 border-b border-[#E8ECF2] flex items-center justify-between text-xs">
-          <span className="text-[#64748B] font-medium text-[11px]">
-            {locale === 'ar' ? 'المنصات المتزامنة' : 'Synced Channels'}
+        <div className="px-4 py-2.5 bg-[#F7F8FA]/80 border-b border-[#E8ECF2] flex items-center justify-between gap-2 text-xs">
+          <span className="text-[#64748B] font-medium text-[11px] shrink-0">
+            {locale === 'ar' ? 'القنوات النشطة' : 'Active Channels'}
           </span>
-          <div className="flex items-center gap-1.5">
-            {settings.marketplaces.map((m) => (
-              <span
-                key={m.id}
-                className="text-[10px] font-semibold px-1.5 py-0.5 rounded border border-[#E8ECF2] bg-white text-[#172033]"
-                title={`${m.nameEn} - Active`}
-              >
-                {locale === 'ar' ? m.nameAr : m.nameEn}
+          <div className="flex items-center gap-1 flex-wrap justify-end">
+            {activeMarketplaces.length === 0 ? (
+              <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded border border-[#E8ECF2] bg-white text-[#64748B]">
+                {locale === 'ar' ? 'متجر مستقل' : 'Independent'}
               </span>
-            ))}
+            ) : (
+              activeMarketplaces.map((m) => (
+                <span
+                  key={m.id}
+                  className="text-[10px] font-semibold px-1.5 py-0.5 rounded border border-[#E8ECF2] bg-white text-[#172033]"
+                  title={`${m.nameEn} - Active`}
+                >
+                  {locale === 'ar' ? m.nameAr : m.nameEn}
+                </span>
+              ))
+            )}
           </div>
         </div>
       )}
@@ -258,8 +275,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
         {!isCollapsed && (
           <div className="px-2 py-1.5 flex items-center gap-2 text-[11px] text-[#64748B]">
-            <div className="w-2 h-2 rounded-full bg-[#16A36A]" />
-            <span className="truncate">{settings.sellerName}</span>
+            <div className="w-2 h-2 rounded-full bg-[#16A36A] shrink-0" />
+            <span className="truncate">
+              {profile.merchantName || settings.sellerName || (locale === 'ar' ? 'حساب التاجر' : 'Merchant Account')}
+            </span>
           </div>
         )}
       </div>

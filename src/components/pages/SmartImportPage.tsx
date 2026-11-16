@@ -30,6 +30,7 @@ import { storageService } from '../../services/storage';
 import { analyzeOrderFile, processMappedOrderRows } from '../../services/smartImport';
 import { translations, Locale } from '../../locales/translations';
 import { useToast } from '../common/Toast';
+import { resolveSafeProductImage } from '../../utils/productVisual';
 
 interface SmartImportPageProps {
   locale: Locale;
@@ -47,13 +48,17 @@ export const SmartImportPage: React.FC<SmartImportPageProps> = ({
   const t = translations[locale];
   const { showToast } = useToast();
   const settings = storageService.getSettings();
+  const activeMarketplaces = storageService.getActiveMarketplaces();
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Workflow steps: 'upload' -> 'mapping' -> 'preview' -> 'completed'
   const [step, setStep] = useState<'upload' | 'mapping' | 'preview' | 'completed'>('upload');
-  const [selectedMarketplace, setSelectedMarketplace] = useState<MarketplaceId>('noon');
+  const [selectedMarketplace, setSelectedMarketplace] = useState<MarketplaceId>(
+    () => storageService.getActiveMarketplaces()[0]?.id || ''
+  );
   const [isDragging, setIsDragging] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
   // Analysis result state
   const [uploadedFileName, setUploadedFileName] = useState('');
@@ -71,10 +76,19 @@ export const SmartImportPage: React.FC<SmartImportPageProps> = ({
     importedCount: number;
     historicalCount: number;
     duplicateCount: number;
+    rejectedCount?: number;
+    rejectedOrders?: Array<{ orderId: string; reason: string }>;
   } | null>(null);
 
   // 1. Handle File Upload
   const handleFileUpload = async (file: File) => {
+    if (!selectedMarketplace) {
+      showToast(
+        locale === 'ar' ? 'يرجى تفعيل قناة بيع واحدة على الأقل قبل استيراد الطلبات.' : 'Please enable at least one sales channel first.',
+        'warning'
+      );
+      return;
+    }
     const validExtensions = ['.xlsx', '.xls', '.csv'];
     const hasValidExt = validExtensions.some((ext) => file.name.toLowerCase().endsWith(ext));
 
@@ -172,64 +186,69 @@ export const SmartImportPage: React.FC<SmartImportPageProps> = ({
 
   // 4. Confirm and Execute Import
   const handleConfirmImport = () => {
-    if (!previewResult) return;
+    if (!previewResult || isSubmitting) return;
+    setIsSubmitting(true);
 
-    // Build Order models to import
-    const ordersToSave: Order[] = previewResult.orders
-      .filter((grp) => !grp.isDuplicate)
-      .map((grp) => {
-        const orderItems: OrderItem[] = grp.items.map((it) => ({
-          productId: it.productId,
-          productSku: it.sku,
-          productName: it.productName,
-          imageUrl: it.imageUrl,
-          unitPrice: it.unitPrice,
-          quantity: it.quantity,
-        }));
+    try {
+      // Build Order models to import
+      const ordersToSave: Order[] = previewResult.orders
+        .filter((grp) => !grp.isDuplicate)
+        .map((grp) => {
+          const orderItems: OrderItem[] = grp.items.map((it) => ({
+            productId: it.productId,
+            productSku: it.sku,
+            productName: it.productName,
+            imageUrl: it.imageUrl,
+            unitPrice: it.unitPrice,
+            quantity: it.quantity,
+          }));
 
-        const isDelivered = grp.normalizedStatus === 'delivered';
+          const isDelivered = grp.normalizedStatus === 'delivered';
 
-        return {
-          id: grp.orderId,
-          marketplaceId: grp.marketplaceId,
-          items: orderItems,
-          totalAmount: grp.totalAmount,
-          status: grp.normalizedStatus,
-          customerName: grp.customerName,
-          orderDate: grp.orderDate,
-          deliveredDate: isDelivered ? grp.orderDate : undefined,
-          stockDeducted: true,
-          deliveredProcessed: isDelivered,
-          isClosed: isDelivered,
-          closedReason: isDelivered ? 'delivered' : undefined,
-          closedAt: isDelivered ? grp.orderDate : undefined,
-          notes: `تم الاستيراد عبر ميزة الاستيراد الذكي (${uploadedFileName})`,
-          createdAt: grp.orderDate || new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-        };
-      });
+          return {
+            id: grp.orderId,
+            marketplaceId: grp.marketplaceId,
+            items: orderItems,
+            totalAmount: grp.totalAmount,
+            status: grp.normalizedStatus,
+            customerName: grp.customerName,
+            orderDate: grp.orderDate,
+            deliveredDate: isDelivered ? grp.orderDate : undefined,
+            stockDeducted: true,
+            deliveredProcessed: isDelivered,
+            isClosed: isDelivered,
+            closedReason: isDelivered ? 'delivered' : undefined,
+            closedAt: isDelivered ? grp.orderDate : undefined,
+            notes: `تم الاستيراد عبر ميزة الاستيراد الذكي (${uploadedFileName})`,
+            createdAt: grp.orderDate || new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          };
+        });
 
-    const res = storageService.saveSmartImportOrders(
-      ordersToSave,
-      deductHistoricalStock,
-      uploadedFileName,
-      settings.sellerName
-    );
+      const res = storageService.saveSmartImportOrders(
+        ordersToSave,
+        deductHistoricalStock,
+        uploadedFileName,
+        settings.sellerName
+      );
 
-    if (!res.success) {
-      showToast(res.error || (locale === 'ar' ? 'تعذر حفظ الطلبات المستوردة.' : 'Failed to save imported orders.'), 'error');
-      return;
+      if (!res.success) {
+        showToast(res.error || (locale === 'ar' ? 'تعذر حفظ الطلبات المستوردة.' : 'Failed to save imported orders.'), 'error');
+        return;
+      }
+
+      setImportSummary(res);
+      setStep('completed');
+      onOrdersImported?.();
+      showToast(
+        locale === 'ar'
+          ? `تم استيراد ${res.importedCount} طلب نشط و ${res.historicalCount} طلب تاريخي${(res.rejectedCount || 0) > 0 ? ` (مع رفض ${res.rejectedCount} لنقص المخزون)` : ''}.`
+          : `Imported ${res.importedCount} active and ${res.historicalCount} historical orders${(res.rejectedCount || 0) > 0 ? ` (${res.rejectedCount} rejected due to stock)` : ''}.`,
+        (res.rejectedCount || 0) > 0 ? 'warning' : 'success'
+      );
+    } finally {
+      setIsSubmitting(false);
     }
-
-    setImportSummary(res);
-    setStep('completed');
-    onOrdersImported?.();
-    showToast(
-      locale === 'ar'
-        ? `تم استيراد ${res.importedCount} طلب نشط و ${res.historicalCount} طلب تاريخي بنجاح.`
-        : `Successfully imported ${res.importedCount} active and ${res.historicalCount} historical orders.`,
-      'success'
-    );
   };
 
   // Filter preview orders by tab
@@ -245,94 +264,88 @@ export const SmartImportPage: React.FC<SmartImportPageProps> = ({
 
   return (
     <div className="space-y-6">
-      {/* Feature Header Strip */}
-      <div className="bg-gradient-to-r from-blue-900 to-indigo-900 rounded-2xl p-6 text-white shadow-sm flex flex-wrap items-center justify-between gap-4">
+      {/* Feature Header Strip (Clean Light SaaS Surface) */}
+      <div className="bg-white rounded-2xl p-5 border border-[#E8ECF2] shadow-xs flex flex-wrap items-center justify-between gap-4">
         <div>
-          <div className="flex items-center gap-2 mb-1.5">
-            <span className="px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-amber-400 text-amber-950 uppercase tracking-wider">
-              {locale === 'ar' ? 'تجريبي - Beta' : 'Beta Feature'}
+          <div className="flex items-center gap-2 mb-1">
+            <span className="px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-blue-50 text-[#2563EB] border border-blue-200">
+              {locale === 'ar' ? 'استيراد متعدد القنوات' : 'Multi-Channel Import'}
             </span>
-            <Sparkles className="w-4 h-4 text-amber-300" />
-            <h2 className="text-lg font-bold">
+            <h2 className="text-base font-bold text-[#172033]">
               {locale === 'ar' ? 'الاستيراد الذكي للطلبات' : 'Smart Orders Import'}
             </h2>
           </div>
-          <p className="text-xs text-blue-100 max-w-2xl leading-relaxed">
+          <p className="text-xs text-[#64748B] max-w-2xl leading-relaxed">
             {locale === 'ar'
-              ? 'استيراد تقارير الطلبات المحملة يدوياً من نون سيلر لاب (Noon Seller Lab) وأمازون سيلر سنترال (Amazon Seller Central) مع التعرف الذكي على الأعمدة وتجميع البنود المتعددة ومنع التكرار نهائياً دون الحاجة لربط API.'
-              : 'Directly import orders reports downloaded from Noon Seller Lab and Amazon Seller Central with intelligent column mapping, multi-item consolidation, and duplicate prevention without requiring APIs.'}
+              ? 'استيراد تقارير الطلبات المحملة يدوياً من قنوات البيع النشطة مع التعرف الذكي على الأعمدة وتجميع البنود المتعددة ومنع التكرار نهائياً.'
+              : 'Import order reports downloaded from your active sales channels with automatic column detection, multi-item grouping, and duplicate prevention.'}
           </p>
         </div>
 
         {/* Step Indicator */}
-        <div className="flex items-center gap-2 text-xs font-semibold bg-white/10 px-3.5 py-1.5 rounded-xl backdrop-blur-xs">
-          <span className={step === 'upload' ? 'text-amber-300 underline' : 'text-blue-200'}>
+        <div className="flex items-center gap-2 text-xs font-semibold bg-[#F7F8FA] border border-[#E8ECF2] px-3.5 py-1.5 rounded-xl">
+          <span className={step === 'upload' ? 'text-[#2563EB] font-bold' : 'text-[#64748B]'}>
             1. {locale === 'ar' ? 'الرفع' : 'Upload'}
           </span>
-          <span className="text-blue-300">→</span>
-          <span className={step === 'mapping' ? 'text-amber-300 underline' : 'text-blue-200'}>
+          <span className="text-slate-300">→</span>
+          <span className={step === 'mapping' ? 'text-[#2563EB] font-bold' : 'text-[#64748B]'}>
             2. {locale === 'ar' ? 'المطابقة' : 'Mapping'}
           </span>
-          <span className="text-blue-300">→</span>
-          <span className={step === 'preview' ? 'text-amber-300 underline' : 'text-blue-200'}>
+          <span className="text-slate-300">→</span>
+          <span className={step === 'preview' ? 'text-[#2563EB] font-bold' : 'text-[#64748B]'}>
             3. {locale === 'ar' ? 'المعاينة' : 'Preview'}
           </span>
         </div>
       </div>
 
-      {/* STEP 1: Upload & Platform Selection */}
+      {/* STEP 1: Upload & Dynamic Platform Selection */}
       {step === 'upload' && (
         <div className="space-y-4">
           <div className="bg-white p-5 rounded-xl border border-[#E8ECF2] shadow-xs space-y-4">
-            <h3 className="text-xs font-bold text-[#172033] uppercase tracking-wider">
-              {locale === 'ar' ? '1. اختر منصة التقرير المُحمّل' : '1. Select Source Marketplace'}
+            <h3 className="text-xs font-bold text-[#172033]">
+              {locale === 'ar' ? '1. اختر قناة البيع مصدر التقرير المُحمّل' : '1. Select Source Marketplace'}
             </h3>
 
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-w-lg">
-              <button
-                type="button"
-                onClick={() => setSelectedMarketplace('noon')}
-                className={`p-3.5 rounded-xl border-2 flex items-center gap-3 transition-all cursor-pointer text-start ${
-                  selectedMarketplace === 'noon'
-                    ? 'border-[#2563EB] bg-blue-50/40 text-[#172033]'
-                    : 'border-[#E8ECF2] hover:border-slate-300 bg-white text-[#64748B]'
-                }`}
-              >
-                <div className="w-10 h-10 rounded-lg bg-[#FEEC00] flex items-center justify-center font-bold text-[#854D0E] text-xs shrink-0">
-                  noon
-                </div>
-                <div>
-                  <div className="font-bold text-xs text-[#172033]">
-                    {locale === 'ar' ? 'تقرير طلبات نون (Noon)' : 'Noon Orders Report'}
-                  </div>
-                  <div className="text-[11px] text-[#64748B]">
-                    {locale === 'ar' ? 'ملفات Seller Lab (Excel / CSV)' : 'Seller Lab Orders (XLSX / CSV)'}
-                  </div>
-                </div>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => setSelectedMarketplace('amazon')}
-                className={`p-3.5 rounded-xl border-2 flex items-center gap-3 transition-all cursor-pointer text-start ${
-                  selectedMarketplace === 'amazon'
-                    ? 'border-[#2563EB] bg-blue-50/40 text-[#172033]'
-                    : 'border-[#E8ECF2] hover:border-slate-300 bg-white text-[#64748B]'
-                }`}
-              >
-                <div className="w-10 h-10 rounded-lg bg-[#FF9900] flex items-center justify-center font-bold text-white text-xs shrink-0">
-                  amz
-                </div>
-                <div>
-                  <div className="font-bold text-xs text-[#172033]">
-                    {locale === 'ar' ? 'تقرير طلبات أمازون (Amazon)' : 'Amazon Orders Report'}
-                  </div>
-                  <div className="text-[11px] text-[#64748B]">
-                    {locale === 'ar' ? 'ملفات Seller Central (XLSX / CSV)' : 'Seller Central Orders (XLSX / CSV)'}
-                  </div>
-                </div>
-              </button>
-            </div>
+            {activeMarketplaces.length === 0 ? (
+              <div className="p-4 rounded-xl bg-amber-50 border border-amber-200 text-xs text-amber-900">
+                {locale === 'ar'
+                  ? 'لا توجد قنوات بيع نشطة حالياً. يرجى تفعيل قناة واحدة على الأقل من الإعدادات قبل استيراد الطلبات.'
+                  : 'No active marketplaces configured. Enable at least one marketplace in Settings before importing orders.'}
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                {activeMarketplaces.map((mkt) => (
+                  <button
+                    key={mkt.id}
+                    type="button"
+                    onClick={() => setSelectedMarketplace(mkt.id)}
+                    className={`p-3.5 rounded-xl border-2 flex items-center gap-3 transition-all cursor-pointer text-start ${
+                      selectedMarketplace === mkt.id
+                        ? 'border-[#2563EB] bg-blue-50/40 text-[#172033]'
+                        : 'border-[#E8ECF2] hover:border-slate-300 bg-white text-[#64748B]'
+                    }`}
+                  >
+                    <div
+                      className="w-10 h-10 rounded-lg flex items-center justify-center font-bold text-xs shrink-0 border border-[#E8ECF2]"
+                      style={{
+                        backgroundColor: mkt.badgeBg || '#F1F5F9',
+                        color: mkt.badgeText || '#475569',
+                      }}
+                    >
+                      {mkt.id.slice(0, 4).toUpperCase()}
+                    </div>
+                    <div className="min-w-0">
+                      <div className="font-bold text-xs text-[#172033] truncate">
+                        {locale === 'ar' ? `تقرير طلبات ${mkt.nameAr}` : `${mkt.nameEn} Orders Report`}
+                      </div>
+                      <div className="text-[11px] text-[#64748B]">
+                        {locale === 'ar' ? 'ملفات Excel / CSV' : 'Excel / CSV Orders'}
+                      </div>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
 
           {/* Upload Dropzone */}
@@ -340,11 +353,13 @@ export const SmartImportPage: React.FC<SmartImportPageProps> = ({
             onDragOver={handleDragOver}
             onDragLeave={handleDragLeave}
             onDrop={handleDrop}
-            onClick={() => fileInputRef.current?.click()}
-            className={`bg-white rounded-xl border-2 border-dashed p-10 text-center cursor-pointer transition-all ${
-              isDragging
-                ? 'border-[#2563EB] bg-blue-50/40'
-                : 'border-[#E8ECF2] hover:border-slate-400 hover:bg-[#F7F8FA]/60'
+            onClick={() => activeMarketplaces.length > 0 && fileInputRef.current?.click()}
+            className={`bg-white rounded-xl border-2 border-dashed p-10 text-center transition-all ${
+              activeMarketplaces.length === 0
+                ? 'border-[#E8ECF2] opacity-60 cursor-not-allowed'
+                : isDragging
+                ? 'border-[#2563EB] bg-blue-50/40 cursor-pointer'
+                : 'border-[#E8ECF2] hover:border-slate-400 hover:bg-[#F7F8FA]/60 cursor-pointer'
             }`}
           >
             <input
@@ -370,7 +385,7 @@ export const SmartImportPage: React.FC<SmartImportPageProps> = ({
             <h3 className="text-sm font-bold text-[#172033] mb-1">
               {isAnalyzing
                 ? locale === 'ar' ? 'جاري فحص التقرير والتعرف على الأعمدة...' : 'Analyzing report structure...'
-                : locale === 'ar' ? 'اسحب تقرير طلبات نون أو أمازون وأفلته هنا' : 'Drag & drop your Noon or Amazon orders file'}
+                : locale === 'ar' ? 'اسحب ملف تقرير الطلبات وأفلته هنا' : 'Drag & drop your marketplace orders file'}
             </h3>
             <p className="text-xs text-[#64748B]">
               {locale === 'ar' ? 'يدعم ملفات Excel (.xlsx, .xls) أو ملفات (.csv)' : 'Supports .xlsx, .xls, and .csv files'}
@@ -680,7 +695,7 @@ export const SmartImportPage: React.FC<SmartImportPageProps> = ({
                         <div className="flex items-center gap-2">
                           {firstItem && (
                             <img
-                              src={firstItem.imageUrl}
+                              src={resolveSafeProductImage(firstItem.imageUrl, firstItem.productName)}
                               alt={firstItem.productName}
                               referrerPolicy="no-referrer"
                               className="w-7 h-7 rounded object-cover border border-[#E8ECF2]"
@@ -755,8 +770,9 @@ export const SmartImportPage: React.FC<SmartImportPageProps> = ({
             </button>
 
             <button
+              disabled={isSubmitting}
               onClick={handleConfirmImport}
-              className="px-5 py-2 text-xs font-semibold text-white bg-[#2563EB] hover:bg-blue-700 rounded-lg transition-colors shadow-sm cursor-pointer"
+              className="px-5 py-2 text-xs font-semibold text-white bg-[#2563EB] hover:bg-blue-700 disabled:opacity-50 rounded-lg transition-colors shadow-sm cursor-pointer whitespace-nowrap shrink-0"
             >
               {locale === 'ar'
                 ? `تأكيد واعتماد استيراد ${previewResult.newOrdersCount + previewResult.historicalOrdersCount} طلب`
@@ -779,12 +795,12 @@ export const SmartImportPage: React.FC<SmartImportPageProps> = ({
             </h3>
             <p className="text-xs text-[#64748B] mt-1">
               {locale === 'ar'
-                ? `تم بنجاح تحديث بيانات منصة (${selectedMarketplace.toUpperCase()}) وتحديث حركات المخزون بدقة تامة.`
-                : `Successfully updated ${selectedMarketplace.toUpperCase()} orders and accurately synced inventory.`}
+                ? `تم تحديث طلبات (${activeMarketplaces.find((m) => m.id === selectedMarketplace)?.nameAr || selectedMarketplace}) ومزامنة المخزون الفعلي.`
+                : `Updated ${activeMarketplaces.find((m) => m.id === selectedMarketplace)?.nameEn || selectedMarketplace} orders and synced inventory.`}
             </p>
           </div>
 
-          <div className="grid grid-cols-3 max-w-lg mx-auto gap-3 text-start">
+          <div className="grid grid-cols-2 sm:grid-cols-4 max-w-2xl mx-auto gap-3 text-start">
             <div className="p-3 bg-emerald-50/60 rounded-xl border border-emerald-200">
               <span className="text-[11px] text-[#16A36A] block mb-0.5">
                 {locale === 'ar' ? 'طلبات نشطة جديدة' : 'New Active Orders'}
@@ -811,7 +827,37 @@ export const SmartImportPage: React.FC<SmartImportPageProps> = ({
                 {importSummary.duplicateCount}
               </span>
             </div>
+
+            <div className="p-3 bg-rose-50/60 rounded-xl border border-rose-200">
+              <span className="text-[11px] text-[#DC5555] block mb-0.5">
+                {locale === 'ar' ? 'مرفوضة لنقص المخزون' : 'Rejected (Stock)'}
+              </span>
+              <span className="text-xl font-bold text-[#DC5555] tabular-nums">
+                {importSummary.rejectedCount || 0}
+              </span>
+            </div>
           </div>
+
+          {importSummary.rejectedOrders && importSummary.rejectedOrders.length > 0 && (
+            <div className="max-w-2xl mx-auto text-start bg-rose-50/50 border border-rose-200 rounded-xl p-4 space-y-2">
+              <div className="flex items-center gap-2 text-xs font-bold text-[#DC5555]">
+                <AlertTriangle className="w-4 h-4 shrink-0" />
+                <span>
+                  {locale === 'ar'
+                    ? 'تفاصيل الطلبات النشطة المرفوضة (لم تُخصم ولم تُسجل لعدم توفر رصيد كافٍ):'
+                    : 'Rejected Active Orders (blocked due to insufficient sellable stock):'}
+                </span>
+              </div>
+              <ul className="space-y-1 text-[11px] text-[#172033] max-h-40 overflow-y-auto">
+                {importSummary.rejectedOrders.map((rej) => (
+                  <li key={rej.orderId} className="font-mono-code">
+                    <strong className="text-[#DC5555]">{rej.orderId}:</strong>{' '}
+                    <span className="font-sans">{rej.reason}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
 
           <div className="flex flex-wrap items-center justify-center gap-3 pt-2">
             <button

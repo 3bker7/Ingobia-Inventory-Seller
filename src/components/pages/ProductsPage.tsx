@@ -23,7 +23,8 @@ import {
 } from 'lucide-react';
 import { Product, MarketplaceId } from '../../types';
 import { storageService } from '../../services/storage';
-import { computeEditedAvailableStock } from '../../domain/inventoryCustody';
+import { computeEditedAvailableStock, getTotalPlatformAllocatedStock } from '../../domain/inventoryCustody';
+import { resolveSafeProductImage } from '../../utils/productVisual';
 import { translations, Locale } from '../../locales/translations';
 import { Modal } from '../common/Modal';
 import { ConfirmDialog } from '../common/ConfirmDialog';
@@ -33,17 +34,22 @@ interface ProductsPageProps {
   locale: Locale;
   isAddModalOpenInitially?: boolean;
   onCloseInitialAddModal?: () => void;
+  onDataChange?: () => void;
 }
 
 export const ProductsPage: React.FC<ProductsPageProps> = ({
   locale,
   isAddModalOpenInitially = false,
   onCloseInitialAddModal,
+  onDataChange,
 }) => {
   const t = translations[locale];
   const { showToast } = useToast();
   const settings = storageService.getSettings();
   const isRtl = locale === 'ar';
+
+  const activeMarketplaces = storageService.getActiveMarketplaces();
+  const allMarketplaces = storageService.getAllMarketplaces();
 
   const [products, setProducts] = useState<Product[]>(() => storageService.getProducts());
   const [searchQuery, setSearchQuery] = useState('');
@@ -52,6 +58,7 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({
   const [viewMode, setViewMode] = useState<'storefront' | 'table'>('storefront');
   const [sortField, setSortField] = useState<'name' | 'physicalStock' | 'price' | 'sku'>('name');
   const [sortAsc, setSortAsc] = useState(true);
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
   // Modals state
   const [isAddModalOpen, setIsAddModalOpen] = useState(isAddModalOpenInitially);
@@ -67,13 +74,17 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({
   const [formBaseCost, setFormBaseCost] = useState<number>(0);
   const [formImageUrl, setFormImageUrl] = useState('');
   const [formPhysicalStock, setFormPhysicalStock] = useState<number>(10);
-  const [formNoonPrice, setFormNoonPrice] = useState<number>(100);
-  const [formNoonQty, setFormNoonQty] = useState<number>(5);
-  const [formAmzPrice, setFormAmzPrice] = useState<number>(105);
-  const [formAmzQty, setFormAmzQty] = useState<number>(5);
+  const [formMarketplacePrices, setFormMarketplacePrices] = useState<Record<string, number>>(() => {
+    const initial: Record<string, number> = {};
+    storageService.getActiveMarketplaces().forEach((m) => {
+      initial[m.id] = 100;
+    });
+    return initial;
+  });
 
   const refreshProducts = () => {
     setProducts(storageService.getProducts());
+    onDataChange?.();
   };
 
   // Distinct categories
@@ -136,37 +147,36 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({
     setFormSku(`SKU-${Math.floor(1000 + Math.random() * 9000)}`);
     setFormCategory('Electronics');
     setFormBaseCost(50);
-    setFormImageUrl(
-      'https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=600&auto=format&fit=crop&q=80'
-    );
+    setFormImageUrl('');
     setFormPhysicalStock(20);
-    setFormNoonPrice(100);
-    setFormNoonQty(10);
-    setFormAmzPrice(105);
-    setFormAmzQty(10);
+    const prices: Record<string, number> = {};
+    activeMarketplaces.forEach((m) => {
+      prices[m.id] = 100;
+    });
+    setFormMarketplacePrices(prices);
     setIsAddModalOpen(true);
   };
 
   const handleOpenEdit = (p: Product) => {
-    const noonListing = p.marketplaceListings.noon;
-    const amzListing = p.marketplaceListings.amazon;
-
     setFormName(p.name);
     setFormNameAr(p.nameAr || '');
     setFormSku(p.sku || '');
     setFormCategory(p.category || 'General');
     setFormBaseCost(p.baseCost || 0);
-    setFormImageUrl(p.imageUrl);
+    setFormImageUrl(p.imageUrl && !p.imageUrl.startsWith('data:image/svg+xml') ? p.imageUrl : '');
     setFormPhysicalStock(p.physicalStock);
-    setFormNoonPrice(noonListing ? noonListing.price : p.currentPrice);
-    setFormNoonQty(noonListing ? noonListing.quantity : 0);
-    setFormAmzPrice(amzListing ? amzListing.price : p.currentPrice);
-    setFormAmzQty(amzListing ? amzListing.quantity : 0);
+    const prices: Record<string, number> = {};
+    activeMarketplaces.forEach((m) => {
+      prices[m.id] = p.marketplaceListings[m.id]?.price ?? p.currentPrice ?? 0;
+    });
+    setFormMarketplacePrices(prices);
     setEditingProduct(p);
   };
 
   const handleSaveProduct = (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSubmitting) return;
+
     if (!formName.trim()) {
       showToast(isRtl ? 'يرجى إدخال اسم المنتج.' : 'Product name is required.', 'warning');
       return;
@@ -188,145 +198,162 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({
       availableStock = custodyCheck.newAvailable;
     }
 
-    const nowIso = new Date().toISOString();
-    const listings: Product['marketplaceListings'] = {
-      ...(editingProduct?.marketplaceListings || {}),
-      noon: {
-        marketplaceId: 'noon',
-        price: Number(formNoonPrice) || 0,
-        quantity: Math.max(0, Number(formNoonQty) || 0),
-        listingStatus: Number(formNoonQty) > 0 ? 'active' : 'out_of_stock',
-        lastUpdated: nowIso,
-      },
-      amazon: {
-        marketplaceId: 'amazon',
-        price: Number(formAmzPrice) || 0,
-        quantity: Math.max(0, Number(formAmzQty) || 0),
-        listingStatus: Number(formAmzQty) > 0 ? 'active' : 'out_of_stock',
-        lastUpdated: nowIso,
-      },
-    };
-
-    if (editingProduct) {
-      if (editingProduct.marketplaceListings.noon?.price !== Number(formNoonPrice)) {
-        const priceRes = storageService.updateProductPriceWithResult(
-          editingProduct.id,
-          'noon',
-          Number(formNoonPrice),
-          'تعديل سعر نون في نموذج المنتج',
-          settings.sellerName
-        );
-        if (!priceRes.success) {
-          showToast(priceRes.error || t.toasts.error, 'error');
-          return;
-        }
-      }
-      if (editingProduct.marketplaceListings.amazon?.price !== Number(formAmzPrice)) {
-        const priceRes = storageService.updateProductPriceWithResult(
-          editingProduct.id,
-          'amazon',
-          Number(formAmzPrice),
-          'تعديل سعر أمازون في نموذج المنتج',
-          settings.sellerName
-        );
-        if (!priceRes.success) {
-          showToast(priceRes.error || t.toasts.error, 'error');
-          return;
-        }
-      }
-
-      const physicalDiff = targetPhysical - editingProduct.physicalStock;
-      const updated: Product = {
-        ...editingProduct,
-        name: formName.trim(),
-        nameAr: formNameAr.trim() || undefined,
-        sku: formSku.trim() || editingProduct.sku,
-        category: formCategory.trim() || editingProduct.category,
-        baseCost: Number(formBaseCost) || undefined,
-        imageUrl: formImageUrl.trim(),
-        physicalStock: targetPhysical,
-        availableStock,
-        marketplaceListings: listings,
+    setIsSubmitting(true);
+    try {
+      const nowIso = new Date().toISOString();
+      const safeImage = resolveSafeProductImage(formImageUrl, formName.trim(), formCategory.trim());
+      const listings: Product['marketplaceListings'] = {
+        ...(editingProduct?.marketplaceListings || {}),
       };
 
-      const saveRes = storageService.saveProduct(updated);
-      if (!saveRes.success) {
-        showToast(saveRes.error || t.toasts.error, 'error');
-        return;
-      }
+      activeMarketplaces.forEach((mkt) => {
+        const priceVal = Math.max(0, Number(formMarketplacePrices[mkt.id]) || 0);
+        const existingListing = listings[mkt.id];
+        const allocatedAvail = editingProduct?.platformAllocations?.[mkt.id]?.availableQty;
+        const nextQty = typeof allocatedAvail === 'number'
+          ? allocatedAvail
+          : existingListing?.quantity ?? 0;
 
-      if (physicalDiff !== 0) {
-        const movRes = storageService.recordStockMovements([
-          {
-            id: `mov-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
-            productId: updated.id,
-            productSku: updated.sku || updated.name,
-            productName: updated.name,
-            type: 'manual_adjustment',
-            quantityChange: physicalDiff,
-            previousPhysical: editingProduct.physicalStock,
-            newPhysical: updated.physicalStock,
-            previousAvailable: editingProduct.availableStock,
-            newAvailable: updated.availableStock,
-            reason: 'تعديل رصيد المخزون من بطاقة المنتج',
-            operator: settings.sellerName,
-            timestamp: nowIso,
-          },
-        ]);
-        if (!movRes.success) {
-          showToast(movRes.error || t.toasts.error, 'error');
+        listings[mkt.id] = {
+          marketplaceId: mkt.id,
+          price: priceVal,
+          quantity: nextQty,
+          listingStatus: availableStock > 0 ? 'active' : 'out_of_stock',
+          lastUpdated: nowIso,
+        };
+      });
+
+      const activePrices = activeMarketplaces
+        .map((m) => Number(formMarketplacePrices[m.id]) || 0)
+        .filter((v) => v > 0);
+      const fallbackPrice = activePrices[0] ?? editingProduct?.currentPrice ?? 0;
+
+      if (editingProduct) {
+        for (const mkt of activeMarketplaces) {
+          const nextPrice = Math.max(0, Number(formMarketplacePrices[mkt.id]) || 0);
+          const prevPrice = editingProduct.marketplaceListings[mkt.id]?.price;
+          if (prevPrice !== undefined && prevPrice !== nextPrice) {
+            const priceRes = storageService.updateProductPriceWithResult(
+              editingProduct.id,
+              mkt.id,
+              nextPrice,
+              `تعديل سعر ${mkt.nameAr} في نموذج المنتج`,
+              settings.sellerName
+            );
+            if (!priceRes.success) {
+              showToast(priceRes.error || t.toasts.error, 'error');
+              return;
+            }
+          }
+        }
+
+        const physicalDiff = targetPhysical - editingProduct.physicalStock;
+        const updated: Product = {
+          ...editingProduct,
+          name: formName.trim(),
+          nameAr: formNameAr.trim() || undefined,
+          sku: formSku.trim() || editingProduct.sku,
+          category: formCategory.trim() || editingProduct.category,
+          baseCost: Number(formBaseCost) || undefined,
+          imageUrl: safeImage,
+          currentPrice: fallbackPrice,
+          physicalStock: targetPhysical,
+          availableStock,
+          marketplaceListings: listings,
+        };
+
+        const saveRes = storageService.saveProduct(updated);
+        if (!saveRes.success) {
+          showToast(saveRes.error || t.toasts.error, 'error');
           return;
         }
+
+        if (physicalDiff !== 0) {
+          const movRes = storageService.recordStockMovements([
+            {
+              id: `mov-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+              productId: updated.id,
+              productSku: updated.sku || updated.name,
+              productName: updated.name,
+              source: physicalDiff > 0 ? 'external' : 'central_available',
+              destination: physicalDiff > 0 ? 'central_available' : 'external',
+              type: 'manual_adjustment',
+              quantityChange: physicalDiff,
+              previousPhysical: editingProduct.physicalStock,
+              newPhysical: updated.physicalStock,
+              previousAvailable: editingProduct.availableStock,
+              newAvailable: updated.availableStock,
+              reason: 'تعديل رصيد المخزون من بطاقة المنتج',
+              operator: settings.sellerName,
+              timestamp: nowIso,
+            },
+          ]);
+          if (!movRes.success) {
+            showToast(movRes.error || t.toasts.error, 'error');
+            return;
+          }
+        }
+
+        showToast(t.toasts.productUpdated, 'success');
+        setEditingProduct(null);
+      } else {
+        const newSku = formSku.trim() || `SKU-${Math.floor(1000 + Math.random() * 9000)}`;
+        const newProd: Product = {
+          id: `prod-${Date.now()}`,
+          sku: newSku,
+          name: formName.trim(),
+          nameAr: formNameAr.trim() || undefined,
+          category: formCategory.trim() || 'General',
+          baseCost: Number(formBaseCost) || undefined,
+          imageUrl: safeImage,
+          currentPrice: fallbackPrice,
+          physicalStock: targetPhysical,
+          availableStock: targetPhysical,
+          centralAvailableStock: targetPhysical,
+          centralReservedStock: 0,
+          reservedStock: 0,
+          platformAllocations: {},
+          awaitingInspectionStock: 0,
+          damagedStock: 0,
+          rejectedResaleStock: 0,
+          outboundInTransitStock: 0,
+          returnInTransitStock: 0,
+          marketplaceListings: listings,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+        };
+
+        const saveRes = storageService.saveProduct(newProd);
+        if (!saveRes.success) {
+          showToast(saveRes.error || t.toasts.error, 'error');
+          return;
+        }
+        showToast(t.toasts.productAdded, 'success');
+        setIsAddModalOpen(false);
+        if (onCloseInitialAddModal) onCloseInitialAddModal();
       }
 
-      showToast(t.toasts.productUpdated, 'success');
-      setEditingProduct(null);
-    } else {
-      const newSku = formSku.trim() || `SKU-${Math.floor(1000 + Math.random() * 9000)}`;
-      const newProd: Product = {
-        id: `prod-${Date.now()}`,
-        sku: newSku,
-        name: formName.trim(),
-        nameAr: formNameAr.trim() || undefined,
-        category: formCategory.trim() || 'General',
-        baseCost: Number(formBaseCost) || undefined,
-        imageUrl: formImageUrl.trim(),
-        currentPrice: Number(formNoonPrice) || Number(formAmzPrice) || 100,
-        physicalStock: Number(formPhysicalStock),
-        availableStock: Number(formPhysicalStock),
-        reservedStock: 0,
-        awaitingInspectionStock: 0,
-        damagedStock: 0,
-        outboundInTransitStock: 0,
-        returnInTransitStock: 0,
-        marketplaceListings: listings,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      };
-
-      const saveRes = storageService.saveProduct(newProd);
-      if (!saveRes.success) {
-        showToast(saveRes.error || t.toasts.error, 'error');
-        return;
-      }
-      showToast(t.toasts.productAdded, 'success');
-      setIsAddModalOpen(false);
-      if (onCloseInitialAddModal) onCloseInitialAddModal();
+      refreshProducts();
+    } finally {
+      setIsSubmitting(false);
     }
-
-    refreshProducts();
   };
 
   const handleDeleteConfirm = () => {
-    if (!productToDelete) return;
-    const delRes = storageService.deleteProduct(productToDelete.id);
-    if (!delRes.success) {
-      showToast(delRes.error || t.toasts.error, 'error');
-      return;
+    if (!productToDelete || isSubmitting) return;
+    setIsSubmitting(true);
+    try {
+      const delRes = storageService.deleteProduct(productToDelete.id);
+      if (!delRes.success) {
+        showToast(delRes.error || t.toasts.error, 'error');
+        return;
+      }
+      showToast(t.toasts.productDeleted, 'success');
+      setProductToDelete(null);
+      refreshProducts();
+    } finally {
+      setIsSubmitting(false);
     }
-    showToast(t.toasts.productDeleted, 'success');
-    setProductToDelete(null);
-    refreshProducts();
   };
 
   return (
@@ -438,7 +465,7 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({
                   {/* Product Image Frame */}
                   <div className="relative aspect-4/3 bg-slate-50 overflow-hidden border-b border-[#E8ECF2]">
                     <img
-                      src={p.imageUrl}
+                      src={resolveSafeProductImage(p.imageUrl, p.name, p.category)}
                       alt={p.name}
                       referrerPolicy="no-referrer"
                       className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
@@ -474,9 +501,12 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({
                     <div className="space-y-1">
                       <div className="flex items-center justify-between text-[10px] text-[#64748B] font-mono-code">
                         <span>SKU: {p.sku || 'N/A'}</span>
-                        <div className="flex items-center gap-1 text-amber-500 font-sans">
-                          <Star className="w-3 h-3 fill-amber-400 text-amber-400" />
-                          <span>4.8</span>
+                        <div className="flex items-center gap-1 text-[#64748B] font-sans">
+                          <span>
+                            {isRtl
+                              ? `مركزي ${p.centralAvailableStock ?? p.availableStock} / مخصص ${getTotalPlatformAllocatedStock(p)}`
+                              : `Central ${p.centralAvailableStock ?? p.availableStock} / Alloc ${getTotalPlatformAllocatedStock(p)}`}
+                          </span>
                         </div>
                       </div>
 
@@ -492,7 +522,7 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({
                           <span className="text-[10px] text-[#64748B] block">
                             {isRtl ? 'سعر البيع المرجعي:' : 'Retail Price:'}
                           </span>
-                          <strong className="text-base font-bold text-[#172033] font-mono-code">
+                          <strong className="text-base font-bold text-[#172033] font-mono-code tabular-nums">
                             {p.currentPrice.toFixed(2)} {settings.currency}
                           </strong>
                         </div>
@@ -512,18 +542,20 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({
                       {/* Marketplace Badges */}
                       <div className="flex items-center gap-1.5 flex-wrap">
                         {Object.values(p.marketplaceListings || {}).map((listing) => {
-                          const mkt = settings.marketplaces.find((m) => m.id === listing.marketplaceId);
+                          const mkt = allMarketplaces.find((m) => m.id === listing.marketplaceId);
+                          const isDisabledMkt = mkt ? !mkt.isActive : true;
                           return (
                             <span
                               key={listing.marketplaceId}
                               className="px-2 py-0.5 rounded text-[10px] font-mono-code font-bold border"
                               style={{
-                                backgroundColor: mkt?.badgeBg || '#FEF9C3',
-                                color: mkt?.badgeText || '#854D0E',
-                                borderColor: '#E8ECF2',
+                                backgroundColor: isDisabledMkt ? '#F1F5F9' : mkt?.badgeBg || '#F1F5F9',
+                                color: isDisabledMkt ? '#475569' : mkt?.badgeText || '#475569',
+                                borderColor: '#E2E8F0',
                               }}
                             >
-                              {mkt ? (isRtl ? mkt.nameAr : mkt.nameEn) : listing.marketplaceId}: {listing.price} {settings.currency}
+                              {mkt ? (isRtl ? mkt.nameAr : mkt.nameEn) : listing.marketplaceId}
+                              {isDisabledMkt ? (isRtl ? ' [معطلة]' : ' [Disabled]') : ''}: {listing.price} {settings.currency}
                             </span>
                           );
                         })}
@@ -547,9 +579,13 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({
                   <th className="py-3.5 px-4 text-start">{t.products.productColumn}</th>
                   <th className="py-3.5 px-3 text-start">SKU</th>
                   <th className="py-3.5 px-3 text-start">{isRtl ? 'سعر التكلفة' : 'Base Cost'}</th>
-                  <th className="py-3.5 px-3 text-start">{isRtl ? 'سعر نون' : 'Noon Price'}</th>
-                  <th className="py-3.5 px-3 text-start">{isRtl ? 'سعر أمازون' : 'Amazon Price'}</th>
-                  <th className="py-3.5 px-3 text-center">{isRtl ? 'المتاح للبيع' : 'Available'}</th>
+                  {activeMarketplaces.map((mkt) => (
+                    <th key={mkt.id} className="py-3.5 px-3 text-start whitespace-nowrap">
+                      {isRtl ? `سعر ${mkt.nameAr}` : `${mkt.nameEn} Price`}
+                    </th>
+                  ))}
+                  <th className="py-3.5 px-3 text-center">{isRtl ? 'مركزي متاح' : 'Central Avail.'}</th>
+                  <th className="py-3.5 px-3 text-center">{isRtl ? 'مخصص للمنصات' : 'Allocated'}</th>
                   <th className="py-3.5 px-3 text-center">{isRtl ? 'المحجوز' : 'Reserved'}</th>
                   <th className="py-3.5 px-3 text-center">{isRtl ? 'في الطريق' : 'In Transit'}</th>
                   <th className="py-3.5 px-3 text-center">{isRtl ? 'المستودع الفعلي' : 'Warehouse Physical'}</th>
@@ -559,15 +595,14 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({
 
               <tbody className="divide-y divide-[#E8ECF2]">
                 {filteredProducts.map((p) => {
-                  const noon = p.marketplaceListings.noon;
-                  const amz = p.marketplaceListings.amazon;
+                  const totalAllocated = getTotalPlatformAllocatedStock(p);
 
                   return (
                     <tr key={p.id} className="hover:bg-[#F7F8FA]/70 transition-colors">
                       <td className="py-3.5 px-4">
                         <div className="flex items-center gap-2.5">
                           <img
-                            src={p.imageUrl}
+                            src={resolveSafeProductImage(p.imageUrl, p.name, p.category)}
                             alt={p.name}
                             referrerPolicy="no-referrer"
                             className="w-9 h-9 rounded-lg object-cover border border-[#E8ECF2] shrink-0"
@@ -585,31 +620,36 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({
                         {p.sku}
                       </td>
 
-                      <td className="py-3.5 px-3 font-mono-code text-[11px] text-[#64748B]">
+                      <td className="py-3.5 px-3 font-mono-code text-[11px] text-[#64748B] tabular-nums">
                         {p.baseCost ? `${p.baseCost} ${settings.currency}` : <span className="text-amber-700">{isRtl ? 'غير مسجل' : 'Missing'}</span>}
                       </td>
 
-                      <td className="py-3.5 px-3 font-mono-code text-[11px] font-semibold text-[#172033]">
-                        {noon ? `${noon.price} ${settings.currency}` : '-'}
+                      {activeMarketplaces.map((mkt) => {
+                        const listing = p.marketplaceListings[mkt.id];
+                        return (
+                          <td key={mkt.id} className="py-3.5 px-3 font-mono-code text-[11px] font-semibold text-[#172033] tabular-nums">
+                            {listing ? `${listing.price} ${settings.currency}` : '-'}
+                          </td>
+                        );
+                      })}
+
+                      <td className="py-3.5 px-3 text-center font-bold font-mono-code text-[#16A36A] tabular-nums">
+                        {p.centralAvailableStock ?? p.availableStock}
                       </td>
 
-                      <td className="py-3.5 px-3 font-mono-code text-[11px] font-semibold text-[#172033]">
-                        {amz ? `${amz.price} ${settings.currency}` : '-'}
+                      <td className="py-3.5 px-3 text-center font-mono-code text-[#2563EB] tabular-nums">
+                        {totalAllocated}
                       </td>
 
-                      <td className="py-3.5 px-3 text-center font-bold font-mono-code text-[#16A36A]">
-                        {p.availableStock}
-                      </td>
-
-                      <td className="py-3.5 px-3 text-center font-mono-code text-[#D99A27]">
+                      <td className="py-3.5 px-3 text-center font-mono-code text-[#D99A27] tabular-nums">
                         {p.reservedStock}
                       </td>
 
-                      <td className="py-3.5 px-3 text-center font-mono-code text-[#2563EB]">
+                      <td className="py-3.5 px-3 text-center font-mono-code text-[#2563EB] tabular-nums">
                         {(p.outboundInTransitStock || 0) + (p.returnInTransitStock || 0)}
                       </td>
 
-                      <td className="py-3.5 px-3 text-center font-bold font-mono-code text-[#172033]">
+                      <td className="py-3.5 px-3 text-center font-bold font-mono-code text-[#172033] tabular-nums">
                         {p.physicalStock}
                       </td>
 
@@ -665,7 +705,7 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({
               <div className="md:col-span-7 space-y-3">
                 <div className="aspect-4/3 rounded-2xl bg-slate-50 overflow-hidden border border-[#E8ECF2]">
                   <img
-                    src={previewProduct.imageUrl}
+                    src={resolveSafeProductImage(previewProduct.imageUrl, previewProduct.name, previewProduct.category)}
                     alt={previewProduct.name}
                     referrerPolicy="no-referrer"
                     className="w-full h-full object-cover"
@@ -687,14 +727,14 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({
                   </h3>
 
                   <div className="flex items-baseline gap-2 pt-1">
-                    <span className="text-xl font-black text-[#172033] font-mono-code">
+                    <span className="text-xl font-black text-[#172033] font-mono-code tabular-nums">
                       {previewProduct.currentPrice.toFixed(2)} {settings.currency}
                     </span>
                     <span className="text-xs text-emerald-700 font-bold">
                       {previewProduct.availableStock > 0
                         ? isRtl
-                          ? `متوفر فوراً (${previewProduct.availableStock} قطع)`
-                          : `In Stock (${previewProduct.availableStock})`
+                          ? `متوفر (${previewProduct.availableStock} قطعة: مركزي ${previewProduct.centralAvailableStock ?? previewProduct.availableStock})`
+                          : `In Stock (${previewProduct.availableStock} total / Central ${previewProduct.centralAvailableStock ?? previewProduct.availableStock})`
                         : isRtl
                         ? 'نافد حالياً'
                         : 'Out of Stock'}
@@ -707,14 +747,21 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({
                       {isRtl ? 'الأسعار والقوائم المتزامنة عبر المنصات:' : 'Channel Listings:'}
                     </span>
                     <div className="space-y-1">
-                      {Object.values(previewProduct.marketplaceListings || {}).map((m) => (
-                        <div key={m.marketplaceId} className="flex items-center justify-between text-[11px]">
-                          <span className="font-semibold text-[#172033] uppercase">{m.marketplaceId}</span>
-                          <span className="font-mono-code font-bold text-[#2563EB]">
-                            {m.price} {settings.currency}
-                          </span>
-                        </div>
-                      ))}
+                      {Object.values(previewProduct.marketplaceListings || {}).map((m) => {
+                        const mkt = allMarketplaces.find((item) => item.id === m.marketplaceId);
+                        const isDisabled = mkt ? !mkt.isActive : true;
+                        return (
+                          <div key={m.marketplaceId} className="flex items-center justify-between text-[11px]">
+                            <span className="font-semibold text-[#172033]">
+                              {mkt ? (isRtl ? mkt.nameAr : mkt.nameEn) : m.marketplaceId}
+                              {isDisabled ? (isRtl ? ' [معطلة]' : ' [Disabled]') : ''}
+                            </span>
+                            <span className="font-mono-code font-bold text-[#2563EB] tabular-nums">
+                              {m.price} {settings.currency}
+                            </span>
+                          </div>
+                        );
+                      })}
                     </div>
                   </div>
                 </div>
@@ -922,46 +969,48 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({
 
           <div>
             <label className="block font-semibold text-[#172033] mb-1">
-              رابط صورة المنتج
+              {isRtl ? 'رابط صورة المنتج (اختياري — يتم إنشاء أيقونة تلقائية عند الترك فارغاً)' : 'Product Image URL (Optional)'}
             </label>
             <input
-              type="url"
-              required
+              type="text"
               value={formImageUrl}
               onChange={(e) => setFormImageUrl(e.target.value)}
-              placeholder="https://..."
+              placeholder="https://... (اختياري)"
               className="w-full px-3 py-2 bg-[#F7F8FA] border border-[#E8ECF2] rounded-xl text-[#172033]"
             />
           </div>
 
           <div className="p-3 bg-[#F8FAFC] rounded-2xl border border-[#E8ECF2] space-y-3">
             <span className="font-bold text-[#172033] block">
-              {isRtl ? 'تسعير المنصات:' : 'Marketplace Prices:'}
+              {isRtl ? 'تسعير المنصات المفعّلة:' : 'Active Marketplace Prices:'}
             </span>
 
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <label className="block text-[11px] text-[#64748B] mb-1">نون (سعر البيع):</label>
-                <input
-                  type="number"
-                  min="0"
-                  value={formNoonPrice}
-                  onChange={(e) => setFormNoonPrice(parseFloat(e.target.value) || 0)}
-                  className="w-full px-3 py-1.5 bg-white border border-[#E8ECF2] rounded-xl font-mono-code font-bold"
-                />
+            {activeMarketplaces.length === 0 ? (
+              <p className="text-[11px] text-amber-800">
+                {isRtl ? 'لا توجد منصات بيع مفعّلة في الإعدادات حالياً.' : 'No active marketplaces enabled in Settings.'}
+              </p>
+            ) : (
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                {activeMarketplaces.map((mkt) => (
+                  <div key={mkt.id}>
+                    <label className="block text-[11px] text-[#64748B] mb-1">
+                      {isRtl ? `${mkt.nameAr} (سعر البيع):` : `${mkt.nameEn} Price:`}
+                    </label>
+                    <input
+                      type="number"
+                      min="0"
+                      step="0.01"
+                      value={formMarketplacePrices[mkt.id] ?? 0}
+                      onChange={(e) => {
+                        const val = parseFloat(e.target.value) || 0;
+                        setFormMarketplacePrices((prev) => ({ ...prev, [mkt.id]: val }));
+                      }}
+                      className="w-full px-3 py-1.5 bg-white border border-[#E8ECF2] rounded-xl font-mono-code font-bold"
+                    />
+                  </div>
+                ))}
               </div>
-
-              <div>
-                <label className="block text-[11px] text-[#64748B] mb-1">أمازون (سعر البيع):</label>
-                <input
-                  type="number"
-                  min="0"
-                  value={formAmzPrice}
-                  onChange={(e) => setFormAmzPrice(parseFloat(e.target.value) || 0)}
-                  className="w-full px-3 py-1.5 bg-white border border-[#E8ECF2] rounded-xl font-mono-code font-bold"
-                />
-              </div>
-            </div>
+            )}
           </div>
 
           <div className="flex items-center justify-end gap-2 pt-3 border-t border-[#E8ECF2]">
@@ -972,13 +1021,14 @@ export const ProductsPage: React.FC<ProductsPageProps> = ({
                 setEditingProduct(null);
                 if (onCloseInitialAddModal) onCloseInitialAddModal();
               }}
-              className="px-4 py-2 text-xs font-semibold text-[#64748B] hover:text-[#172033] bg-[#F7F8FA] rounded-xl transition-colors cursor-pointer"
+              className="px-4 py-2 text-xs font-semibold text-[#64748B] hover:text-[#172033] bg-[#F7F8FA] rounded-xl transition-colors cursor-pointer whitespace-nowrap shrink-0"
             >
               {t.actions.cancel}
             </button>
             <button
               type="submit"
-              className="px-6 py-2 text-xs font-bold text-white bg-[#2563EB] hover:bg-blue-700 rounded-xl transition-colors shadow-xs cursor-pointer"
+              disabled={isSubmitting}
+              className="px-6 py-2 text-xs font-bold text-white bg-[#2563EB] hover:bg-blue-700 disabled:opacity-50 rounded-xl transition-colors shadow-xs cursor-pointer whitespace-nowrap shrink-0"
             >
               {t.actions.save}
             </button>
