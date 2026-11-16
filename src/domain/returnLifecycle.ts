@@ -77,6 +77,90 @@ export function getOrderReturnableItems(
   });
 }
 
+function isReturnInspectionCompleted(ret: ReturnRecord): boolean {
+  return Boolean(
+    ret.isCompleted ||
+      ret.returnStatus === 'closed' ||
+      ret.returnStatus === 'inspection_completed' ||
+      ret.returnStatus === 'restocked' ||
+      ret.returnStatus === 'damaged'
+  );
+}
+
+/**
+ * Computes the refundable value of a post-delivery return strictly using
+ * original order item unitPrice snapshots and bounding total refunded quantity
+ * per order item against originally ordered quantities.
+ */
+export function computeReturnRefundAmount(
+  ret: ReturnRecord,
+  order?: Order,
+  allReturnsForOrder: ReturnRecord[] = []
+): number {
+  if (!ret.items || ret.items.length === 0) return 0;
+
+  if (!order || !order.items || order.items.length === 0) {
+    const rawTotal = ret.items.reduce((sum, item) => {
+      const qty = Math.max(0, Math.floor(Number(item.quantity) || 0));
+      const price =
+        typeof item.unitPrice === 'number' && Number.isFinite(item.unitPrice) && item.unitPrice >= 0
+          ? item.unitPrice
+          : 0;
+      return sum + qty * price;
+    }, 0);
+    return Math.round(rawTotal * 100) / 100;
+  }
+
+  // Track remaining refundable quantity per original order line after accounting for
+  // any previously completed refundable returns on the same order.
+  const remainingByLine = order.items.map((it) => Math.max(0, Math.floor(Number(it.quantity) || 0)));
+  const seenPriorIds = new Set<string>();
+
+  for (const prior of allReturnsForOrder) {
+    if (prior.orderId !== order.id || prior.id === ret.id) continue;
+    if (prior.id && seenPriorIds.has(prior.id)) continue;
+    if (prior.id) seenPriorIds.add(prior.id);
+    if (!isReturnInspectionCompleted(prior)) continue;
+    if (prior.inspectionOutcome === 'missing' || prior.physicalCondition === 'lost') continue;
+
+    for (const pItem of prior.items || []) {
+      let toConsume = Math.max(0, Math.floor(Number(pItem.quantity) || 0));
+      for (let idx = 0; idx < order.items.length && toConsume > 0; idx++) {
+        const oItem = order.items[idx];
+        const matches =
+          oItem.productId === pItem.productId ||
+          (Boolean(oItem.productSku) && oItem.productSku === pItem.productSku);
+        if (!matches || remainingByLine[idx] <= 0) continue;
+        const used = Math.min(toConsume, remainingByLine[idx]);
+        remainingByLine[idx] -= used;
+        toConsume -= used;
+      }
+    }
+  }
+
+  let refundTotal = 0;
+  for (const rItem of ret.items) {
+    let qtyToRefund = Math.max(0, Math.floor(Number(rItem.quantity) || 0));
+    for (let idx = 0; idx < order.items.length && qtyToRefund > 0; idx++) {
+      const oItem = order.items[idx];
+      const matches =
+        oItem.productId === rItem.productId ||
+        (Boolean(oItem.productSku) && oItem.productSku === rItem.productSku);
+      if (!matches || remainingByLine[idx] <= 0) continue;
+      const applied = Math.min(qtyToRefund, remainingByLine[idx]);
+      const originalUnitPrice =
+        typeof oItem.unitPrice === 'number' && Number.isFinite(oItem.unitPrice) && oItem.unitPrice >= 0
+          ? oItem.unitPrice
+          : 0;
+      refundTotal += applied * originalUnitPrice;
+      remainingByLine[idx] -= applied;
+      qtyToRefund -= applied;
+    }
+  }
+
+  return Math.round(refundTotal * 100) / 100;
+}
+
 export function advanceReturnStatusPure(params: {
   returnId: string;
   targetStatus: ReturnStatus;
@@ -187,7 +271,7 @@ export function advanceReturnStatusPure(params: {
 
         newMovements.push({
           id: `mov-${Date.now()}-${i}-${Math.random().toString(36).substring(2, 6)}`,
-          merchantId: ret.merchantId || product.merchantId,
+          merchantId: merchantId || ret.merchantId || product.merchantId,
           productId: product.id,
           productSku: product.sku || product.name,
           productName: product.name,
@@ -379,6 +463,7 @@ export function processReturnInspectionPure(params: {
   const newMovements: StockMovement[] = [];
   const newTransactions: Array<Omit<FinancialTransaction, 'id' | 'date'> & { date?: string }> = [];
 
+  const resolvedMerchantId = merchantId || ret.merchantId || order?.merchantId;
   const isPostDelivery =
     ret.isPostDeliveryReturn === true || Boolean(order && order.deliveredProcessed === true);
 
@@ -436,7 +521,7 @@ export function processReturnInspectionPure(params: {
 
         newMovements.push({
           id: `mov-${Date.now()}-${i}-${Math.random().toString(36).substring(2, 6)}`,
-          merchantId: ret.merchantId || product.merchantId,
+          merchantId: resolvedMerchantId || product.merchantId,
           productId: product.id,
           productSku: product.sku || product.name,
           productName: product.name,
@@ -513,7 +598,7 @@ export function processReturnInspectionPure(params: {
 
         newMovements.push({
           id: `mov-${Date.now()}-${i}-${Math.random().toString(36).substring(2, 6)}`,
-          merchantId: ret.merchantId || product.merchantId,
+          merchantId: resolvedMerchantId || product.merchantId,
           productId: product.id,
           productSku: product.sku || product.name,
           productName: product.name,
@@ -542,7 +627,7 @@ export function processReturnInspectionPure(params: {
         const { unitCost } = resolveOrderItemUnitCost(item, products);
         if (unitCost !== null && unitCost > 0) {
           newTransactions.push({
-            merchantId: ret.merchantId,
+            merchantId: resolvedMerchantId || product.merchantId,
             eventRef: `return_damaged|damage_writeoff|${ret.id}|${product.id}|${i}`,
             orderId: ret.orderId,
             returnId: ret.id,
@@ -601,7 +686,7 @@ export function processReturnInspectionPure(params: {
 
         newMovements.push({
           id: `mov-${Date.now()}-${i}-${Math.random().toString(36).substring(2, 6)}`,
-          merchantId: ret.merchantId || product.merchantId,
+          merchantId: resolvedMerchantId || product.merchantId,
           productId: product.id,
           productSku: product.sku || product.name,
           productName: product.name,
@@ -658,6 +743,40 @@ export function processReturnInspectionPure(params: {
       operator,
       notes,
     });
+  }
+
+  // Generate accurate customer_refund transaction for completed post-delivery returns
+  // (restockable or damaged). Uses original order item unitPrice snapshots and never duplicates.
+  if (
+    isPostDelivery &&
+    ret.isCompleted &&
+    (outcome === 'restockable' || outcome === 'damaged') &&
+    !existingRet.refundProcessed
+  ) {
+    const refundAmount = computeReturnRefundAmount(ret, order, rawReturns);
+    ret.refundAmount = refundAmount;
+    ret.refundProcessed = true;
+
+    if (refundAmount > 0) {
+      const refundedUnits = ret.items.reduce(
+        (sum, it) => sum + Math.max(0, Math.floor(Number(it.quantity) || 0)),
+        0
+      );
+      newTransactions.push({
+        merchantId: resolvedMerchantId,
+        eventRef: `return_inspection|customer_refund|${ret.id}`,
+        orderId: ret.orderId,
+        returnId: ret.id,
+        marketplaceId: ret.marketplaceId,
+        type: 'customer_refund',
+        amount: refundAmount,
+        currency,
+        status: 'confirmed',
+        source: 'automatic',
+        date: nowIso,
+        notes: `استرداد قيمة أصناف المرتجع #${ret.id} للعميل (${refundedUnits} قطعة وفق سعر الطلب الأصلي)`,
+      });
+    }
   }
 
   ret.physicalCondition = condition;
@@ -772,6 +891,7 @@ export function registerPostDeliveryReturnPure(params: {
   const returnItems: OrderItem[] = [];
 
   if (selectedItems && selectedItems.length > 0) {
+    const requestedByKey = new Map<string, { item: OrderItem; quantity: number }>();
     for (const sel of selectedItems) {
       if (!Number.isFinite(sel.quantity) || !Number.isInteger(sel.quantity) || sel.quantity <= 0) {
         return {
@@ -802,10 +922,14 @@ export function registerPostDeliveryReturnPure(params: {
         };
       }
 
-      if (sel.quantity > match.remainingQty) {
+      const itemKey = `${match.item.productId}|${match.item.productSku || ''}`;
+      const prevSelected = requestedByKey.get(itemKey)?.quantity || 0;
+      const cumulativeQty = prevSelected + sel.quantity;
+
+      if (cumulativeQty > match.remainingQty) {
         return {
           success: false,
-          error: `الكمية المطلوبة لإرجاع (${match.item.productName}) (${sel.quantity}) تتجاوز الكمية المؤهلة المتبقية (${match.remainingQty}).`,
+          error: `الكمية المطلوبة لإرجاع (${match.item.productName}) (${cumulativeQty}) تتجاوز الكمية المؤهلة المتبقية (${match.remainingQty}).`,
           orders: rawOrders,
           returns: rawReturns,
           products: rawProducts,
@@ -814,9 +938,16 @@ export function registerPostDeliveryReturnPure(params: {
         };
       }
 
+      requestedByKey.set(itemKey, {
+        item: match.item,
+        quantity: cumulativeQty,
+      });
+    }
+
+    for (const entry of requestedByKey.values()) {
       returnItems.push({
-        ...match.item,
-        quantity: sel.quantity,
+        ...entry.item,
+        quantity: entry.quantity,
       });
     }
   } else {
@@ -864,8 +995,8 @@ export function registerPostDeliveryReturnPure(params: {
       products[prodIdx] = product;
 
       newMovements.push({
-        id: `mov-${Date.now()}-${i}-${Math.random().toString(36).substring(2, 6)}`,
-        merchantId: existingOrder.merchantId || product.merchantId,
+        id: `mov-${Date.now()}`,
+        merchantId: merchantId || existingOrder.merchantId || product.merchantId,
         productId: product.id,
         productSku: product.sku || product.name,
         productName: product.name,
@@ -895,7 +1026,7 @@ export function registerPostDeliveryReturnPure(params: {
 
   const newReturn: ReturnRecord = {
     id: returnId,
-    merchantId: existingOrder.merchantId,
+    merchantId: merchantId || existingOrder.merchantId,
     orderId: existingOrder.id,
     marketplaceId: existingOrder.marketplaceId,
     items: returnItems,
@@ -937,7 +1068,7 @@ export function registerPostDeliveryReturnPure(params: {
 
   const newTransactions: Array<Omit<FinancialTransaction, 'id' | 'date'> & { date?: string }> = [
     {
-      merchantId: existingOrder.merchantId,
+      merchantId: merchantId || existingOrder.merchantId,
       eventRef: `post_delivery_return|return_shipping|${returnId}`,
       orderId: existingOrder.id,
       returnId,

@@ -13,6 +13,7 @@ import {
   OrderFinancialBreakdown,
   OrderItem,
   Product,
+  ReturnRecord,
 } from '../types';
 
 /** Documented heuristic rate used ONLY for informational estimates when marketplace commission is unrecorded. */
@@ -45,9 +46,50 @@ export function resolveOrderItemUnitCost(
   return { unitCost: null, source: 'missing' };
 }
 
+function isReturnRecordCompleted(ret: ReturnRecord): boolean {
+  return Boolean(
+    ret.isCompleted ||
+      ret.returnStatus === 'closed' ||
+      ret.returnStatus === 'inspection_completed' ||
+      ret.returnStatus === 'restocked' ||
+      ret.returnStatus === 'damaged'
+  );
+}
+
+function deduplicateTransactionsList(
+  transactions: FinancialTransaction[]
+): FinancialTransaction[] {
+  const seenIds = new Set<string>();
+  const seenEventRefs = new Set<string>();
+  const seenAutoSignatures = new Set<string>();
+  const dedupedTx: FinancialTransaction[] = [];
+
+  for (const tx of transactions) {
+    if (tx.id && seenIds.has(tx.id)) continue;
+    if (tx.eventRef) {
+      const refSig = `ref|${tx.eventRef}|${tx.status === 'cancelled' ? 'cancelled' : 'active'}`;
+      if (seenEventRefs.has(refSig)) continue;
+      seenEventRefs.add(refSig);
+    } else if (tx.source === 'automatic' && tx.type !== 'adjustment') {
+      const signature =
+        tx.type === 'damage_writeoff'
+          ? `auto|${tx.orderId}|${tx.returnId || ''}|${tx.type}|${tx.status}|${tx.amount}|${tx.notes || ''}`
+          : `auto|${tx.orderId}|${tx.returnId || ''}|${tx.type}|${tx.status}`;
+      if (seenAutoSignatures.has(signature)) continue;
+      seenAutoSignatures.add(signature);
+    }
+    if (tx.id) seenIds.add(tx.id);
+    dedupedTx.push(tx);
+  }
+
+  return dedupedTx;
+}
+
 export function computeOrderFinancialBreakdown(
   order: Order,
-  products: Product[]
+  products: Product[],
+  returns: ReturnRecord[] = [],
+  transactions: FinancialTransaction[] = []
 ): OrderFinancialBreakdown {
   const totalSellingPrice = order.totalAmount;
   let totalCostOfGoods = 0;
@@ -110,8 +152,112 @@ export function computeOrderFinancialBreakdown(
 
   const isDelivered = order.status === 'delivered';
   const isCancelled = order.status === 'cancelled';
-  const refundAmount =
-    order.hasPostDeliveryReturn || order.status === 'rejected' ? totalSellingPrice : 0;
+
+  // Calculate actual completed refund amount strictly from completed post-delivery return records
+  // associated with this order (and any unaccounted confirmed customer_refund ledger entries),
+  // bounded by original order item quantities and valued at original order item unitPrice snapshots.
+  let refundAmount = 0;
+  let pendingRefundAmount = 0;
+  let refundedItemsCount = 0;
+
+  if (!isCancelled) {
+    const orderReturns = returns.filter((r) => r.orderId === order.id);
+    const remainingByLine = order.items.map((it) =>
+      Math.max(0, Math.floor(Number(it.quantity) || 0))
+    );
+    const seenReturnIds = new Set<string>();
+    const accountedReturnIds = new Set<string>();
+
+    for (const ret of orderReturns) {
+      if (ret.id && seenReturnIds.has(ret.id)) continue;
+      if (ret.id) seenReturnIds.add(ret.id);
+
+      const isPostDeliveryContext =
+        ret.isPostDeliveryReturn === true || isDelivered || order.deliveredProcessed === true;
+      if (!isPostDeliveryContext) continue;
+
+      if (!isReturnRecordCompleted(ret)) {
+        // Uninspected return is kept strictly in pendingRefundAmount, NEVER in completed refundAmount
+        for (const rItem of ret.items || []) {
+          let qty = Math.max(0, Math.floor(Number(rItem.quantity) || 0));
+          for (let idx = 0; idx < order.items.length && qty > 0; idx++) {
+            const oItem = order.items[idx];
+            const matches =
+              oItem.productId === rItem.productId ||
+              (Boolean(oItem.productSku) && oItem.productSku === rItem.productSku);
+            if (!matches || remainingByLine[idx] <= 0) continue;
+            const bounded = Math.min(qty, remainingByLine[idx]);
+            const origPrice =
+              typeof oItem.unitPrice === 'number' &&
+              Number.isFinite(oItem.unitPrice) &&
+              oItem.unitPrice >= 0
+                ? oItem.unitPrice
+                : 0;
+            pendingRefundAmount += bounded * origPrice;
+            qty -= bounded;
+          }
+        }
+        continue;
+      }
+
+      if (ret.inspectionOutcome === 'missing' || ret.physicalCondition === 'lost') {
+        continue;
+      }
+
+      for (const rItem of ret.items || []) {
+        let qtyToRefund = Math.max(0, Math.floor(Number(rItem.quantity) || 0));
+        for (let idx = 0; idx < order.items.length && qtyToRefund > 0; idx++) {
+          const oItem = order.items[idx];
+          const matches =
+            oItem.productId === rItem.productId ||
+            (Boolean(oItem.productSku) && oItem.productSku === rItem.productSku);
+          if (!matches || remainingByLine[idx] <= 0) continue;
+          const appliedQty = Math.min(qtyToRefund, remainingByLine[idx]);
+          const origPrice =
+            typeof oItem.unitPrice === 'number' &&
+            Number.isFinite(oItem.unitPrice) &&
+            oItem.unitPrice >= 0
+              ? oItem.unitPrice
+              : 0;
+          refundAmount += appliedQty * origPrice;
+          refundedItemsCount += appliedQty;
+          remainingByLine[idx] -= appliedQty;
+          qtyToRefund -= appliedQty;
+        }
+      }
+
+      if (ret.id) {
+        accountedReturnIds.add(ret.id);
+      }
+    }
+
+    // Reconcile any confirmed/pending customer_refund ledger transactions not already counted from return records
+    if (transactions.length > 0) {
+      const dedupedOrderTx = deduplicateTransactionsList(
+        transactions.filter((tx) => tx.orderId === order.id && tx.type === 'customer_refund')
+      );
+
+      for (const tx of dedupedOrderTx) {
+        if (tx.status === 'cancelled') continue;
+        if (tx.returnId && accountedReturnIds.has(tx.returnId)) continue;
+        const txAmount = Number.isFinite(tx.amount) ? Math.max(0, tx.amount) : 0;
+
+        if (isConfirmedStatus(tx.status)) {
+          const remainingOrderCap = Math.max(0, totalSellingPrice - refundAmount);
+          refundAmount += Math.min(txAmount, remainingOrderCap);
+        } else if (tx.status === 'pending') {
+          const remainingOrderCap = Math.max(
+            0,
+            totalSellingPrice - refundAmount - pendingRefundAmount
+          );
+          pendingRefundAmount += Math.min(txAmount, remainingOrderCap);
+        }
+      }
+    }
+  }
+
+  refundAmount = Math.round(refundAmount * 100) / 100;
+  pendingRefundAmount = Math.round(pendingRefundAmount * 100) / 100;
 
   // Recorded-Cost Margin can be computed whenever order is delivered and all item COGS exist,
   // explicitly reflecting ONLY recorded expenses (excluding missing marketplace commission).
@@ -170,6 +316,8 @@ export function computeOrderFinancialBreakdown(
     productCostOfGoods: hasAllCosts ? totalCostOfGoods : null,
     cogsSource,
     refundAmount,
+    pendingRefundAmount,
+    refundedItemsCount,
     recordedCostMargin,
     confirmedNet,
     estimatedNet,
@@ -254,28 +402,7 @@ export function computeFinancialSummary(
 
   // Deduplicate transactions to prevent double-counting identical or retried postings
   // while preserving distinct legitimate multi-events on the same order via eventRef.
-  const seenIds = new Set<string>();
-  const seenEventRefs = new Set<string>();
-  const seenAutoSignatures = new Set<string>();
-  const dedupedTx: FinancialTransaction[] = [];
-
-  for (const tx of relevantTx) {
-    if (tx.id && seenIds.has(tx.id)) continue;
-    if (tx.eventRef) {
-      const refSig = `ref|${tx.eventRef}|${tx.status}`;
-      if (seenEventRefs.has(refSig)) continue;
-      seenEventRefs.add(refSig);
-    } else if (tx.source === 'automatic' && tx.type !== 'adjustment') {
-      const signature =
-        tx.type === 'damage_writeoff'
-          ? `auto|${tx.orderId}|${tx.returnId || ''}|${tx.type}|${tx.status}|${tx.amount}|${tx.notes || ''}`
-          : `auto|${tx.orderId}|${tx.returnId || ''}|${tx.type}|${tx.status}`;
-      if (seenAutoSignatures.has(signature)) continue;
-      seenAutoSignatures.add(signature);
-    }
-    if (tx.id) seenIds.add(tx.id);
-    dedupedTx.push(tx);
-  }
+  const dedupedTx = deduplicateTransactionsList(relevantTx);
 
   let courierShippingExpenses = 0;
   let returnShippingExpenses = 0;

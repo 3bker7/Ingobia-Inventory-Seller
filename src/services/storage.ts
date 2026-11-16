@@ -1509,6 +1509,9 @@ class StorageService {
   public recordFinancialTransactionWithResult(
     tx: Omit<FinancialTransaction, 'id' | 'date'> & { id?: string; date?: string }
   ): StorageWriteResult & { transaction?: FinancialTransaction; deduplicated?: boolean } {
+    if (!Number.isFinite(tx.amount) || tx.amount < 0) {
+      return { success: false, error: 'قيمة المعاملة المالية غير صالحة.' };
+    }
     const list = this.getFinancialTransactions();
     const prep = this.prepareTransactionsAppend(list, [tx]);
     if (prep.added.length === 0) {
@@ -1550,7 +1553,12 @@ class StorageService {
   public getOrderFinancialBreakdown(orderId: string): OrderFinancialBreakdown | null {
     const order = this.getOrders().find((o) => o.id === orderId);
     if (!order) return null;
-    return computeOrderFinancialBreakdown(order, this.getProducts());
+    return computeOrderFinancialBreakdown(
+      order,
+      this.getProducts(),
+      this.getReturns(),
+      this.getFinancialTransactions()
+    );
   }
 
   public getFinancialSummary(

@@ -202,6 +202,8 @@ export interface OrderFinancialBreakdown {
   productCostOfGoods: number | null; // null if missing
   cogsSource?: 'snapshot' | 'catalog' | 'mixed' | 'missing';
   refundAmount: number;
+  pendingRefundAmount?: number;
+  refundedItemsCount?: number;
   recordedCostMargin: number | null; // Margin from recorded costs only (excludes missing marketplace fees); null if COGS missing or not delivered
   confirmedNet: number | null; // Strictly non-null ONLY when delivered, non-cancelled, all COGS exist, AND marketplaceCommission is recorded
   estimatedNet: number | null; // Informational estimate using documented 12% estimated commission when unrecorded; null if COGS missing or not delivered
@@ -334,6 +336,8 @@ export interface ReturnRecord {
   restockTarget?: 'central' | MarketplaceId; // where approved items were restocked
   isCompleted?: boolean; // Marked true once inspected and closed
   isPostDeliveryReturn?: boolean; // True if created after successful delivery
+  refundAmount?: number; // Actual refundable value computed from original order item price snapshots
+  refundProcessed?: boolean; // Safeguard against duplicate customer_refund ledger generation
   // Shipping & Custody details
   shipment?: ShipmentRecord;
   courierName?: string;

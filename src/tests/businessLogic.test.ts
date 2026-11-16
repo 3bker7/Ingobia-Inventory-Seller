@@ -25,6 +25,7 @@ import {
   ALLOWED_RETURN_TRANSITIONS,
   addReturnNotePure,
   advanceReturnStatusPure,
+  computeReturnRefundAmount,
   getOrderReturnableItems,
   processReturnInspectionPure,
   registerPostDeliveryReturnPure,
@@ -1657,5 +1658,601 @@ test('saveSmartImportOrdersPure rejects active orders exceeding sellable stock i
   assert.equal(res.orders.length, 0);
   assert.equal(res.products[0].availableStock, 2);
   assert.equal(res.products[0].physicalStock, 2);
+});
+
+// ---------------------------------------------------------------------------
+// 17. Refund Integrity Scenario 1: 4 units @ 200 SAR -> 1 unit returned = 200 SAR
+//     (and uninspected return is NOT treated as completed refund + snapshot price preserved)
+// ---------------------------------------------------------------------------
+test('refund integrity: 4 units at 200 SAR with 1 returned generates 200 SAR refund after inspection using original price snapshot', () => {
+  // Catalog currentPrice later raised to 350 SAR, but original order snapshot was 200 SAR
+  const prod = makeProduct({
+    id: 'prod-ref-1',
+    sku: 'REF-SKU-1',
+    currentPrice: 350,
+    baseCost: 90,
+    physicalStock: 10,
+    availableStock: 10,
+  });
+  const order = makeOrder({
+    id: 'ORD-REF-1',
+    merchantId: 'merch-1',
+    marketplaceId: 'noon',
+    status: 'delivered',
+    deliveredProcessed: true,
+    isClosed: true,
+    totalAmount: 800,
+    marketplaceCommission: 80,
+    shippingCost: 20,
+    items: [
+      {
+        productId: prod.id,
+        productSku: prod.sku,
+        productName: prod.name,
+        imageUrl: prod.imageUrl,
+        quantity: 4,
+        unitPrice: 200,
+        unitCostSnapshot: 90,
+      },
+    ],
+  });
+
+  const reg = registerPostDeliveryReturnPure({
+    orderId: order.id,
+    reason: 'مرتجع وحدة واحدة',
+    selectedItems: [{ productId: prod.id, productSku: prod.sku, quantity: 1 }],
+    orders: [order],
+    returns: [],
+    products: [prod],
+    currency: 'SAR',
+    merchantId: 'merch-1',
+  });
+  assert.equal(reg.success, true);
+
+  // Before inspection: NO customer_refund transaction and breakdown.refundAmount === 0
+  assert.equal(
+    reg.newTransactions.some((t) => t.type === 'customer_refund'),
+    false
+  );
+  const uninspectedBreakdown = computeOrderFinancialBreakdown(
+    reg.orders[0],
+    reg.products,
+    reg.returns,
+    []
+  );
+  assert.equal(uninspectedBreakdown.refundAmount, 0);
+  assert.equal(uninspectedBreakdown.pendingRefundAmount, 200);
+
+  const recv = advanceReturnStatusPure({
+    returnId: reg.returnRecord!.id,
+    targetStatus: 'received_at_warehouse',
+    returns: reg.returns,
+    products: reg.products,
+    orders: reg.orders,
+    merchantId: 'merch-1',
+  });
+  assert.equal(recv.success, true);
+
+  const insp = processReturnInspectionPure({
+    returnId: reg.returnRecord!.id,
+    outcome: 'restockable',
+    condition: 'like_new',
+    notes: 'وحدة سليمة',
+    returns: recv.returns,
+    products: recv.products,
+    orders: reg.orders,
+    currency: 'SAR',
+    merchantId: 'merch-1',
+  });
+  assert.equal(insp.success, true);
+
+  const refundTx = insp.newTransactions.find((t) => t.type === 'customer_refund');
+  assert.ok(refundTx);
+  assert.equal(refundTx.amount, 200);
+  assert.equal(refundTx.orderId, order.id);
+  assert.equal(refundTx.returnId, reg.returnRecord!.id);
+  assert.equal(refundTx.merchantId, 'merch-1');
+  assert.equal(refundTx.marketplaceId, 'noon');
+  assert.equal(refundTx.currency, 'SAR');
+  assert.equal(refundTx.status, 'confirmed');
+  assert.equal(refundTx.eventRef, `return_inspection|customer_refund|${reg.returnRecord!.id}`);
+
+  const inspectedBreakdown = computeOrderFinancialBreakdown(
+    insp.orders[0],
+    insp.products,
+    insp.returns,
+    insp.newTransactions as FinancialTransaction[]
+  );
+  assert.equal(inspectedBreakdown.refundAmount, 200);
+  assert.equal(inspectedBreakdown.pendingRefundAmount, 0);
+  assert.equal(inspectedBreakdown.refundedItemsCount, 1);
+});
+
+// ---------------------------------------------------------------------------
+// 18. Refund Integrity Scenario 2: 4 units @ 200 SAR -> all 4 returned = 800 SAR
+// ---------------------------------------------------------------------------
+test('refund integrity: 4 units at 200 SAR with all 4 returned equals 800 SAR', () => {
+  const prod = makeProduct({ id: 'prod-ref-2', sku: 'REF-SKU-2', currentPrice: 299, physicalStock: 5, availableStock: 5 });
+  const order = makeOrder({
+    id: 'ORD-REF-FULL',
+    status: 'delivered',
+    deliveredProcessed: true,
+    isClosed: true,
+    totalAmount: 800,
+    items: [
+      {
+        productId: prod.id,
+        productSku: prod.sku,
+        productName: prod.name,
+        imageUrl: prod.imageUrl,
+        quantity: 4,
+        unitPrice: 200,
+        unitCostSnapshot: 100,
+      },
+    ],
+  });
+
+  const reg = registerPostDeliveryReturnPure({
+    orderId: order.id,
+    reason: 'إرجاع كامل',
+    orders: [order],
+    returns: [],
+    products: [prod],
+    currency: 'SAR',
+  });
+  assert.equal(reg.success, true);
+
+  const recv = advanceReturnStatusPure({
+    returnId: reg.returnRecord!.id,
+    targetStatus: 'received_at_warehouse',
+    returns: reg.returns,
+    products: reg.products,
+    orders: reg.orders,
+  });
+  assert.equal(recv.success, true);
+
+  const insp = processReturnInspectionPure({
+    returnId: reg.returnRecord!.id,
+    outcome: 'restockable',
+    condition: 'like_new',
+    notes: 'إرجاع كامل سليم',
+    returns: recv.returns,
+    products: recv.products,
+    orders: reg.orders,
+    currency: 'SAR',
+  });
+  assert.equal(insp.success, true);
+
+  const refundTx = insp.newTransactions.find((t) => t.type === 'customer_refund');
+  assert.ok(refundTx);
+  assert.equal(refundTx.amount, 800);
+
+  const breakdown = computeOrderFinancialBreakdown(
+    insp.orders[0],
+    insp.products,
+    insp.returns,
+    insp.newTransactions as FinancialTransaction[]
+  );
+  assert.equal(breakdown.refundAmount, 800);
+  assert.equal(breakdown.refundedItemsCount, 4);
+});
+
+// ---------------------------------------------------------------------------
+// 19. Refund Integrity Scenario 3: Two separate partial returns + multiple products
+// ---------------------------------------------------------------------------
+test('refund integrity: two separate partial returns and multi-product returns sum accurately without over-refunding', () => {
+  const prodA = makeProduct({ id: 'prod-mp-a', sku: 'MP-A', currentPrice: 999, physicalStock: 10, availableStock: 10 });
+  const prodB = makeProduct({ id: 'prod-mp-b', sku: 'MP-B', currentPrice: 888, physicalStock: 10, availableStock: 10 });
+  const order = makeOrder({
+    id: 'ORD-REF-MULTI',
+    status: 'delivered',
+    deliveredProcessed: true,
+    isClosed: true,
+    totalAmount: 1100, // 4 * 200 + 2 * 150
+    items: [
+      {
+        productId: prodA.id,
+        productSku: prodA.sku,
+        productName: prodA.name,
+        imageUrl: prodA.imageUrl,
+        quantity: 4,
+        unitPrice: 200,
+        unitCostSnapshot: 90,
+      },
+      {
+        productId: prodB.id,
+        productSku: prodB.sku,
+        productName: prodB.name,
+        imageUrl: prodB.imageUrl,
+        quantity: 2,
+        unitPrice: 150,
+        unitCostSnapshot: 70,
+      },
+    ],
+  });
+
+  // Partial 1: 1 unit of A (200) + 1 unit of B (150) = 350
+  const p1 = registerPostDeliveryReturnPure({
+    orderId: order.id,
+    reason: 'جزئي أول',
+    selectedItems: [
+      { productId: prodA.id, productSku: prodA.sku, quantity: 1 },
+      { productId: prodB.id, productSku: prodB.sku, quantity: 1 },
+    ],
+    orders: [order],
+    returns: [],
+    products: [prodA, prodB],
+    currency: 'SAR',
+  });
+  assert.equal(p1.success, true);
+
+  const r1 = advanceReturnStatusPure({
+    returnId: p1.returnRecord!.id,
+    targetStatus: 'received_at_warehouse',
+    returns: p1.returns,
+    products: p1.products,
+    orders: p1.orders,
+  });
+  const i1 = processReturnInspectionPure({
+    returnId: p1.returnRecord!.id,
+    outcome: 'restockable',
+    condition: 'like_new',
+    notes: 'فحص أول',
+    returns: r1.returns,
+    products: r1.products,
+    orders: p1.orders,
+    currency: 'SAR',
+  });
+  assert.equal(i1.success, true);
+  assert.equal(i1.newTransactions.find((t) => t.type === 'customer_refund')?.amount, 350);
+
+  // Partial 2: 2 units of A (400) = 400 -> Combined refund = 750
+  const p2 = registerPostDeliveryReturnPure({
+    orderId: order.id,
+    reason: 'جزئي ثاني',
+    selectedItems: [{ productId: prodA.id, productSku: prodA.sku, quantity: 2 }],
+    orders: i1.orders,
+    returns: i1.returns,
+    products: i1.products,
+    currency: 'SAR',
+  });
+  assert.equal(p2.success, true);
+
+  const r2 = advanceReturnStatusPure({
+    returnId: p2.returnRecord!.id,
+    targetStatus: 'received_at_warehouse',
+    returns: p2.returns,
+    products: p2.products,
+    orders: p2.orders,
+  });
+  const i2 = processReturnInspectionPure({
+    returnId: p2.returnRecord!.id,
+    outcome: 'restockable',
+    condition: 'opened_good',
+    notes: 'فحص ثاني',
+    returns: r2.returns,
+    products: r2.products,
+    orders: p2.orders,
+    currency: 'SAR',
+  });
+  assert.equal(i2.success, true);
+  assert.equal(i2.newTransactions.find((t) => t.type === 'customer_refund')?.amount, 400);
+
+  const allLedgerTx: FinancialTransaction[] = [
+    ...p1.newTransactions.map((t, idx) => ({ ...t, id: `tx-p1-${idx}`, date: '2026-11-16T00:00:00Z' })),
+    ...i1.newTransactions.map((t, idx) => ({ ...t, id: `tx-i1-${idx}`, date: '2026-11-16T01:00:00Z' })),
+    ...p2.newTransactions.map((t, idx) => ({ ...t, id: `tx-p2-${idx}`, date: '2026-11-16T02:00:00Z' })),
+    ...i2.newTransactions.map((t, idx) => ({ ...t, id: `tx-i2-${idx}`, date: '2026-11-16T03:00:00Z' })),
+  ];
+
+  const breakdown = computeOrderFinancialBreakdown(i2.orders[0], i2.products, i2.returns, allLedgerTx);
+  assert.equal(breakdown.refundAmount, 750);
+  assert.equal(breakdown.refundedItemsCount, 4);
+
+  const summary = computeFinancialSummary(i2.orders, allLedgerTx, i2.products);
+  assert.equal(summary.confirmedRefunds, 750);
+});
+
+// ---------------------------------------------------------------------------
+// 20. Refund Integrity Scenario 4: Repeating inspection/write creates ZERO duplicate refunds
+// ---------------------------------------------------------------------------
+test('refund integrity: repeating the same return processing never creates duplicate refund transactions', () => {
+  const backing = new Map<string, string>();
+  Object.defineProperty(globalThis, 'localStorage', {
+    value: {
+      get length() { return backing.size; },
+      clear() { backing.clear(); },
+      getItem(k: string) { return backing.get(k) ?? null; },
+      key(i: number) { return Array.from(backing.keys())[i] ?? null; },
+      removeItem(k: string) { backing.delete(k); },
+      setItem(k: string, v: string) { backing.set(k, v); },
+    },
+    configurable: true,
+    writable: true,
+  });
+
+  storageService.init();
+  storageService.clearAllStoreData();
+
+  const prod = makeProduct({ id: 'prod-dup-ref', sku: 'DUP-REF-1', currentPrice: 200, physicalStock: 10, availableStock: 10 });
+  assert.equal(storageService.saveProduct(prod).success, true);
+
+  const ordRes = storageService.createOrder({
+    marketplaceId: 'noon',
+    status: 'preparing',
+    orderDate: '2026-11-16T00:00:00Z',
+    totalAmount: 800,
+    items: [{ productId: prod.id, productSku: prod.sku, productName: prod.name, imageUrl: prod.imageUrl, quantity: 4, unitPrice: 200 }],
+  });
+  assert.equal(ordRes.success, true);
+  assert.equal(storageService.updateOrderStatus(ordRes.order!.id, 'with_delivery').success, true);
+  assert.equal(storageService.updateOrderStatus(ordRes.order!.id, 'delivered').success, true);
+
+  const retRes = storageService.registerPostDeliveryReturn(ordRes.order!.id, 'تبديل', '', [
+    { productId: prod.id, productSku: prod.sku, quantity: 1 },
+  ]);
+  assert.equal(retRes.success, true);
+
+  assert.equal(storageService.advanceReturnStatus(retRes.returnRecord!.id, 'received_at_warehouse').success, true);
+
+  const firstInsp = storageService.processReturnInspection(retRes.returnRecord!.id, 'restockable', 'like_new', 'أول فحص');
+  assert.equal(firstInsp.success, true);
+
+  // Repeat inspection via storageService -> blocked cleanly
+  const repeatInsp = storageService.processReturnInspection(retRes.returnRecord!.id, 'restockable', 'like_new', 'تكرار');
+  assert.equal(repeatInsp.success, false);
+
+  // Even direct retry of recording the same customer_refund eventRef deduplicates without inserting a 2nd row
+  const refundTx = storageService
+    .getFinancialTransactions()
+    .filter((t) => t.type === 'customer_refund' && t.returnId === retRes.returnRecord!.id);
+  assert.equal(refundTx.length, 1);
+  assert.equal(refundTx[0].amount, 200);
+
+  const dupAppend = storageService.recordFinancialTransactionWithResult({
+    eventRef: refundTx[0].eventRef,
+    orderId: ordRes.order!.id,
+    returnId: retRes.returnRecord!.id,
+    marketplaceId: 'noon',
+    type: 'customer_refund',
+    amount: 200,
+    currency: 'SAR',
+    status: 'confirmed',
+    source: 'automatic',
+  });
+  assert.equal(dupAppend.deduplicated, true);
+  assert.equal(
+    storageService.getFinancialTransactions().filter((t) => t.type === 'customer_refund').length,
+    1
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 21. Refund Integrity Scenario 5: Over-returning more units than ordered is rejected & capped
+// ---------------------------------------------------------------------------
+test('refund integrity: returning more units than originally ordered is rejected and refundAmount is bounded', () => {
+  const prod = makeProduct({ id: 'prod-over-ref', sku: 'OVER-REF-1', physicalStock: 10, availableStock: 10 });
+  const order = makeOrder({
+    id: 'ORD-OVER-REF',
+    status: 'delivered',
+    deliveredProcessed: true,
+    isClosed: true,
+    totalAmount: 800,
+    items: [
+      {
+        productId: prod.id,
+        productSku: prod.sku,
+        productName: prod.name,
+        imageUrl: prod.imageUrl,
+        quantity: 4,
+        unitPrice: 200,
+        unitCostSnapshot: 90,
+      },
+    ],
+  });
+
+  // Single request exceeding ordered qty
+  const overSingle = registerPostDeliveryReturnPure({
+    orderId: order.id,
+    reason: 'تجاوز مباشر',
+    selectedItems: [{ productId: prod.id, productSku: prod.sku, quantity: 5 }],
+    orders: [order],
+    returns: [],
+    products: [prod],
+    currency: 'SAR',
+  });
+  assert.equal(overSingle.success, false);
+
+  // Split duplicate selectedItems lines summing to > 4 (3 + 2 = 5)
+  const overSplit = registerPostDeliveryReturnPure({
+    orderId: order.id,
+    reason: 'تجاوز مجزأ في نفس الطلب',
+    selectedItems: [
+      { productId: prod.id, productSku: prod.sku, quantity: 3 },
+      { productId: prod.id, productSku: prod.sku, quantity: 2 },
+    ],
+    orders: [order],
+    returns: [],
+    products: [prod],
+    currency: 'SAR',
+  });
+  assert.equal(overSplit.success, false);
+
+  // Even computeReturnRefundAmount & computeOrderFinancialBreakdown cap corrupted oversized return lines at 4 * 200 = 800
+  const oversizedCorruptReturn = {
+    id: 'RET-CORRUPT',
+    orderId: order.id,
+    marketplaceId: 'noon',
+    items: [{ ...order.items[0], quantity: 7 }],
+    returnReason: 'corrupted',
+    returnStatus: 'closed' as const,
+    inspectionOutcome: 'restockable' as const,
+    stockRestored: true,
+    isCompleted: true,
+    isPostDeliveryReturn: true,
+    createdAt: '2026-11-16T00:00:00Z',
+    updatedAt: '2026-11-16T00:00:00Z',
+  };
+  assert.equal(computeReturnRefundAmount(oversizedCorruptReturn, order, []), 800);
+  const cappedBreakdown = computeOrderFinancialBreakdown(order, [prod], [oversizedCorruptReturn], []);
+  assert.equal(cappedBreakdown.refundAmount, 800);
+  assert.equal(cappedBreakdown.refundedItemsCount, 4);
+});
+
+// ---------------------------------------------------------------------------
+// 22. Refund Integrity Scenario 6: Failed storage write never reports success or partial refund
+// ---------------------------------------------------------------------------
+test('refund integrity: failed storage write rolls back and never reports a successful financial transaction', () => {
+  const backing = new Map<string, string>();
+  let failOnKeySubstr: string | null = null;
+  Object.defineProperty(globalThis, 'localStorage', {
+    value: {
+      get length() { return backing.size; },
+      clear() { backing.clear(); },
+      getItem(k: string) { return backing.get(k) ?? null; },
+      key(i: number) { return Array.from(backing.keys())[i] ?? null; },
+      removeItem(k: string) { backing.delete(k); },
+      setItem(k: string, v: string) {
+        if (failOnKeySubstr && k.includes(failOnKeySubstr)) {
+          const err = new Error('The quota has been exceeded.');
+          err.name = 'QuotaExceededError';
+          throw err;
+        }
+        backing.set(k, v);
+      },
+    },
+    configurable: true,
+    writable: true,
+  });
+
+  storageService.init();
+  storageService.clearAllStoreData();
+
+  const prod = makeProduct({ id: 'prod-fail-tx', sku: 'FAIL-TX-1', currentPrice: 200, physicalStock: 10, availableStock: 10 });
+  assert.equal(storageService.saveProduct(prod).success, true);
+
+  const ordRes = storageService.createOrder({
+    marketplaceId: 'noon',
+    status: 'preparing',
+    orderDate: '2026-11-16T00:00:00Z',
+    totalAmount: 800,
+    items: [{ productId: prod.id, productSku: prod.sku, productName: prod.name, imageUrl: prod.imageUrl, quantity: 4, unitPrice: 200 }],
+  });
+  assert.equal(ordRes.success, true);
+  assert.equal(storageService.updateOrderStatus(ordRes.order!.id, 'with_delivery').success, true);
+  assert.equal(storageService.updateOrderStatus(ordRes.order!.id, 'delivered').success, true);
+
+  const retRes = storageService.registerPostDeliveryReturn(ordRes.order!.id, 'مرتجع', '', [
+    { productId: prod.id, productSku: prod.sku, quantity: 1 },
+  ]);
+  assert.equal(retRes.success, true);
+  assert.equal(storageService.advanceReturnStatus(retRes.returnRecord!.id, 'received_at_warehouse').success, true);
+
+  // Inject failure specifically when writing financial_tx during return inspection
+  failOnKeySubstr = STORAGE_KEYS.FINANCIAL_TRANSACTIONS;
+  const failedInsp = storageService.processReturnInspection(
+    retRes.returnRecord!.id,
+    'restockable',
+    'like_new',
+    'اختبار فشل الكتابة'
+  );
+  failOnKeySubstr = null;
+
+  assert.equal(failedInsp.success, false);
+  assert.equal(failedInsp.quotaExceeded, true);
+  assert.equal(failedInsp.rolledBack, true);
+
+  // Zero customer_refund transactions persisted & return remains uncompleted in received_at_warehouse
+  assert.equal(
+    storageService.getFinancialTransactions().filter((t) => t.type === 'customer_refund').length,
+    0
+  );
+  const currentRet = storageService.getReturns().find((r) => r.id === retRes.returnRecord!.id);
+  assert.equal(currentRet?.isCompleted, false);
+  assert.equal(currentRet?.returnStatus, 'received_at_warehouse');
+});
+
+// ---------------------------------------------------------------------------
+// 23. Refund Integrity Scenario 7: Return shipping & damaged write-offs stay separate from refunds
+// ---------------------------------------------------------------------------
+test('refund integrity: return shipping costs and damaged stock write-offs remain separate from customer refunds', () => {
+  const prod = makeProduct({ id: 'prod-sep-1', sku: 'SEP-1', currentPrice: 250, baseCost: 80, physicalStock: 10, availableStock: 10 });
+  const order = makeOrder({
+    id: 'ORD-SEP-1',
+    status: 'delivered',
+    deliveredProcessed: true,
+    isClosed: true,
+    totalAmount: 800,
+    marketplaceCommission: 80,
+    shippingCost: 20,
+    items: [
+      {
+        productId: prod.id,
+        productSku: prod.sku,
+        productName: prod.name,
+        imageUrl: prod.imageUrl,
+        quantity: 4,
+        unitPrice: 200,
+        unitCostSnapshot: 80,
+      },
+    ],
+  });
+
+  const reg = registerPostDeliveryReturnPure({
+    orderId: order.id,
+    reason: 'تلف عند العميل',
+    selectedItems: [{ productId: prod.id, productSku: prod.sku, quantity: 1 }],
+    orders: [order],
+    returns: [],
+    products: [prod],
+    currency: 'SAR',
+  });
+  assert.equal(reg.success, true);
+
+  const recv = advanceReturnStatusPure({
+    returnId: reg.returnRecord!.id,
+    targetStatus: 'received_at_warehouse',
+    returns: reg.returns,
+    products: reg.products,
+    orders: reg.orders,
+  });
+  assert.equal(recv.success, true);
+
+  const dmgInsp = processReturnInspectionPure({
+    returnId: reg.returnRecord!.id,
+    outcome: 'damaged',
+    condition: 'damaged',
+    notes: 'منتج تالف غير صالح',
+    returns: recv.returns,
+    products: recv.products,
+    orders: reg.orders,
+    currency: 'SAR',
+  });
+  assert.equal(dmgInsp.success, true);
+
+  // Must emit BOTH damage_writeoff (cost = 80) AND customer_refund (price = 200) distinctly
+  const writeoffTx = dmgInsp.newTransactions.find((t) => t.type === 'damage_writeoff');
+  const refundTx = dmgInsp.newTransactions.find((t) => t.type === 'customer_refund');
+  assert.ok(writeoffTx);
+  assert.ok(refundTx);
+  assert.equal(writeoffTx.amount, 80);
+  assert.equal(refundTx.amount, 200);
+  assert.notEqual(writeoffTx.eventRef, refundTx.eventRef);
+
+  const allTx: FinancialTransaction[] = [
+    ...reg.newTransactions.map((t, i) => ({ ...t, id: `sep-reg-${i}`, date: '2026-11-16T00:00:00Z' })),
+    ...dmgInsp.newTransactions.map((t, i) => ({ ...t, id: `sep-dmg-${i}`, date: '2026-11-16T01:00:00Z' })),
+  ];
+
+  const summary = computeFinancialSummary([order], allTx, dmgInsp.products);
+  assert.equal(summary.confirmedRefunds, 200);
+  assert.equal(summary.damageWriteoffs, 80);
+  assert.equal(summary.confirmedExpenses, 80);
+  assert.equal(summary.pendingReturnShipping, 15);
+  assert.equal(summary.pendingRefunds, 0);
+  // Confirmed settlement = 800 (revenue) - 80 (damage writeoff) - 200 (refund) = 520
+  assert.equal(summary.confirmedSettlement, 520);
+  // Expected settlement = 520 - 15 (pending return shipping) = 505
+  assert.equal(summary.expectedSettlement, 505);
 });
 
