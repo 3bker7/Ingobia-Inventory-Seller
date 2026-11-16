@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { Product, Order, FinancialTransaction, StockMovement } from '../types';
+import { Product, Order, FinancialTransaction, StockMovement, ReturnRecord } from '../types';
 import {
   allocateStockToPlatformPure,
   applyManualStockAdjustmentPure,
@@ -26,6 +26,7 @@ import {
   addReturnNotePure,
   advanceReturnStatusPure,
   computeReturnRefundAmount,
+  computeReturnRefundAssessment,
   getOrderReturnableItems,
   processReturnInspectionPure,
   registerPostDeliveryReturnPure,
@@ -2255,4 +2256,702 @@ test('refund integrity: return shipping costs and damaged stock write-offs remai
   // Expected settlement = 520 - 15 (pending return shipping) = 505
   assert.equal(summary.expectedSettlement, 505);
 });
+
+// ---------------------------------------------------------------------------
+// 24. Refund Integrity: Pending + Completed Returns Never Consume Same Units
+// ---------------------------------------------------------------------------
+test('computeOrderFinancialBreakdown prevents pending and completed returns from consuming the same units', () => {
+  const product = makeProduct({ id: 'prod-ri-1', sku: 'RI-SKU-1', currentPrice: 200, baseCost: 90 });
+  const order = makeOrder({
+    id: 'ORD-RI-24',
+    status: 'delivered',
+    deliveredProcessed: true,
+    totalAmount: 400,
+    items: [
+      {
+        productId: 'prod-ri-1',
+        productSku: 'RI-SKU-1',
+        productName: 'RI Item',
+        imageUrl: '',
+        quantity: 2,
+        unitPrice: 200,
+        unitCostSnapshot: 90,
+      },
+    ],
+  });
+
+  const makeRet = (overrides: Partial<ReturnRecord>): ReturnRecord => ({
+    id: 'RET-RI-24',
+    orderId: order.id,
+    marketplaceId: 'noon',
+    items: [
+      {
+        productId: 'prod-ri-1',
+        productSku: 'RI-SKU-1',
+        productName: 'RI Item',
+        imageUrl: '',
+        quantity: 1,
+        unitPrice: 200,
+      },
+    ],
+    returnReason: 'test',
+    returnStatus: 'closed',
+    stockRestored: true,
+    isCompleted: true,
+    isPostDeliveryReturn: true,
+    refundProcessed: true,
+    createdAt: '2026-11-16T01:00:00Z',
+    updatedAt: '2026-11-16T01:00:00Z',
+    ...overrides,
+  });
+
+  // Case A: 1 completed + 1 pending claiming 2 units -> pending capped at remaining 1 unit
+  const completed1 = makeRet({
+    id: 'RET-24-DONE',
+    returnStatus: 'closed',
+    isCompleted: true,
+    items: [{ ...order.items[0], quantity: 1 }],
+  });
+  const pending2 = makeRet({
+    id: 'RET-24-PEND',
+    returnStatus: 'in_transit_back',
+    isCompleted: false,
+    stockRestored: false,
+    refundProcessed: false,
+    items: [{ ...order.items[0], quantity: 2 }],
+    createdAt: '2026-11-16T00:30:00Z',
+  });
+
+  const bA = computeOrderFinancialBreakdown(order, [product], [pending2, completed1]);
+  assert.equal(bA.refundAmount, 200);
+  assert.equal(bA.pendingRefundAmount, 200);
+  assert.equal(bA.refundedItemsCount, 1);
+
+  // Case B: Completed covers all 2 units; overlapping pending gets 0
+  const completedAll = makeRet({
+    id: 'RET-24-DONE-ALL',
+    items: [{ ...order.items[0], quantity: 2 }],
+  });
+  const bB = computeOrderFinancialBreakdown(order, [product], [pending2, completedAll]);
+  assert.equal(bB.refundAmount, 400);
+  assert.equal(bB.pendingRefundAmount, 0);
+  assert.equal(bB.refundedItemsCount, 2);
+});
+
+// ---------------------------------------------------------------------------
+// 25. Refund Integrity: Multiple Pending Returns Bounded by Ordered Quantity
+// ---------------------------------------------------------------------------
+test('computeOrderFinancialBreakdown bounds multiple pending returns by remaining ordered quantity', () => {
+  const product = makeProduct({ id: 'prod-ri-25', sku: 'RI-SKU-25', currentPrice: 200, baseCost: 90 });
+  const order = makeOrder({
+    id: 'ORD-RI-25',
+    status: 'delivered',
+    deliveredProcessed: true,
+    totalAmount: 800,
+    items: [
+      {
+        productId: 'prod-ri-25',
+        productSku: 'RI-SKU-25',
+        productName: 'RI Multi Pending',
+        imageUrl: '',
+        quantity: 4,
+        unitPrice: 200,
+        unitCostSnapshot: 90,
+      },
+    ],
+  });
+
+  const pend1: ReturnRecord = {
+    id: 'RET-25-A',
+    orderId: order.id,
+    marketplaceId: 'noon',
+    items: [{ ...order.items[0], quantity: 3 }],
+    returnReason: 'pending 1',
+    returnStatus: 'in_transit_back',
+    stockRestored: false,
+    isCompleted: false,
+    isPostDeliveryReturn: true,
+    createdAt: '2026-11-16T01:00:00Z',
+    updatedAt: '2026-11-16T01:00:00Z',
+  };
+  const pend2: ReturnRecord = {
+    ...pend1,
+    id: 'RET-25-B',
+    returnStatus: 'under_inspection',
+    createdAt: '2026-11-16T02:00:00Z',
+    updatedAt: '2026-11-16T02:00:00Z',
+  };
+
+  const breakdown = computeOrderFinancialBreakdown(order, [product], [pend1, pend2]);
+  assert.equal(breakdown.refundAmount, 0);
+  assert.equal(breakdown.pendingRefundAmount, 800);
+  assert.equal(breakdown.refundedItemsCount, 0);
+});
+
+// ---------------------------------------------------------------------------
+// 26. Refund Integrity: Deterministic Result Regardless of Return Array Order
+// ---------------------------------------------------------------------------
+test('computeOrderFinancialBreakdown produces identical accounting regardless of return storage order', () => {
+  const product = makeProduct({ id: 'prod-ri-26', sku: 'RI-SKU-26', currentPrice: 150, baseCost: 70 });
+  const order = makeOrder({
+    id: 'ORD-RI-26',
+    status: 'delivered',
+    deliveredProcessed: true,
+    totalAmount: 450,
+    items: [
+      {
+        productId: 'prod-ri-26',
+        productSku: 'RI-SKU-26',
+        productName: 'RI Order Test',
+        imageUrl: '',
+        quantity: 3,
+        unitPrice: 150,
+        unitCostSnapshot: 70,
+      },
+    ],
+  });
+
+  const retCompleted: ReturnRecord = {
+    id: 'RET-26-1',
+    orderId: order.id,
+    marketplaceId: 'noon',
+    items: [{ ...order.items[0], quantity: 2 }],
+    returnReason: 'done',
+    returnStatus: 'closed',
+    stockRestored: true,
+    isCompleted: true,
+    isPostDeliveryReturn: true,
+    refundProcessed: true,
+    createdAt: '2026-11-16T02:00:00Z',
+    updatedAt: '2026-11-16T02:00:00Z',
+  };
+  const retCompletedDup: ReturnRecord = {
+    ...retCompleted,
+    items: [{ ...order.items[0], quantity: 2 }],
+  };
+  const retPendingEarly: ReturnRecord = {
+    id: 'RET-26-2',
+    orderId: order.id,
+    marketplaceId: 'noon',
+    items: [{ ...order.items[0], quantity: 2 }],
+    returnReason: 'pending',
+    returnStatus: 'received_at_warehouse',
+    stockRestored: false,
+    isCompleted: false,
+    isPostDeliveryReturn: true,
+    createdAt: '2026-11-16T01:00:00Z',
+    updatedAt: '2026-11-16T01:00:00Z',
+  };
+
+  const bForward = computeOrderFinancialBreakdown(order, [product], [
+    retCompleted,
+    retCompletedDup,
+    retPendingEarly,
+  ]);
+  const bReverse = computeOrderFinancialBreakdown(order, [product], [
+    retPendingEarly,
+    retCompletedDup,
+    retCompleted,
+  ]);
+
+  assert.equal(bForward.refundAmount, 300);
+  assert.equal(bForward.pendingRefundAmount, 150);
+  assert.equal(bForward.refundedItemsCount, 2);
+  assert.equal(bReverse.refundAmount, bForward.refundAmount);
+  assert.equal(bReverse.pendingRefundAmount, bForward.pendingRefundAmount);
+  assert.equal(bReverse.refundedItemsCount, bForward.refundedItemsCount);
+});
+
+// ---------------------------------------------------------------------------
+// 27. Refund Integrity: Missing Original Order Rejects Fallback Pricing
+// ---------------------------------------------------------------------------
+test('missing original order blocks untrusted ReturnRecord fallback refund pricing', () => {
+  const product = makeProduct({
+    id: 'prod-ri-27',
+    sku: 'RI-SKU-27',
+    currentPrice: 500,
+    baseCost: 100,
+    physicalStock: 10,
+    availableStock: 9,
+    awaitingInspectionStock: 1,
+  });
+
+  const orphanPostReturn: ReturnRecord = {
+    id: 'RET-27-ORPHAN',
+    orderId: 'ORD-MISSING-999',
+    marketplaceId: 'noon',
+    items: [
+      {
+        productId: 'prod-ri-27',
+        productSku: 'RI-SKU-27',
+        productName: 'Orphan Item',
+        imageUrl: '',
+        quantity: 1,
+        unitPrice: 999, // Untrusted return unitPrice should NEVER be credited
+      },
+    ],
+    returnReason: 'post-delivery',
+    returnStatus: 'received_at_warehouse',
+    stockRestored: false,
+    isCompleted: false,
+    isPostDeliveryReturn: true,
+    physicalRestoredAtReceipt: true,
+    createdAt: '2026-11-16T01:00:00Z',
+    updatedAt: '2026-11-16T01:00:00Z',
+  };
+
+  const assessment = computeReturnRefundAssessment(orphanPostReturn, undefined, []);
+  assert.equal(assessment.valid, false);
+  assert.equal(assessment.refundAmount, 0);
+  assert.ok(assessment.diagnostic && assessment.diagnostic.length > 0);
+  assert.equal(computeReturnRefundAmount(orphanPostReturn, undefined, []), 0);
+
+  const insp = processReturnInspectionPure({
+    returnId: orphanPostReturn.id,
+    outcome: 'restockable',
+    condition: 'like_new',
+    notes: 'فحص مرتجع بدون طلب أصلي',
+    returns: [orphanPostReturn],
+    products: [product],
+    orders: [],
+    currency: 'SAR',
+  });
+  assert.equal(insp.success, true);
+  assert.ok(insp.refundDiagnostic && insp.refundDiagnostic.length > 0);
+  assert.equal(insp.newTransactions.filter((t) => t.type === 'customer_refund').length, 0);
+  const updatedRet = insp.returns.find((r) => r.id === orphanPostReturn.id)!;
+  assert.equal(updatedRet.refundAmount, 0);
+  assert.equal(updatedRet.refundProcessed, false);
+  // Physical custody can still be restored cleanly without fabricating a financial refund
+  assert.equal(updatedRet.stockRestored, true);
+  assert.equal(updatedRet.isCompleted, true);
+});
+
+// ---------------------------------------------------------------------------
+// 28. Refund Integrity: Mismatched Product Identity (ID vs SKU) Blocked
+// ---------------------------------------------------------------------------
+test('return item with mismatched productId sharing unrelated SKU (and vice versa) is rejected', () => {
+  const product = makeProduct({
+    id: 'prod-real-28',
+    sku: 'SKU-REAL-28',
+    currentPrice: 250,
+    baseCost: 80,
+    physicalStock: 10,
+    availableStock: 9,
+    awaitingInspectionStock: 1,
+  });
+  const order = makeOrder({
+    id: 'ORD-RI-28',
+    status: 'delivered',
+    deliveredProcessed: true,
+    totalAmount: 250,
+    items: [
+      {
+        productId: 'prod-real-28',
+        productSku: 'SKU-REAL-28',
+        productName: 'Real Product',
+        imageUrl: '',
+        quantity: 1,
+        unitPrice: 250,
+        unitCostSnapshot: 80,
+      },
+    ],
+  });
+
+  const mismatchedIdReturn: ReturnRecord = {
+    id: 'RET-28-MISMATCH-ID',
+    orderId: order.id,
+    marketplaceId: 'noon',
+    items: [
+      {
+        productId: 'prod-wrong-id',
+        productSku: 'SKU-REAL-28',
+        productName: 'Spoofed ID Item',
+        imageUrl: '',
+        quantity: 1,
+        unitPrice: 250,
+      },
+    ],
+    returnReason: 'test',
+    returnStatus: 'received_at_warehouse',
+    stockRestored: false,
+    isCompleted: false,
+    isPostDeliveryReturn: true,
+    physicalRestoredAtReceipt: true,
+    createdAt: '2026-11-16T01:00:00Z',
+    updatedAt: '2026-11-16T01:00:00Z',
+  };
+
+  const mismatchedSkuReturn: ReturnRecord = {
+    ...mismatchedIdReturn,
+    id: 'RET-28-MISMATCH-SKU',
+    items: [
+      {
+        productId: 'prod-real-28',
+        productSku: 'SKU-WRONG-999',
+        productName: 'Spoofed SKU Item',
+        imageUrl: '',
+        quantity: 1,
+        unitPrice: 250,
+      },
+    ],
+  };
+
+  const a1 = computeReturnRefundAssessment(mismatchedIdReturn, order, []);
+  assert.equal(a1.valid, false);
+  assert.equal(a1.refundAmount, 0);
+  assert.equal(a1.unmatchedItems.length, 1);
+
+  const a2 = computeReturnRefundAssessment(mismatchedSkuReturn, order, []);
+  assert.equal(a2.valid, false);
+  assert.equal(a2.refundAmount, 0);
+  assert.equal(a2.unmatchedItems.length, 1);
+
+  const insp = processReturnInspectionPure({
+    returnId: mismatchedIdReturn.id,
+    outcome: 'restockable',
+    condition: 'like_new',
+    notes: 'id mismatch',
+    returns: [mismatchedIdReturn],
+    products: [product],
+    orders: [order],
+    currency: 'SAR',
+  });
+  assert.equal(insp.newTransactions.filter((t) => t.type === 'customer_refund').length, 0);
+  assert.equal(insp.returns[0].refundProcessed, false);
+
+  const breakdown = computeOrderFinancialBreakdown(order, [product], [
+    { ...mismatchedIdReturn, isCompleted: true, returnStatus: 'closed', refundProcessed: true },
+    { ...mismatchedSkuReturn, returnStatus: 'in_transit_back', isCompleted: false },
+  ]);
+  assert.equal(breakdown.refundAmount, 0);
+  assert.equal(breakdown.pendingRefundAmount, 0);
+});
+
+// ---------------------------------------------------------------------------
+// 29. Refund Integrity: Pending Ledger Refund Tied to Pending Return Not Double-Counted
+// ---------------------------------------------------------------------------
+test('pending customer_refund ledger transaction matching pending returnId is not double-counted', () => {
+  const product = makeProduct({ id: 'prod-ri-29', sku: 'RI-SKU-29', currentPrice: 200, baseCost: 100 });
+  const order = makeOrder({
+    id: 'ORD-RI-29',
+    status: 'delivered',
+    deliveredProcessed: true,
+    totalAmount: 400,
+    items: [
+      {
+        productId: 'prod-ri-29',
+        productSku: 'RI-SKU-29',
+        productName: 'Item 29',
+        imageUrl: '',
+        quantity: 2,
+        unitPrice: 200,
+        unitCostSnapshot: 100,
+      },
+    ],
+  });
+
+  const pendingRet: ReturnRecord = {
+    id: 'RET-29-PEND',
+    orderId: order.id,
+    marketplaceId: 'noon',
+    items: [{ ...order.items[0], quantity: 1 }],
+    returnReason: 'pending return',
+    returnStatus: 'in_transit_back',
+    stockRestored: false,
+    isCompleted: false,
+    isPostDeliveryReturn: true,
+    createdAt: '2026-11-16T01:00:00Z',
+    updatedAt: '2026-11-16T01:00:00Z',
+  };
+
+  const pendingTx: FinancialTransaction = {
+    id: 'tx-29-pend',
+    orderId: order.id,
+    returnId: 'RET-29-PEND',
+    eventRef: 'post_delivery_return|customer_refund|RET-29-PEND',
+    marketplaceId: 'noon',
+    type: 'customer_refund',
+    amount: 200,
+    currency: 'SAR',
+    status: 'pending',
+    source: 'automatic',
+    date: '2026-11-16T01:00:00Z',
+  };
+
+  const breakdown = computeOrderFinancialBreakdown(order, [product], [pendingRet], [pendingTx]);
+  assert.equal(breakdown.refundAmount, 0);
+  assert.equal(breakdown.pendingRefundAmount, 200);
+});
+
+// ---------------------------------------------------------------------------
+// 30. Refund Integrity: Confirmed Ledger Refund Tied to Completed Return Not Double-Counted
+// ---------------------------------------------------------------------------
+test('confirmed customer_refund ledger transaction matching completed returnId is not double-counted', () => {
+  const product = makeProduct({ id: 'prod-ri-30', sku: 'RI-SKU-30', currentPrice: 200, baseCost: 100 });
+  const order = makeOrder({
+    id: 'ORD-RI-30',
+    status: 'delivered',
+    deliveredProcessed: true,
+    totalAmount: 400,
+    items: [
+      {
+        productId: 'prod-ri-30',
+        productSku: 'RI-SKU-30',
+        productName: 'Item 30',
+        imageUrl: '',
+        quantity: 2,
+        unitPrice: 200,
+        unitCostSnapshot: 100,
+      },
+    ],
+  });
+
+  const completedRet: ReturnRecord = {
+    id: 'RET-30-DONE',
+    orderId: order.id,
+    marketplaceId: 'noon',
+    items: [{ ...order.items[0], quantity: 1 }],
+    returnReason: 'done',
+    returnStatus: 'closed',
+    inspectionOutcome: 'restockable',
+    stockRestored: true,
+    isCompleted: true,
+    isPostDeliveryReturn: true,
+    refundAmount: 200,
+    refundProcessed: true,
+    createdAt: '2026-11-16T01:00:00Z',
+    updatedAt: '2026-11-16T02:00:00Z',
+  };
+
+  const confirmedTx: FinancialTransaction = {
+    id: 'tx-30-conf',
+    orderId: order.id,
+    returnId: 'RET-30-DONE',
+    eventRef: 'return_inspection|customer_refund|RET-30-DONE',
+    marketplaceId: 'noon',
+    type: 'customer_refund',
+    amount: 200,
+    currency: 'SAR',
+    status: 'confirmed',
+    source: 'automatic',
+    date: '2026-11-16T02:00:00Z',
+  };
+
+  const breakdown = computeOrderFinancialBreakdown(order, [product], [completedRet], [confirmedTx]);
+  assert.equal(breakdown.refundAmount, 200);
+  assert.equal(breakdown.pendingRefundAmount, 0);
+  assert.equal(breakdown.refundedItemsCount, 1);
+});
+
+// ---------------------------------------------------------------------------
+// 31. Refund Integrity: Standalone Valid Refund Preserved & Cancelled Excluded
+// ---------------------------------------------------------------------------
+test('standalone customer_refund ledger transactions are preserved accurately while cancelled entries stay excluded', () => {
+  const product = makeProduct({ id: 'prod-ri-31', sku: 'RI-SKU-31', currentPrice: 300, baseCost: 120 });
+  const order = makeOrder({
+    id: 'ORD-RI-31',
+    status: 'delivered',
+    deliveredProcessed: true,
+    totalAmount: 300,
+    items: [
+      {
+        productId: 'prod-ri-31',
+        productSku: 'RI-SKU-31',
+        productName: 'Item 31',
+        imageUrl: '',
+        quantity: 1,
+        unitPrice: 300,
+        unitCostSnapshot: 120,
+      },
+    ],
+  });
+
+  const txs: FinancialTransaction[] = [
+    {
+      id: 'tx-31-standalone-conf',
+      orderId: order.id,
+      marketplaceId: 'noon',
+      type: 'customer_refund',
+      amount: 150,
+      currency: 'SAR',
+      status: 'confirmed',
+      source: 'manual',
+      date: '2026-11-16T01:00:00Z',
+    },
+    {
+      id: 'tx-31-cancelled',
+      orderId: order.id,
+      marketplaceId: 'noon',
+      type: 'customer_refund',
+      amount: 300,
+      currency: 'SAR',
+      status: 'cancelled',
+      source: 'manual',
+      date: '2026-11-16T01:30:00Z',
+    },
+    {
+      id: 'tx-31-standalone-pend',
+      orderId: order.id,
+      marketplaceId: 'noon',
+      type: 'customer_refund',
+      amount: 50,
+      currency: 'SAR',
+      status: 'pending',
+      source: 'manual',
+      date: '2026-11-16T02:00:00Z',
+    },
+  ];
+
+  const breakdown = computeOrderFinancialBreakdown(order, [product], [], txs);
+  assert.equal(breakdown.refundAmount, 150);
+  assert.equal(breakdown.pendingRefundAmount, 50);
+});
+
+// ---------------------------------------------------------------------------
+// 32. Refund Integrity: Cumulative Refunds Never Exceed Order Refundable Cap
+// ---------------------------------------------------------------------------
+test('cumulative confirmed plus pending refunds never exceed original order refundable cap', () => {
+  const product = makeProduct({ id: 'prod-ri-32', sku: 'RI-SKU-32', currentPrice: 200, baseCost: 80 });
+  const order = makeOrder({
+    id: 'ORD-RI-32',
+    status: 'delivered',
+    deliveredProcessed: true,
+    totalAmount: 350, // Discounted order total < 2 * 200 = 400
+    items: [
+      {
+        productId: 'prod-ri-32',
+        productSku: 'RI-SKU-32',
+        productName: 'Discounted Item',
+        imageUrl: '',
+        quantity: 2,
+        unitPrice: 200,
+        unitCostSnapshot: 80,
+      },
+    ],
+  });
+
+  const retDone: ReturnRecord = {
+    id: 'RET-32-DONE',
+    orderId: order.id,
+    marketplaceId: 'noon',
+    items: [{ ...order.items[0], quantity: 1 }],
+    returnReason: 'partial 1',
+    returnStatus: 'closed',
+    stockRestored: true,
+    isCompleted: true,
+    isPostDeliveryReturn: true,
+    refundProcessed: true,
+    createdAt: '2026-11-16T01:00:00Z',
+    updatedAt: '2026-11-16T01:00:00Z',
+  };
+  const retPend: ReturnRecord = {
+    id: 'RET-32-PEND',
+    orderId: order.id,
+    marketplaceId: 'noon',
+    items: [{ ...order.items[0], quantity: 1 }],
+    returnReason: 'partial 2',
+    returnStatus: 'in_transit_back',
+    stockRestored: false,
+    isCompleted: false,
+    isPostDeliveryReturn: true,
+    createdAt: '2026-11-16T02:00:00Z',
+    updatedAt: '2026-11-16T02:00:00Z',
+  };
+  const extraManualTx: FinancialTransaction = {
+    id: 'tx-32-manual',
+    orderId: order.id,
+    marketplaceId: 'noon',
+    type: 'customer_refund',
+    amount: 500,
+    currency: 'SAR',
+    status: 'pending',
+    source: 'manual',
+    date: '2026-11-16T03:00:00Z',
+  };
+
+  const breakdown = computeOrderFinancialBreakdown(
+    order,
+    [product],
+    [retDone, retPend],
+    [extraManualTx]
+  );
+  assert.equal(breakdown.refundAmount, 200);
+  assert.equal(breakdown.pendingRefundAmount, 150);
+  assert.ok(breakdown.refundAmount + (breakdown.pendingRefundAmount || 0) <= order.totalAmount);
+});
+
+// ---------------------------------------------------------------------------
+// 33. Refund Integrity: Invalid Return Quantities Rejected Strictly
+// ---------------------------------------------------------------------------
+test('fractional, zero, negative, NaN, and Infinity return quantities are rejected without truncation or refunds', () => {
+  const product = makeProduct({
+    id: 'prod-ri-33',
+    sku: 'RI-SKU-33',
+    currentPrice: 200,
+    baseCost: 80,
+    physicalStock: 10,
+    availableStock: 9,
+    awaitingInspectionStock: 1,
+  });
+  const order = makeOrder({
+    id: 'ORD-RI-33',
+    status: 'delivered',
+    deliveredProcessed: true,
+    totalAmount: 400,
+    items: [
+      {
+        productId: 'prod-ri-33',
+        productSku: 'RI-SKU-33',
+        productName: 'Qty Validation Item',
+        imageUrl: '',
+        quantity: 2,
+        unitPrice: 200,
+        unitCostSnapshot: 80,
+      },
+    ],
+  });
+
+  for (const badQty of [1.5, -2, 0, Number.NaN, Number.POSITIVE_INFINITY]) {
+    const badReturn: ReturnRecord = {
+      id: `RET-33-BAD-${String(badQty)}`,
+      orderId: order.id,
+      marketplaceId: 'noon',
+      items: [{ ...order.items[0], quantity: badQty }],
+      returnReason: 'bad qty',
+      returnStatus: 'received_at_warehouse',
+      stockRestored: false,
+      isCompleted: false,
+      isPostDeliveryReturn: true,
+      physicalRestoredAtReceipt: true,
+      createdAt: '2026-11-16T01:00:00Z',
+      updatedAt: '2026-11-16T01:00:00Z',
+    };
+
+    const assessment = computeReturnRefundAssessment(badReturn, order, []);
+    assert.equal(assessment.valid, false);
+    assert.equal(assessment.refundAmount, 0);
+    assert.equal(assessment.invalidQuantities.length, 1);
+
+    const insp = processReturnInspectionPure({
+      returnId: badReturn.id,
+      outcome: 'restockable',
+      condition: 'like_new',
+      notes: 'invalid qty',
+      returns: [badReturn],
+      products: [product],
+      orders: [order],
+      currency: 'SAR',
+    });
+    assert.equal(insp.newTransactions.filter((t) => t.type === 'customer_refund').length, 0);
+    assert.equal(insp.returns[0].refundProcessed, false);
+
+    const breakdown = computeOrderFinancialBreakdown(order, [product], [
+      { ...badReturn, isCompleted: true, returnStatus: 'closed', refundProcessed: true },
+    ]);
+    assert.equal(breakdown.refundAmount, 0);
+    assert.equal(breakdown.pendingRefundAmount, 0);
+  }
+});
+
 

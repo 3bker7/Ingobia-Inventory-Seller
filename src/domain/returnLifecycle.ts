@@ -17,7 +17,13 @@ import {
   ShipmentRecord,
   StockMovement,
 } from '../types';
-import { resolveOrderItemUnitCost } from './financialLedger';
+import {
+  doesReturnItemMatchOrderItem,
+  isReturnRecordCompleted,
+  normalizeSortedUniqueReturns,
+  parseValidPositiveIntegerQty,
+  resolveOrderItemUnitCost,
+} from './financialLedger';
 import { generateUniqueId, normalizeProductCustody } from './inventoryCustody';
 
 export const ALLOWED_RETURN_TRANSITIONS: Record<ReturnStatus, ReturnStatus[]> = {
@@ -53,84 +59,128 @@ export function getOrderReturnableItems(
   alreadyReturnedQty: number;
   remainingQty: number;
 }> {
-  const orderReturns = returns.filter((r) => r.orderId === order.id);
+  const orderReturns = normalizeSortedUniqueReturns(returns, order.id);
 
   return order.items.map((item) => {
     let returned = 0;
     for (const r of orderReturns) {
       for (const rItem of r.items) {
-        if (
-          rItem.productId === item.productId ||
-          (item.productSku && rItem.productSku === item.productSku)
-        ) {
-          returned += rItem.quantity;
+        if (doesReturnItemMatchOrderItem(rItem, item)) {
+          const validQty = parseValidPositiveIntegerQty(rItem.quantity);
+          if (validQty !== null) {
+            returned += validQty;
+          }
         }
       }
     }
-    const remainingQty = Math.max(0, item.quantity - returned);
+    const orderedQty =
+      Number.isFinite(item.quantity) && Number.isInteger(item.quantity) && item.quantity > 0
+        ? item.quantity
+        : 0;
+    const remainingQty = Math.max(0, orderedQty - returned);
     return {
       item,
-      orderedQty: item.quantity,
+      orderedQty,
       alreadyReturnedQty: returned,
       remainingQty,
     };
   });
 }
 
-function isReturnInspectionCompleted(ret: ReturnRecord): boolean {
-  return Boolean(
-    ret.isCompleted ||
-      ret.returnStatus === 'closed' ||
-      ret.returnStatus === 'inspection_completed' ||
-      ret.returnStatus === 'restocked' ||
-      ret.returnStatus === 'damaged'
-  );
+export interface ReturnRefundAssessment {
+  valid: boolean;
+  refundAmount: number;
+  refundedUnits: number;
+  diagnostic?: string;
+  unmatchedItems: string[];
+  invalidQuantities: string[];
 }
 
 /**
- * Computes the refundable value of a post-delivery return strictly using
- * original order item unitPrice snapshots and bounding total refunded quantity
- * per order item against originally ordered quantities.
+ * Assesses and computes the refundable value of a post-delivery return STRICTLY using
+ * original order item unitPrice snapshots and strict product identity matching.
+ * Never falls back to ReturnRecord.items[].unitPrice or mutable catalog prices.
  */
-export function computeReturnRefundAmount(
+export function computeReturnRefundAssessment(
   ret: ReturnRecord,
   order?: Order,
   allReturnsForOrder: ReturnRecord[] = []
-): number {
-  if (!ret.items || ret.items.length === 0) return 0;
-
+): ReturnRefundAssessment {
   if (!order || !order.items || order.items.length === 0) {
-    const rawTotal = ret.items.reduce((sum, item) => {
-      const qty = Math.max(0, Math.floor(Number(item.quantity) || 0));
-      const price =
-        typeof item.unitPrice === 'number' && Number.isFinite(item.unitPrice) && item.unitPrice >= 0
-          ? item.unitPrice
-          : 0;
-      return sum + qty * price;
-    }, 0);
-    return Math.round(rawTotal * 100) / 100;
+    return {
+      valid: false,
+      refundAmount: 0,
+      refundedUnits: 0,
+      diagnostic:
+        'الطلب الأصلي غير موجود أو لا يحتوي على بنود مسجلة؛ لا يمكن احتساب استرداد مالي من بيانات مرتجع غير موثقة.',
+      unmatchedItems: [],
+      invalidQuantities: [],
+    };
   }
 
-  // Track remaining refundable quantity per original order line after accounting for
-  // any previously completed refundable returns on the same order.
-  const remainingByLine = order.items.map((it) => Math.max(0, Math.floor(Number(it.quantity) || 0)));
-  const seenPriorIds = new Set<string>();
+  if (!ret.items || ret.items.length === 0) {
+    return {
+      valid: false,
+      refundAmount: 0,
+      refundedUnits: 0,
+      diagnostic: 'سجل المرتجع لا يحتوي على أي بنود.',
+      unmatchedItems: [],
+      invalidQuantities: [],
+    };
+  }
 
-  for (const prior of allReturnsForOrder) {
-    if (prior.orderId !== order.id || prior.id === ret.id) continue;
-    if (prior.id && seenPriorIds.has(prior.id)) continue;
-    if (prior.id) seenPriorIds.add(prior.id);
-    if (!isReturnInspectionCompleted(prior)) continue;
+  const unmatchedItems: string[] = [];
+  const invalidQuantities: string[] = [];
+
+  for (const rItem of ret.items) {
+    if (parseValidPositiveIntegerQty(rItem.quantity) === null) {
+      invalidQuantities.push(rItem.productSku || rItem.productId || rItem.productName || 'item');
+    }
+    const hasMatch = order.items.some((oItem) => doesReturnItemMatchOrderItem(rItem, oItem));
+    if (!hasMatch) {
+      unmatchedItems.push(rItem.productSku || rItem.productId || rItem.productName || 'item');
+    }
+  }
+
+  if (invalidQuantities.length > 0 || unmatchedItems.length > 0) {
+    const reasons: string[] = [];
+    if (invalidQuantities.length > 0) {
+      reasons.push(`كميات غير صالحة للأصناف: (${invalidQuantities.join(', ')})`);
+    }
+    if (unmatchedItems.length > 0) {
+      reasons.push(`أصناف غير مطابقة للطلب الأصلي: (${unmatchedItems.join(', ')})`);
+    }
+    return {
+      valid: false,
+      refundAmount: 0,
+      refundedUnits: 0,
+      diagnostic: `تعذر التحقق من بنود الاسترداد: ${reasons.join(' | ')}.`,
+      unmatchedItems,
+      invalidQuantities,
+    };
+  }
+
+  // Account for previously completed refundable returns deterministically
+  const remainingByLine = order.items.map((it) =>
+    Number.isFinite(it.quantity) && Number.isInteger(it.quantity) && it.quantity > 0
+      ? it.quantity
+      : 0
+  );
+  const priorReturns = normalizeSortedUniqueReturns(allReturnsForOrder, order.id);
+
+  for (const prior of priorReturns) {
+    if (prior.id === ret.id) continue;
+    if (!isReturnRecordCompleted(prior)) continue;
     if (prior.inspectionOutcome === 'missing' || prior.physicalCondition === 'lost') continue;
+    if (prior.refundProcessed === false) continue;
 
     for (const pItem of prior.items || []) {
-      let toConsume = Math.max(0, Math.floor(Number(pItem.quantity) || 0));
+      const pQty = parseValidPositiveIntegerQty(pItem.quantity);
+      if (pQty === null) continue;
+      let toConsume = pQty;
       for (let idx = 0; idx < order.items.length && toConsume > 0; idx++) {
         const oItem = order.items[idx];
-        const matches =
-          oItem.productId === pItem.productId ||
-          (Boolean(oItem.productSku) && oItem.productSku === pItem.productSku);
-        if (!matches || remainingByLine[idx] <= 0) continue;
+        if (!doesReturnItemMatchOrderItem(pItem, oItem) || remainingByLine[idx] <= 0) continue;
         const used = Math.min(toConsume, remainingByLine[idx]);
         remainingByLine[idx] -= used;
         toConsume -= used;
@@ -139,26 +189,57 @@ export function computeReturnRefundAmount(
   }
 
   let refundTotal = 0;
+  let refundedUnits = 0;
   for (const rItem of ret.items) {
-    let qtyToRefund = Math.max(0, Math.floor(Number(rItem.quantity) || 0));
+    const rQty = parseValidPositiveIntegerQty(rItem.quantity);
+    if (rQty === null) continue;
+    let qtyToRefund = rQty;
     for (let idx = 0; idx < order.items.length && qtyToRefund > 0; idx++) {
       const oItem = order.items[idx];
-      const matches =
-        oItem.productId === rItem.productId ||
-        (Boolean(oItem.productSku) && oItem.productSku === rItem.productSku);
-      if (!matches || remainingByLine[idx] <= 0) continue;
+      if (!doesReturnItemMatchOrderItem(rItem, oItem) || remainingByLine[idx] <= 0) continue;
+      if (typeof oItem.unitPrice !== 'number' || !Number.isFinite(oItem.unitPrice) || oItem.unitPrice < 0) {
+        return {
+          valid: false,
+          refundAmount: 0,
+          refundedUnits: 0,
+          diagnostic: `سعر الوحدة الأصلي مفقود أو غير صالح للبند (${oItem.productName}).`,
+          unmatchedItems: [],
+          invalidQuantities: [],
+        };
+      }
       const applied = Math.min(qtyToRefund, remainingByLine[idx]);
-      const originalUnitPrice =
-        typeof oItem.unitPrice === 'number' && Number.isFinite(oItem.unitPrice) && oItem.unitPrice >= 0
-          ? oItem.unitPrice
-          : 0;
-      refundTotal += applied * originalUnitPrice;
+      refundTotal += applied * oItem.unitPrice;
+      refundedUnits += applied;
       remainingByLine[idx] -= applied;
       qtyToRefund -= applied;
     }
   }
 
-  return Math.round(refundTotal * 100) / 100;
+  const orderCap =
+    typeof order.totalAmount === 'number' && Number.isFinite(order.totalAmount) && order.totalAmount >= 0
+      ? order.totalAmount
+      : refundTotal;
+
+  const finalRefund = Math.round(Math.min(refundTotal, orderCap) * 100) / 100;
+  return {
+    valid: true,
+    refundAmount: finalRefund,
+    refundedUnits,
+    unmatchedItems: [],
+    invalidQuantities: [],
+  };
+}
+
+/**
+ * Computes the refundable value of a post-delivery return strictly using
+ * original order item unitPrice snapshots. Returns 0 if order is missing or items cannot be verified.
+ */
+export function computeReturnRefundAmount(
+  ret: ReturnRecord,
+  order?: Order,
+  allReturnsForOrder: ReturnRecord[] = []
+): number {
+  return computeReturnRefundAssessment(ret, order, allReturnsForOrder).refundAmount;
 }
 
 export function advanceReturnStatusPure(params: {
@@ -366,6 +447,7 @@ export function processReturnInspectionPure(params: {
 }): {
   success: boolean;
   message: string;
+  refundDiagnostic?: string;
   returns: ReturnRecord[];
   products: Product[];
   orders: Order[];
@@ -746,36 +828,47 @@ export function processReturnInspectionPure(params: {
   }
 
   // Generate accurate customer_refund transaction for completed post-delivery returns
-  // (restockable or damaged). Uses original order item unitPrice snapshots and never duplicates.
+  // (restockable or damaged). Strictly requires verified original order & item snapshots.
+  let refundDiagnostic: string | undefined;
   if (
     isPostDelivery &&
     ret.isCompleted &&
     (outcome === 'restockable' || outcome === 'damaged') &&
     !existingRet.refundProcessed
   ) {
-    const refundAmount = computeReturnRefundAmount(ret, order, rawReturns);
-    ret.refundAmount = refundAmount;
-    ret.refundProcessed = true;
-
-    if (refundAmount > 0) {
-      const refundedUnits = ret.items.reduce(
-        (sum, it) => sum + Math.max(0, Math.floor(Number(it.quantity) || 0)),
-        0
-      );
-      newTransactions.push({
-        merchantId: resolvedMerchantId,
-        eventRef: `return_inspection|customer_refund|${ret.id}`,
-        orderId: ret.orderId,
-        returnId: ret.id,
-        marketplaceId: ret.marketplaceId,
-        type: 'customer_refund',
-        amount: refundAmount,
-        currency,
-        status: 'confirmed',
-        source: 'automatic',
-        date: nowIso,
-        notes: `استرداد قيمة أصناف المرتجع #${ret.id} للعميل (${refundedUnits} قطعة وفق سعر الطلب الأصلي)`,
+    const assessment = computeReturnRefundAssessment(ret, order, rawReturns);
+    if (!assessment.valid) {
+      ret.refundAmount = 0;
+      ret.refundProcessed = false;
+      refundDiagnostic = assessment.diagnostic;
+      ret.activities!.push({
+        id: `act-${Date.now()}-refdiag`,
+        timestamp: nowIso,
+        type: 'system',
+        action: 'refund_verification_blocked',
+        actionAr: assessment.diagnostic || 'تعذر التحقق من بيانات الطلب الأصلي؛ لم يتم إنشاء قيد استرداد مالي.',
+        operator,
       });
+    } else {
+      ret.refundAmount = assessment.refundAmount;
+      ret.refundProcessed = true;
+
+      if (assessment.refundAmount > 0) {
+        newTransactions.push({
+          merchantId: resolvedMerchantId,
+          eventRef: `return_inspection|customer_refund|${ret.id}`,
+          orderId: ret.orderId,
+          returnId: ret.id,
+          marketplaceId: ret.marketplaceId,
+          type: 'customer_refund',
+          amount: assessment.refundAmount,
+          currency,
+          status: 'confirmed',
+          source: 'automatic',
+          date: nowIso,
+          notes: `استرداد قيمة أصناف المرتجع #${ret.id} للعميل (${assessment.refundedUnits} قطعة وفق سعر الطلب الأصلي)`,
+        });
+      }
     }
   }
 
@@ -803,6 +896,7 @@ export function processReturnInspectionPure(params: {
         : outcome === 'missing'
         ? 'تم تسجيل المرتجع كمفقود وشطبه.'
         : 'تم حفظ حالة المرتجع بانتظار إجراءات إضافية.',
+    refundDiagnostic,
     returns,
     products,
     orders,
@@ -905,11 +999,7 @@ export function registerPostDeliveryReturnPure(params: {
         };
       }
 
-      const match = eligibleSummary.find(
-        (e) =>
-          e.item.productId === sel.productId ||
-          (sel.productSku && e.item.productSku === sel.productSku)
-      );
+      const match = eligibleSummary.find((e) => doesReturnItemMatchOrderItem(sel, e.item));
       if (!match) {
         return {
           success: false,

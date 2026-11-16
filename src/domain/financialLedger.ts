@@ -46,7 +46,34 @@ export function resolveOrderItemUnitCost(
   return { unitCost: null, source: 'missing' };
 }
 
-function isReturnRecordCompleted(ret: ReturnRecord): boolean {
+export function parseValidPositiveIntegerQty(qty: unknown): number | null {
+  if (typeof qty !== 'number' || !Number.isFinite(qty) || !Number.isInteger(qty) || qty <= 0) {
+    return null;
+  }
+  return qty;
+}
+
+/**
+ * Strictly validates whether a return item matches an original order line.
+ * When both productId and productSku are present on both sides, BOTH must agree
+ * so a mismatched productId sharing an unrelated SKU (or vice versa) can never match.
+ */
+export function doesReturnItemMatchOrderItem(
+  retItem: { productId?: string; productSku?: string },
+  orderItem: { productId?: string; productSku?: string }
+): boolean {
+  const rId = typeof retItem.productId === 'string' ? retItem.productId.trim() : '';
+  const rSku = typeof retItem.productSku === 'string' ? retItem.productSku.trim() : '';
+  const oId = typeof orderItem.productId === 'string' ? orderItem.productId.trim() : '';
+  const oSku = typeof orderItem.productSku === 'string' ? orderItem.productSku.trim() : '';
+
+  if (rId && oId && rId !== oId) return false;
+  if (rSku && oSku && rSku !== oSku) return false;
+
+  return Boolean((rId && oId && rId === oId) || (rSku && oSku && rSku === oSku));
+}
+
+export function isReturnRecordCompleted(ret: ReturnRecord): boolean {
   return Boolean(
     ret.isCompleted ||
       ret.returnStatus === 'closed' ||
@@ -54,6 +81,32 @@ function isReturnRecordCompleted(ret: ReturnRecord): boolean {
       ret.returnStatus === 'restocked' ||
       ret.returnStatus === 'damaged'
   );
+}
+
+export function normalizeSortedUniqueReturns(returns: ReturnRecord[], orderId?: string): ReturnRecord[] {
+  const filtered = orderId ? returns.filter((r) => r.orderId === orderId) : [...returns];
+  const sorted = [...filtered].sort((a, b) => {
+    const compDiff = (isReturnRecordCompleted(a) ? 0 : 1) - (isReturnRecordCompleted(b) ? 0 : 1);
+    if (compDiff !== 0) return compDiff;
+    const cA = a.createdAt || '';
+    const cB = b.createdAt || '';
+    if (cA !== cB) return cA < cB ? -1 : 1;
+    const uA = a.updatedAt || '';
+    const uB = b.updatedAt || '';
+    if (uA !== uB) return uA < uB ? -1 : 1;
+    return (a.id || '').localeCompare(b.id || '');
+  });
+
+  const seenIds = new Set<string>();
+  const result: ReturnRecord[] = [];
+  for (const ret of sorted) {
+    if (ret.id) {
+      if (seenIds.has(ret.id)) continue;
+      seenIds.add(ret.id);
+    }
+    result.push(ret);
+  }
+  return result;
 }
 
 function deduplicateTransactionsList(
@@ -153,65 +206,66 @@ export function computeOrderFinancialBreakdown(
   const isDelivered = order.status === 'delivered';
   const isCancelled = order.status === 'cancelled';
 
-  // Calculate actual completed refund amount strictly from completed post-delivery return records
-  // associated with this order (and any unaccounted confirmed customer_refund ledger entries),
-  // bounded by original order item quantities and valued at original order item unitPrice snapshots.
+  // Calculate actual completed & pending refund amounts deterministically:
+  // 1) Prioritize completed post-delivery returns before pending returns so they never consume the same units.
+  // 2) Deduct consumed units for pending returns too so multiple pending returns cannot exceed ordered quantities.
+  // 3) Require strict product identity match and positive integer quantities.
+  // 4) Reconcile customer_refund ledger entries by returnId without double-counting, keeping standalone valid entries.
   let refundAmount = 0;
   let pendingRefundAmount = 0;
   let refundedItemsCount = 0;
 
   if (!isCancelled) {
-    const orderReturns = returns.filter((r) => r.orderId === order.id);
+    const orderReturns = normalizeSortedUniqueReturns(returns, order.id);
     const remainingByLine = order.items.map((it) =>
-      Math.max(0, Math.floor(Number(it.quantity) || 0))
+      Number.isFinite(it.quantity) && Number.isInteger(it.quantity) && it.quantity > 0
+        ? it.quantity
+        : 0
     );
-    const seenReturnIds = new Set<string>();
+    const originalItemsTotal = order.items.reduce((sum, it) => {
+      const qty =
+        Number.isFinite(it.quantity) && Number.isInteger(it.quantity) && it.quantity > 0
+          ? it.quantity
+          : 0;
+      const price =
+        typeof it.unitPrice === 'number' && Number.isFinite(it.unitPrice) && it.unitPrice >= 0
+          ? it.unitPrice
+          : 0;
+      return sum + qty * price;
+    }, 0);
+    const validOrderTotal =
+      typeof totalSellingPrice === 'number' &&
+      Number.isFinite(totalSellingPrice) &&
+      totalSellingPrice >= 0
+        ? totalSellingPrice
+        : originalItemsTotal;
+    const maxRefundableOrderCap =
+      originalItemsTotal > 0 ? Math.min(validOrderTotal, originalItemsTotal) : validOrderTotal;
+
     const accountedReturnIds = new Set<string>();
 
-    for (const ret of orderReturns) {
-      if (ret.id && seenReturnIds.has(ret.id)) continue;
-      if (ret.id) seenReturnIds.add(ret.id);
+    const postDeliveryReturns = orderReturns.filter(
+      (ret) => ret.isPostDeliveryReturn === true || isDelivered || order.deliveredProcessed === true
+    );
+    const completedReturns = postDeliveryReturns.filter((ret) => isReturnRecordCompleted(ret));
+    const pendingReturns = postDeliveryReturns.filter((ret) => !isReturnRecordCompleted(ret));
 
-      const isPostDeliveryContext =
-        ret.isPostDeliveryReturn === true || isDelivered || order.deliveredProcessed === true;
-      if (!isPostDeliveryContext) continue;
-
-      if (!isReturnRecordCompleted(ret)) {
-        // Uninspected return is kept strictly in pendingRefundAmount, NEVER in completed refundAmount
-        for (const rItem of ret.items || []) {
-          let qty = Math.max(0, Math.floor(Number(rItem.quantity) || 0));
-          for (let idx = 0; idx < order.items.length && qty > 0; idx++) {
-            const oItem = order.items[idx];
-            const matches =
-              oItem.productId === rItem.productId ||
-              (Boolean(oItem.productSku) && oItem.productSku === rItem.productSku);
-            if (!matches || remainingByLine[idx] <= 0) continue;
-            const bounded = Math.min(qty, remainingByLine[idx]);
-            const origPrice =
-              typeof oItem.unitPrice === 'number' &&
-              Number.isFinite(oItem.unitPrice) &&
-              oItem.unitPrice >= 0
-                ? oItem.unitPrice
-                : 0;
-            pendingRefundAmount += bounded * origPrice;
-            qty -= bounded;
-          }
-        }
+    // Pass 1: Completed post-delivery returns (excluding missing/lost or explicitly failed refund verification)
+    for (const ret of completedReturns) {
+      if (ret.inspectionOutcome === 'missing' || ret.physicalCondition === 'lost') {
         continue;
       }
-
-      if (ret.inspectionOutcome === 'missing' || ret.physicalCondition === 'lost') {
+      if (ret.refundProcessed === false) {
         continue;
       }
 
       for (const rItem of ret.items || []) {
-        let qtyToRefund = Math.max(0, Math.floor(Number(rItem.quantity) || 0));
+        const validQty = parseValidPositiveIntegerQty(rItem.quantity);
+        if (validQty === null) continue;
+        let qtyToRefund = validQty;
         for (let idx = 0; idx < order.items.length && qtyToRefund > 0; idx++) {
           const oItem = order.items[idx];
-          const matches =
-            oItem.productId === rItem.productId ||
-            (Boolean(oItem.productSku) && oItem.productSku === rItem.productSku);
-          if (!matches || remainingByLine[idx] <= 0) continue;
+          if (!doesReturnItemMatchOrderItem(rItem, oItem) || remainingByLine[idx] <= 0) continue;
           const appliedQty = Math.min(qtyToRefund, remainingByLine[idx]);
           const origPrice =
             typeof oItem.unitPrice === 'number' &&
@@ -231,7 +285,40 @@ export function computeOrderFinancialBreakdown(
       }
     }
 
-    // Reconcile any confirmed/pending customer_refund ledger transactions not already counted from return records
+    // Pass 2: Pending/uninspected post-delivery returns share the SAME remaining order-line quantities
+    for (const ret of pendingReturns) {
+      for (const rItem of ret.items || []) {
+        const validQty = parseValidPositiveIntegerQty(rItem.quantity);
+        if (validQty === null) continue;
+        let qtyToReserve = validQty;
+        for (let idx = 0; idx < order.items.length && qtyToReserve > 0; idx++) {
+          const oItem = order.items[idx];
+          if (!doesReturnItemMatchOrderItem(rItem, oItem) || remainingByLine[idx] <= 0) continue;
+          const bounded = Math.min(qtyToReserve, remainingByLine[idx]);
+          const origPrice =
+            typeof oItem.unitPrice === 'number' &&
+            Number.isFinite(oItem.unitPrice) &&
+            oItem.unitPrice >= 0
+              ? oItem.unitPrice
+              : 0;
+          pendingRefundAmount += bounded * origPrice;
+          remainingByLine[idx] -= bounded;
+          qtyToReserve -= bounded;
+        }
+      }
+
+      if (ret.id) {
+        accountedReturnIds.add(ret.id);
+      }
+    }
+
+    refundAmount = Math.min(refundAmount, maxRefundableOrderCap);
+    pendingRefundAmount = Math.min(
+      pendingRefundAmount,
+      Math.max(0, maxRefundableOrderCap - refundAmount)
+    );
+
+    // Reconcile standalone customer_refund ledger transactions not already accounted by returnId
     if (transactions.length > 0) {
       const dedupedOrderTx = deduplicateTransactionsList(
         transactions.filter((tx) => tx.orderId === order.id && tx.type === 'customer_refund')
@@ -243,12 +330,16 @@ export function computeOrderFinancialBreakdown(
         const txAmount = Number.isFinite(tx.amount) ? Math.max(0, tx.amount) : 0;
 
         if (isConfirmedStatus(tx.status)) {
-          const remainingOrderCap = Math.max(0, totalSellingPrice - refundAmount);
+          const remainingOrderCap = Math.max(0, maxRefundableOrderCap - refundAmount);
           refundAmount += Math.min(txAmount, remainingOrderCap);
+          pendingRefundAmount = Math.min(
+            pendingRefundAmount,
+            Math.max(0, maxRefundableOrderCap - refundAmount)
+          );
         } else if (tx.status === 'pending') {
           const remainingOrderCap = Math.max(
             0,
-            totalSellingPrice - refundAmount - pendingRefundAmount
+            maxRefundableOrderCap - refundAmount - pendingRefundAmount
           );
           pendingRefundAmount += Math.min(txAmount, remainingOrderCap);
         }
